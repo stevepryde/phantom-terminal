@@ -137,7 +137,10 @@ jobs:
       - name: osv-scanner (JS + Rust lockfiles)
         uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
         with:
+          # The advisory ignore policy (justified unmaintained/unsound transitive
+          # Tauri deps) lives in osv-scanner.toml, mirroring src-tauri/deny.toml.
           scan-args: |-
+            --config=osv-scanner.toml
             --lockfile=bun.lock
             --lockfile=src-tauri/Cargo.lock
 

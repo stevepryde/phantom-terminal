@@ -5,12 +5,15 @@
 version = 2
 # Fail on any crate with a known security advisory or a yanked release.
 yanked = "deny"
-# The entries below are *unmaintained* advisories only (not vulnerabilities), and
-# every one is a transitive dependency pulled in by Tauri itself — none is in our
-# direct dependency tree and none has a safe upgrade available. We list each ID
-# explicitly (rather than disabling the unmaintained check wholesale) so that an
-# unmaintained crate we DO control would still fail CI. Actual security
+# The entries below are *unmaintained* / *unsound* informational advisories only
+# (not exploitable vulnerabilities), and every one is a transitive dependency
+# pulled in by Tauri itself — none is in our direct dependency tree and none has a
+# safe upgrade available while we track Tauri 2 (GTK3 / gtk-rs 0.18). We list each
+# ID explicitly (rather than disabling the unmaintained/unsound check wholesale)
+# so that an unmaintained crate we DO control would still fail CI. Actual security
 # vulnerabilities remain hard-denied. Revisit when Tauri migrates off GTK3 / unic.
+#
+# Keep this list in sync with ../osv-scanner.toml, which gates the same advisories.
 ignore = [
   # gtk-rs GTK3 bindings — Tauri's Linux webview backend (wry → webkit2gtk).
   "RUSTSEC-2024-0411",
@@ -23,6 +26,10 @@ ignore = [
   "RUSTSEC-2024-0418",
   "RUSTSEC-2024-0419",
   "RUSTSEC-2024-0420",
+  # glib 0.18.5 — unsoundness in glib::VariantStrIter (fixed in 0.20.0, which
+  # requires gtk-rs 0.20 / a newer Tauri). Pinned transitively by gtk 0.18. Our
+  # code never calls VariantStrIter; it lives in the GTK binding layer.
+  "RUSTSEC-2024-0429",
   # unic-* family — via tauri-utils → urlpattern → unic-ucd-*.
   "RUSTSEC-2025-0075",
   "RUSTSEC-2025-0080",
