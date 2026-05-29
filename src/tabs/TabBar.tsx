@@ -295,7 +295,7 @@ function TabItem({
       aria-selected={active}
       tabIndex={0}
       className={[
-        "no-drag group my-1.5 flex min-w-[7rem] max-w-[14rem] cursor-pointer items-center gap-2 rounded px-3 text-sm",
+        "no-drag group my-1.5 flex min-w-[7rem] max-w-[14rem] cursor-pointer items-center gap-1 rounded py-0 pr-1.5 pl-3 text-sm",
         active ? "bg-white/15 text-white" : "text-white/55 hover:bg-white/8 hover:text-white/85",
         dragging ? "opacity-40" : "",
       ].join(" ")}
@@ -325,7 +325,7 @@ function TabItem({
       <button
         type="button"
         aria-label="Close tab"
-        className="flex h-4 w-4 shrink-0 items-center justify-center rounded text-white/40 opacity-0 hover:bg-white/20 hover:text-white group-hover:opacity-100"
+        className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-white/40 opacity-0 hover:bg-white/20 hover:text-white group-hover:opacity-100"
         title="Close tab (⌘W)"
         onClick={(e) => {
           e.stopPropagation();
