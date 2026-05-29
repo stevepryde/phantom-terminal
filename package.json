@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "update": "bash scripts/update-local.sh",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src package.json tsconfig.json vite.config.ts biome.json",
     "format": "biome format --write .",

@@ -83,9 +83,26 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: taiki-e/install-action@6ed6112eb9893c58dd600eebccdf6e77ab7bfa9c # v2
+      # actionlint is not packaged by install-action, so fetch the pinned
+      # release binary directly and verify its SHA-256 before trusting it.
+      # Bump both the version and the checksum together (deliberately).
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL "$url" -o actionlint.tar.gz
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum --check --strict
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf actionlint.tar.gz -C "$HOME/.local/bin" actionlint
+          rm -f actionlint.tar.gz
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: taiki-e/install-action@15413b256f995d819248ea62704771a959284285 # v2.79.13
         with:
-          tool: actionlint,zizmor
+          tool: zizmor
 
       - name: actionlint
         run: actionlint -color
@@ -118,7 +135,7 @@ jobs:
         run: bun audit --audit-level=high
 
       - name: osv-scanner (JS + Rust lockfiles)
-        uses: google/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
         with:
           scan-args: |-
             --lockfile=bun.lock
@@ -128,7 +145,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: taiki-e/install-action@6ed6112eb9893c58dd600eebccdf6e77ab7bfa9c # v2
+      - uses: taiki-e/install-action@15413b256f995d819248ea62704771a959284285 # v2.79.13
         with:
           tool: cargo-audit,cargo-deny
 
@@ -222,7 +239,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: taiki-e/install-action@6ed6112eb9893c58dd600eebccdf6e77ab7bfa9c # v2
+      - uses: taiki-e/install-action@15413b256f995d819248ea62704771a959284285 # v2.79.13
         with:
           tool: cargo-cyclonedx
 
