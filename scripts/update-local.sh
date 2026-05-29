@@ -1,63 +1,48 @@
 #!/usr/bin/env bash
-# Painless local "auto-update" for Phantom Terminal.
+# Build the current checkout and install it locally.
+#
+# This installs WHAT IS CHECKED OUT — it deliberately does not touch git. To
+# update first, use your normal workflow (`git pull`, switch branches, etc.) and
+# then run this. Keeping the two separate means the script never rewrites itself
+# mid-run, and you always know exactly what you're installing.
 #
 # Phantom Terminal ships no network auto-updater on purpose — the no-network
 # security posture (enforced by scripts/check-no-network.sh in CI) forbids the
-# tauri-plugin-updater and any outbound HTTP. So "updating" means: pull the
-# latest source, build a fresh release bundle, and install it over the old one.
+# tauri-plugin-updater and any outbound HTTP. Rebuilding from source is the
+# update path.
 #
 # Usage:
-#   bun run update           # pull latest, build release, install
-#   bun run update -- --no-pull   # build the working tree as-is, then install
-#   bun run update -- --no-install # build only, leave the bundle in target/
+#   bun run update                  # build release, install over the old copy
+#   bun run update -- --no-install  # build only, leave the bundle in target/
 #
 # Env overrides:
 #   INSTALL_DIR=~/Applications bun run update   # install somewhere else (macOS)
 set -euo pipefail
+
+note() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── Resolve repo root (this script lives in <root>/scripts) ──────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
-PULL=1
 INSTALL=1
 for arg in "$@"; do
   case "$arg" in
-    --no-pull) PULL=0 ;;
     --no-install) INSTALL=0 ;;
-    -h|--help)
-      sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-      exit 0 ;;
-    *) echo "unknown option: $arg" >&2; exit 2 ;;
+    -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $arg" ;;
   esac
 done
 
-note() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
-
 PRODUCT_NAME="Phantom Terminal"
-OLD_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version" 2>/dev/null || echo '?')"
+VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version" 2>/dev/null || echo '?')"
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
 
-# ── 1. Pull latest source (unless --no-pull or the tree is dirty) ────────────
-if [ "$PULL" -eq 1 ]; then
-  if [ -n "$(git status --porcelain)" ]; then
-    warn "working tree has uncommitted changes — skipping git pull, building as-is."
-  else
-    branch="$(git rev-parse --abbrev-ref HEAD)"
-    note "Pulling latest on '$branch' (fast-forward only)…"
-    if git pull --ff-only; then :; else
-      warn "fast-forward pull failed (diverged branch?) — building current commit."
-    fi
-  fi
-fi
-
-NEW_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version" 2>/dev/null || echo '?')"
-note "Building $PRODUCT_NAME v$NEW_VERSION (was v$OLD_VERSION)…"
-
-# ── 2. Build the release bundle (tauri runs the frontend build first) ────────
-# --no-bundle would skip packaging; we want the installable .app/.deb/.AppImage.
+# ── Build the release bundle (tauri runs the frontend build first) ───────────
+note "Building $PRODUCT_NAME v$VERSION ($COMMIT)…"
 bun run tauri build
 
 if [ "$INSTALL" -eq 0 ]; then
@@ -65,7 +50,7 @@ if [ "$INSTALL" -eq 0 ]; then
   exit 0
 fi
 
-# ── 3. Install over the existing copy, per-platform ──────────────────────────
+# ── Install over the existing copy, per-platform ─────────────────────────────
 BUNDLE_DIR="src-tauri/target/release/bundle"
 OS="$(uname -s)"
 

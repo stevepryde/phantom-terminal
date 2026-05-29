@@ -25,18 +25,20 @@ bun run tauri dev      # hot-reloading desktop app
 There is **no network auto-updater** — by design. Phantom Terminal enforces a
 no-outbound-network posture (see `scripts/check-no-network.sh`, gated in CI), so
 `tauri-plugin-updater` and any HTTP client are forbidden. Instead you "update"
-by rebuilding from source with a single command:
+by rebuilding from source. Pull (or switch branches) however you normally would,
+then build and install the current checkout with a single command:
 
 ```sh
-bun run update
+git pull          # your normal git workflow — optional
+bun run update    # build the current checkout and install it
 ```
 
-This pulls the latest source (fast-forward only; skipped if your tree is dirty),
-builds a release bundle, and installs it over the previous copy — into
-`/Applications` on macOS, or `~/.local/bin` (AppImage) on Linux.
+This builds a release bundle from **what is checked out** and installs it over
+the previous copy — into `/Applications` on macOS, or `~/.local/bin` (AppImage)
+on Linux. It does not touch git, so you always know exactly what you're
+installing.
 
 ```sh
-bun run update -- --no-pull      # build the working tree as-is, then install
 bun run update -- --no-install   # build only; leave the bundle in target/
 INSTALL_DIR="$HOME/Applications" bun run update   # install elsewhere (macOS)
 ```
