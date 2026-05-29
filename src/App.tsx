@@ -12,7 +12,7 @@ import {
 } from "./lib/ipc";
 import { setHomeDir } from "./lib/paths";
 import { useStore } from "./lib/store";
-import { SettingsModal } from "./settings/SettingsModal";
+import { SettingsView } from "./settings/SettingsView";
 import {
   type Tab,
   activateIndex,
@@ -20,10 +20,12 @@ import {
   activateTab,
   addTab,
   closeTab,
+  openSettingsTab,
   renameTab,
   setTabCwd,
   setTabPty,
   tabsStore,
+  toggleSettingsTab,
 } from "./store/tabs";
 import { TabBar } from "./tabs/TabBar";
 import { TerminalView } from "./terminal/TerminalView";
@@ -35,7 +37,6 @@ export default function App() {
   const activeId = useStore(tabsStore, (s) => s.activeId);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const readyRef = useRef(false);
   // Mirror config into a ref so the (deps-free) keyboard/command handlers can
@@ -123,6 +124,7 @@ export default function App() {
     const { tabs, activeId } = tabsStore.state;
     const records: TabRecord[] = [];
     for (const t of tabs) {
+      if (t.kind === "settings") continue; // the settings tab is never persisted
       let cwd = t.cwd;
       if (t.ptyId != null) {
         const live = await ptyCwd(t.ptyId);
@@ -173,7 +175,7 @@ export default function App() {
 
       if ((isMac ? e.metaKey : e.ctrlKey) && k === ",") {
         e.preventDefault();
-        setSettingsOpen((v) => !v);
+        toggleSettingsTab();
         return;
       }
       if ((isMac ? e.metaKey : e.ctrlKey) && k === "k") {
@@ -258,7 +260,7 @@ export default function App() {
           setEditingId(null);
         }}
         onCancelRename={() => setEditingId(null)}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={openSettingsTab}
       />
       <div className="relative min-h-0 flex-1 bg-[#0b0b0e]">
         {tabs.map((tab) => (
@@ -269,27 +271,32 @@ export default function App() {
           // accepts pointer events; the rest let clicks fall through.
           <div
             key={tab.id}
-            className="absolute inset-0"
-            style={{ pointerEvents: tab.id === activeId ? "auto" : "none" }}
+            // Terminal tabs get a small inset so the pane doesn't sit flush
+            // against the window edges; the settings tab manages its own layout.
+            className={`absolute inset-0 ${tab.kind === "settings" ? "" : "p-2"}`}
+            style={{
+              pointerEvents: tab.id === activeId ? "auto" : "none",
+              // TerminalView hides itself when inactive, but SettingsView does
+              // not — so an inactive settings tab would keep painting on top of
+              // the active terminal. Hide its wrapper when it isn't active.
+              display: tab.kind === "settings" && tab.id !== activeId ? "none" : undefined,
+            }}
           >
-            <TerminalView
-              tabId={tab.id}
-              cwd={tab.cwd}
-              active={tab.id === activeId}
-              config={config}
-              shellProfileId={tab.shellProfileId}
-              onSpawn={setTabPty}
-            />
+            {tab.kind === "settings" ? (
+              <SettingsView config={config} onChange={updateConfig} />
+            ) : (
+              <TerminalView
+                tabId={tab.id}
+                cwd={tab.cwd}
+                active={tab.id === activeId}
+                config={config}
+                shellProfileId={tab.shellProfileId}
+                onSpawn={setTabPty}
+              />
+            )}
           </div>
         ))}
       </div>
-      {settingsOpen && (
-        <SettingsModal
-          config={config}
-          onChange={updateConfig}
-          onClose={() => setSettingsOpen(false)}
-        />
-      )}
       {paletteOpen && (
         <CommandPalette
           tabs={tabs}
@@ -299,7 +306,7 @@ export default function App() {
           onNewTab={newTab}
           onCloseTab={closeTab}
           onRenameTab={setEditingId}
-          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenSettings={openSettingsTab}
         />
       )}
     </div>

@@ -25,3 +25,34 @@ body {
 .no-drag {
   -webkit-app-region: no-drag;
 }
+
+/* A slim, unobtrusive scrollbar so the horizontal tab strip isn't squashed by
+   the chunky default scrollbar (and for the settings panes). */
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+.thin-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.thin-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.18);
+  border-radius: 9999px;
+}
+.thin-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.32);
+}
+
+/* The tab strip hides its scrollbar entirely (it would steal vertical space and
+   squash the tabs). Scrollability is signalled instead by edge-fade gradients
+   drawn in TabBar, which take no layout space. */
+.tab-scrollbar {
+  scrollbar-width: none; /* Firefox */
+}
+.tab-scrollbar::-webkit-scrollbar {
+  display: none; /* WebKit (Tauri/macOS) */
+}
