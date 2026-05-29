@@ -35,8 +35,7 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Editor
-.vscode/*
-!.vscode/extensions.json
+.vscode/
 .idea
 .DS_Store
 *.sw?
