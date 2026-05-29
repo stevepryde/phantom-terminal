@@ -1,3 +1,5 @@
+import { copyFile, mkdir } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
@@ -7,7 +9,7 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), copyGhosttyWasm()],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
@@ -31,3 +33,15 @@ export default defineConfig(async () => ({
     },
   },
 }));
+
+function copyGhosttyWasm() {
+  return {
+    name: "copy-ghostty-wasm",
+    async closeBundle() {
+      const source = resolve("node_modules/ghostty-web/ghostty-vt.wasm");
+      const target = resolve("dist/ghostty-vt.wasm");
+      await mkdir(dirname(target), { recursive: true });
+      await copyFile(source, target);
+    },
+  };
+}

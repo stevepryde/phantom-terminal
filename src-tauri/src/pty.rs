@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +39,13 @@ struct PtySession {
     pid: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+struct AccountEnv {
+    home: Option<String>,
+    shell: Option<String>,
+    user: Option<String>,
+}
+
 #[derive(Default)]
 pub struct PtyManager {
     sessions: Arc<Mutex<HashMap<u32, PtySession>>>,
@@ -61,19 +70,31 @@ impl PtyManager {
             .openpty(size)
             .map_err(|e| AppError::Pty(format!("openpty failed: {e}")))?;
 
-        let command = opts
-            .command
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(default_shell);
-        let mut cmd = CommandBuilder::new(command);
-        for arg in &opts.args {
-            cmd.arg(arg);
-        }
+        let account = account_env();
+        let use_default_shell =
+            opts.command.as_ref().is_none_or(|c| c.is_empty()) && opts.args.is_empty();
+        let mut cmd = if use_default_shell {
+            CommandBuilder::new_default_prog()
+        } else {
+            let command = opts
+                .command
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| default_shell(&account));
+            let mut cmd = CommandBuilder::new(command);
+            for arg in &opts.args {
+                cmd.arg(arg);
+            }
+            cmd
+        };
         if let Some(cwd) = opts.cwd.as_ref().filter(|c| !c.is_empty()) {
             cmd.cwd(cwd);
         }
-        // A login-ish interactive shell; TERM advertises a capable terminal.
+        // TERM advertises a capable terminal; PATH is normalized because macOS
+        // GUI apps launch with a sparse environment compared with login shells.
         cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("PATH", shell_path());
+        apply_account_env(&mut cmd, &account);
 
         let child = pair
             .slave
@@ -169,8 +190,153 @@ impl PtyManager {
     }
 }
 
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+fn default_shell(account: &AccountEnv) -> String {
+    account
+        .shell
+        .clone()
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+fn apply_account_env(cmd: &mut CommandBuilder, account: &AccountEnv) {
+    if let Some(home) = &account.home {
+        cmd.env("HOME", home);
+    }
+    if let Some(shell) = &account.shell {
+        cmd.env("SHELL", shell);
+    }
+    if let Some(user) = &account.user {
+        cmd.env("USER", user);
+        cmd.env("LOGNAME", user);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn account_env() -> AccountEnv {
+    let entry = unsafe { libc::getpwuid(libc::getuid()) };
+    if entry.is_null() {
+        return fallback_account_env();
+    }
+
+    let entry = unsafe { &*entry };
+    AccountEnv {
+        home: c_string(entry.pw_dir).or_else(|| std::env::var("HOME").ok()),
+        shell: c_string(entry.pw_shell).or_else(|| std::env::var("SHELL").ok()),
+        user: c_string(entry.pw_name)
+            .or_else(|| std::env::var("USER").ok())
+            .or_else(|| std::env::var("LOGNAME").ok()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn c_string(ptr: *const libc::c_char) -> Option<String> {
+    use std::ffi::CStr;
+
+    if ptr.is_null() {
+        return None;
+    }
+
+    Some(
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn account_env() -> AccountEnv {
+    fallback_account_env()
+}
+
+fn fallback_account_env() -> AccountEnv {
+    AccountEnv {
+        home: std::env::var("HOME").ok(),
+        shell: std::env::var("SHELL").ok(),
+        user: std::env::var("USER")
+            .ok()
+            .or_else(|| std::env::var("LOGNAME").ok()),
+    }
+}
+
+fn shell_path() -> String {
+    merge_path_parts([
+        std::env::var("PATH").ok(),
+        macos_path_helper_path(),
+        Some(default_unix_path().to_string()),
+    ])
+}
+
+fn default_unix_path() -> &'static str {
+    "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:~/.cargo/bin:~/.local/bin"
+}
+
+fn merge_path_parts(parts: impl IntoIterator<Item = Option<String>>) -> String {
+    let mut paths = Vec::<PathBuf>::new();
+    for part in parts.into_iter().flatten() {
+        paths.extend(std::env::split_paths(&expand_home_in_path_list(&part)));
+    }
+
+    let mut merged = Vec::<PathBuf>::new();
+    for path in paths {
+        if !merged.iter().any(|existing| existing == &path) {
+            merged.push(path);
+        }
+    }
+
+    std::env::join_paths(merged)
+        .ok()
+        .and_then(|path| path.into_string().ok())
+        .unwrap_or_else(|| default_unix_path().to_string())
+}
+
+fn expand_home_in_path_list(path: &str) -> String {
+    let Some(home) = account_env().home else {
+        return path.to_string();
+    };
+
+    path.split(':')
+        .map(|part| {
+            part.strip_prefix("~/")
+                .map(|rest| format!("{home}/{rest}"))
+                .unwrap_or_else(|| part.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_path_helper_path() -> Option<String> {
+    let output = Command::new("/usr/libexec/path_helper")
+        .arg("-s")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.split(';').find_map(|part| {
+        let value = part.trim().strip_prefix("PATH=")?;
+        Some(unquote_shell_value(value).to_string())
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_path_helper_path() -> Option<String> {
+    None
+}
+
+fn unquote_shell_value(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let quoted = (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'');
+        if quoted {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }
 
 #[cfg(target_os = "linux")]
@@ -219,4 +385,29 @@ fn cwd_of_pid(pid: u32) -> Option<String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn cwd_of_pid(_pid: u32) -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unquote_shell_value_handles_path_helper_output() {
+        assert_eq!(unquote_shell_value(r#""/usr/bin:/bin""#), "/usr/bin:/bin");
+        assert_eq!(
+            unquote_shell_value("'/opt/homebrew/bin'"),
+            "/opt/homebrew/bin"
+        );
+        assert_eq!(unquote_shell_value("/usr/local/bin"), "/usr/local/bin");
+    }
+
+    #[test]
+    fn merge_path_parts_preserves_order_and_removes_duplicates() {
+        let merged = merge_path_parts([
+            Some("/usr/bin:/bin".to_string()),
+            Some("/bin:/opt/homebrew/bin".to_string()),
+        ]);
+
+        assert_eq!(merged, "/usr/bin:/bin:/opt/homebrew/bin");
+    }
 }

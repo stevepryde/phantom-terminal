@@ -1,12 +1,12 @@
-import { FitAddon, init, Terminal } from "ghostty-web";
+import { FitAddon, Ghostty, Terminal } from "ghostty-web";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
 
 // ghostty-web's WASM is initialised once for the whole app.
-let initPromise: Promise<void> | null = null;
-function ensureInit(): Promise<void> {
-  if (!initPromise) initPromise = init();
-  return initPromise;
+let ghosttyPromise: Promise<Ghostty> | null = null;
+function ensureGhostty(): Promise<Ghostty> {
+  ghosttyPromise ??= Ghostty.load(import.meta.env.DEV ? undefined : "/ghostty-vt.wasm");
+  return ghosttyPromise;
 }
 
 function nextFrame(): Promise<void> {
@@ -40,10 +40,11 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
     const disposers: Array<() => void> = [];
 
     (async () => {
-      await ensureInit();
+      const ghostty = await ensureGhostty();
       if (disposed || !containerRef.current) return;
 
       const term = new Terminal({
+        ghostty,
         fontFamily: config.font_family,
         fontSize: config.font_size,
         theme: ghosttyTheme(config.theme),
