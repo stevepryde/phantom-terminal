@@ -41,5 +41,8 @@ pnpm-debug.log*
 .DS_Store
 *.sw?
 
+# Claude Code local state
+.claude/
+
 # SBOM / audit artifacts
 *.sbom.json
