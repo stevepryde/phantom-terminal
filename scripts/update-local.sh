@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Build the current checkout and install it locally.
 #
-# This installs WHAT IS CHECKED OUT — it deliberately does not touch git. To
+# This installs WHAT IS CHECKED OUT - it deliberately does not touch git. To
 # update first, use your normal workflow (`git pull`, switch branches, etc.) and
 # then run this. Keeping the two separate means the script never rewrites itself
 # mid-run, and you always know exactly what you're installing.
 #
-# Phantom Terminal ships no network auto-updater on purpose — the no-network
+# Phantom Terminal ships no network auto-updater on purpose - the no-network
 # security posture (enforced by scripts/check-no-network.sh in CI) forbids the
 # tauri-plugin-updater and any outbound HTTP. Rebuilding from source is the
 # update path.
@@ -23,7 +23,7 @@ note() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# ── Resolve repo root (this script lives in <root>/scripts) ──────────────────
+# Resolve repo root (this script lives in <root>/scripts).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
@@ -41,8 +41,8 @@ PRODUCT_NAME="Phantom Terminal"
 VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version" 2>/dev/null || echo '?')"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
 
-# ── Build the release bundle (tauri runs the frontend build first) ───────────
-note "Building $PRODUCT_NAME v$VERSION ($COMMIT)…"
+# Build the release bundle (tauri runs the frontend build first).
+note "Building ${PRODUCT_NAME} v${VERSION} (${COMMIT})..."
 bun run tauri build
 
 if [ "$INSTALL" -eq 0 ]; then
@@ -50,7 +50,7 @@ if [ "$INSTALL" -eq 0 ]; then
   exit 0
 fi
 
-# ── Install over the existing copy, per-platform ─────────────────────────────
+# Install over the existing copy, per-platform.
 BUNDLE_DIR="src-tauri/target/release/bundle"
 OS="$(uname -s)"
 
@@ -63,13 +63,13 @@ case "$OS" in
 
     # Quit a running instance so we can replace it cleanly.
     if pgrep -f "$PRODUCT_NAME.app/Contents/MacOS/" >/dev/null 2>&1; then
-      note "Quitting running $PRODUCT_NAME…"
+      note "Quitting running ${PRODUCT_NAME}..."
       osascript -e "tell application \"$PRODUCT_NAME\" to quit" >/dev/null 2>&1 || true
       sleep 1
       pkill -f "$PRODUCT_NAME.app/Contents/MacOS/" 2>/dev/null || true
     fi
 
-    note "Installing to $APP_DST…"
+    note "Installing to ${APP_DST}..."
     mkdir -p "$INSTALL_DIR" 2>/dev/null || true
     if [ ! -d "$INSTALL_DIR" ] || [ ! -w "$INSTALL_DIR" ]; then
       die "$INSTALL_DIR is not writable. Re-run with INSTALL_DIR=\"\$HOME/Applications\" or use sudo."
@@ -91,7 +91,7 @@ case "$OS" in
       INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
       mkdir -p "$INSTALL_DIR"
       dst="$INSTALL_DIR/phantom-terminal.AppImage"
-      note "Installing AppImage to $dst…"
+      note "Installing AppImage to ${dst}..."
       install -m 0755 "$appimage" "$dst"
       note "Done. Launch with: $dst"
       case ":$PATH:" in *":$INSTALL_DIR:"*) ;; *) warn "$INSTALL_DIR is not on your PATH.";; esac
@@ -104,6 +104,6 @@ case "$OS" in
     ;;
 
   *)
-    die "unsupported platform '$OS' — install the bundle from $BUNDLE_DIR manually."
+    die "unsupported platform '$OS' - install the bundle from $BUNDLE_DIR manually."
     ;;
 esac
