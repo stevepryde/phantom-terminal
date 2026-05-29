@@ -1,3 +1,4 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState } from "react";
 import { CommandPalette } from "./command-palette/CommandPalette";
 import {
@@ -5,6 +6,7 @@ import {
   configGet,
   configSet,
   homeDir,
+  isTauri,
   ptyCwd,
   type TabRecord,
   tabsLoad,
@@ -38,6 +40,7 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [chromePaintRevision, setChromePaintRevision] = useState(0);
   const readyRef = useRef(false);
   // Mirror config into a ref so the (deps-free) keyboard/command handlers can
   // read the current default profile without re-binding listeners.
@@ -246,6 +249,55 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
+  // Moving a WKWebView between macOS displays can leave custom draggable chrome
+  // in a stale paint state until the next resize. Nudge chrome + terminals after
+  // display-affecting window events so crossing screens behaves like a resize.
+  useEffect(() => {
+    if (!isTauri()) return;
+
+    const win = getCurrentWindow();
+    let timers: Array<ReturnType<typeof setTimeout>> = [];
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+
+    const clearRefreshTimers = () => {
+      for (const timer of timers) clearTimeout(timer);
+      timers = [];
+    };
+
+    const emitDisplayLayoutRefresh = () => {
+      if (disposed) return;
+      setChromePaintRevision((revision) => revision + 1);
+      window.dispatchEvent(new Event("phantom:display-layout-change"));
+    };
+
+    const refreshDisplayLayout = () => {
+      clearRefreshTimers();
+      timers = [0, 50, 150, 300].map((delay) => setTimeout(emitDisplayLayoutRefresh, delay));
+    };
+
+    void Promise.all([
+      win.onScaleChanged(refreshDisplayLayout),
+      win.onMoved(refreshDisplayLayout),
+      win.onResized(refreshDisplayLayout),
+      win.onFocusChanged(({ payload: focused }) => {
+        if (focused) refreshDisplayLayout();
+      }),
+    ]).then((listeners) => {
+      if (disposed) {
+        for (const unlisten of listeners) unlisten();
+      } else {
+        unlisteners.push(...listeners);
+      }
+    });
+
+    return () => {
+      disposed = true;
+      clearRefreshTimers();
+      for (const unlisten of unlisteners) unlisten();
+    };
+  }, []);
+
   if (!config) {
     return <div className="grid h-full place-items-center text-white/40">Loading…</div>;
   }
@@ -253,6 +305,7 @@ export default function App() {
   return (
     <div className="relative flex h-full flex-col">
       <TabBar
+        paintRevision={chromePaintRevision}
         tabs={tabs}
         activeId={activeId}
         editingId={editingId}

@@ -1,4 +1,4 @@
-import { FitAddon, Ghostty, Terminal } from "ghostty-web";
+import { FitAddon, type FontMetrics, Ghostty, Terminal } from "ghostty-web";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
 
@@ -11,6 +11,25 @@ function ensureGhostty(): Promise<Ghostty> {
 
 function nextFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+interface LineHeightRenderer {
+  devicePixelRatio?: number;
+  metrics?: FontMetrics;
+  getMetrics: () => FontMetrics;
+  render: (
+    buffer: unknown,
+    forceAll?: boolean,
+    viewportY?: number,
+    scrollbackProvider?: unknown,
+    scrollbarOpacity?: number,
+  ) => void;
+  remeasureFont: () => void;
+  resize: (cols: number, rows: number) => void;
+}
+
+interface TerminalInternals {
+  renderer?: LineHeightRenderer;
 }
 
 interface Props {
@@ -52,8 +71,6 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         cursorStyle: config.cursor_style,
         scrollback: config.scrollback_lines,
       });
-      const termOptions = term as unknown as { options?: Record<string, unknown> };
-      if (termOptions.options) termOptions.options.lineHeight = config.line_height;
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(containerRef.current);
@@ -63,7 +80,9 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
 
       await nextFrame();
       if (disposed || !containerRef.current) return;
+      refreshTerminalDisplay(term, config.line_height);
       fit.fit();
+      forceTerminalRender(term);
 
       const ptyId = await spawnPty(
         {
@@ -124,22 +143,51 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   useLayoutEffect(() => {
     if (!active) return;
     termRef.current?.focus();
-    const id = requestAnimationFrame(() => fitRef.current?.fit());
+    const id = requestAnimationFrame(() => {
+      const term = termRef.current;
+      if (!term) return;
+      refreshTerminalDisplay(term, config.line_height);
+      fitRef.current?.fit();
+      forceTerminalRender(term);
+    });
     return () => cancelAnimationFrame(id);
-  }, [active]);
+  }, [active, config.line_height]);
+
+  // Display scale changes do not always trigger a useful ResizeObserver event
+  // inside WKWebView. Re-apply metrics and fit when the app-level chrome nudge
+  // fires after moving between monitors.
+  useEffect(() => {
+    const onDisplayLayoutChange = () => {
+      const term = termRef.current;
+      if (!term) return;
+      refreshTerminalDisplay(term, config.line_height);
+      fitRef.current?.fit();
+      forceTerminalRender(term);
+
+      requestAnimationFrame(() => {
+        refreshTerminalDisplay(term, config.line_height);
+        fitRef.current?.fit();
+        forceTerminalRender(term);
+      });
+    };
+
+    window.addEventListener("phantom:display-layout-change", onDisplayLayoutChange);
+    return () => window.removeEventListener("phantom:display-layout-change", onDisplayLayoutChange);
+  }, [config.line_height]);
 
   // Live theme/font updates without respawning the shell.
   useEffect(() => {
-    const term = termRef.current as unknown as { options?: Record<string, unknown> } | null;
-    if (term?.options) {
+    const term = termRef.current;
+    if (term) {
       term.options.fontSize = config.font_size;
       term.options.fontFamily = config.font_family;
-      term.options.lineHeight = config.line_height;
       term.options.theme = ghosttyTheme(config.theme);
       term.options.cursorBlink = config.cursor_blink;
       term.options.cursorStyle = config.cursor_style;
       term.options.scrollback = config.scrollback_lines;
+      refreshTerminalDisplay(term, config.line_height);
       fitRef.current?.fit();
+      forceTerminalRender(term);
     }
   }, [
     config.font_family,
@@ -165,3 +213,27 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
 
 // Keep onExit referenced for future PTY-exit handling.
 export type { Props as TerminalViewProps };
+
+function refreshTerminalDisplay(term: Terminal, lineHeight: number) {
+  const renderer = (term as unknown as TerminalInternals).renderer;
+  if (!renderer) return;
+
+  renderer.devicePixelRatio = window.devicePixelRatio || 1;
+  renderer.remeasureFont();
+  const metrics = renderer.getMetrics();
+  const height = Math.max(metrics.height, Math.ceil(metrics.height * lineHeight));
+  const extra = height - metrics.height;
+  renderer.metrics = {
+    ...metrics,
+    height,
+    baseline: metrics.baseline + Math.floor(extra / 2),
+  };
+  renderer.resize(term.cols, term.rows);
+  forceTerminalRender(term);
+}
+
+function forceTerminalRender(term: Terminal) {
+  const renderer = (term as unknown as TerminalInternals).renderer;
+  if (!renderer || !term.wasmTerm) return;
+  renderer.render(term.wasmTerm, true, term.viewportY, term);
+}

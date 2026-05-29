@@ -6,6 +6,7 @@ import { moveTab, type Tab, tabTitle } from "../store/tabs";
 import { TabContextMenu } from "./TabContextMenu";
 
 interface Props {
+  paintRevision?: number;
   tabs: Tab[];
   activeId: string | null;
   editingId: string | null;
@@ -20,6 +21,7 @@ interface Props {
 }
 
 export function TabBar({
+  paintRevision = 0,
   tabs,
   activeId,
   editingId,
@@ -104,7 +106,10 @@ export function TabBar({
     <>
       <div
         data-tauri-drag-region
-        className="flex h-10 shrink-0 items-stretch gap-1 border-white/10 border-b bg-[#111116] px-1"
+        className="flex h-10 shrink-0 items-stretch gap-1 border-white/10 border-b bg-[#111116] px-1 will-change-transform"
+        style={{
+          transform: paintRevision % 2 === 0 ? "translateZ(0)" : "translateZ(0.001px)",
+        }}
       >
         <WindowControls placement="leading" />
         {/* Sizes to the tabs' width, but shrinks (min-w-0) to scroll when they
