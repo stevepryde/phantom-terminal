@@ -246,9 +246,12 @@ jobs:
         with:
           tool: cargo-cyclonedx
 
+      # cargo-cyclonedx writes the SBOM next to the manifest and --override-filename
+      # is a bare basename (path separators are rejected), so it lands at
+      # src-tauri/sbom-rust.json — referenced as such in the upload step below.
       - name: Rust SBOM
         working-directory: src-tauri
-        run: cargo cyclonedx --format json --override-filename ../sbom-rust
+        run: cargo cyclonedx --format json --override-filename sbom-rust
 
       - name: JS SBOM
         run: bunx @cyclonedx/cdxgen@11 -t bun -o sbom-js.json . || echo "cdxgen produced no output"
@@ -257,6 +260,6 @@ jobs:
         with:
           name: sbom
           path: |
-            sbom-rust.json
+            src-tauri/sbom-rust.json
             sbom-js.json
           if-no-files-found: warn
