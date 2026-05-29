@@ -1,0 +1,80 @@
+# osv-scanner advisory policy — mirrors the cargo-deny ignore list in
+# src-tauri/deny.toml. Every entry is an *unmaintained* or *unsound* informational
+# advisory in a transitive dependency that Tauri 2 pins (GTK3 / gtk-rs 0.18, unic-*),
+# with no safe upgrade available while we track Tauri 2. None is an exploitable
+# vulnerability and none is in our direct dependency tree. Keep this in sync with
+# src-tauri/deny.toml; revisit when Tauri migrates off GTK3 / unic.
+#
+# Passed to osv-scanner via `--config=osv-scanner.toml` in .github/workflows/ci.yml.
+
+# ── gtk-rs GTK3 bindings — Tauri's Linux webview backend (wry → webkit2gtk) ──
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0411"
+reason = "Unmaintained gtk-rs GTK3 binding (gdkwayland-sys), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0412"
+reason = "Unmaintained gtk-rs GTK3 binding (gdk), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0413"
+reason = "Unmaintained gtk-rs GTK3 binding (atk), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0414"
+reason = "Unmaintained gtk-rs GTK3 binding (gdkx11-sys), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0415"
+reason = "Unmaintained gtk-rs GTK3 binding (gtk), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0416"
+reason = "Unmaintained gtk-rs GTK3 binding (atk-sys), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0417"
+reason = "Unmaintained gtk-rs GTK3 binding (gdkx11), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0418"
+reason = "Unmaintained gtk-rs GTK3 binding (gdk-sys), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0419"
+reason = "Unmaintained gtk-rs GTK3 binding (gtk3-macros), pinned transitively by Tauri 2; no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0420"
+reason = "Unmaintained gtk-rs GTK3 binding (gtk-sys), pinned transitively by Tauri 2; no upgrade path."
+
+# ── glib unsoundness (informational; no CVSS in RustSec) ────────────────────
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0429"
+reason = "Unsoundness in glib::VariantStrIter (glib 0.18.5); fix needs glib 0.20 / gtk-rs 0.20. Pinned transitively by gtk 0.18; our code never calls VariantStrIter."
+
+# ── unic-* family — via tauri-utils → urlpattern → unic-ucd-* ────────────────
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0075"
+reason = "Unmaintained unic-char-range, pulled in transitively by Tauri (urlpattern); no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0080"
+reason = "Unmaintained unic-common, pulled in transitively by Tauri (urlpattern); no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0081"
+reason = "Unmaintained unic-char-property, pulled in transitively by Tauri (urlpattern); no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0098"
+reason = "Unmaintained unic-ucd-version, pulled in transitively by Tauri (urlpattern); no upgrade path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0100"
+reason = "Unmaintained unic-ucd-ident, pulled in transitively by Tauri (urlpattern); no upgrade path."
+
+# ── proc-macro-error — build-time macro dependency in the Tauri toolchain ────
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0370"
+reason = "Unmaintained proc-macro-error, build-time only, pulled in transitively by the Tauri toolchain; no upgrade path."
