@@ -106,6 +106,7 @@ export function TabBar({
         data-tauri-drag-region
         className="flex h-10 shrink-0 items-stretch gap-1 border-white/10 border-b bg-[#111116] px-1"
       >
+        <WindowControls placement="leading" />
         {/* Sizes to the tabs' width, but shrinks (min-w-0) to scroll when they
             overflow. Because it isn't flex-1, the New Tab button after it sits
             right next to the tabs when they fit and pins to the right edge of
@@ -184,7 +185,8 @@ export function TabBar({
             className="my-1.5 w-8"
             onClick={onOpenSettings}
           />
-          <WindowControls />
+          <WindowControls placement="trailing" />
+          <div aria-hidden className="h-full w-3 shrink-0" data-tauri-drag-region />
         </div>
       </div>
       {menu && (
