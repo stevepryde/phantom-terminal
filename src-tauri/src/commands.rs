@@ -3,9 +3,11 @@ use tauri::State;
 
 use crate::config::AppConfig;
 use crate::error::command_error;
-use crate::pty::SpawnOpts;
+use crate::pty::{LaunchOpts, SpawnOpts};
 use crate::session::TabRecord;
 use crate::AppState;
+
+const MAX_SPAWN_CWD_LEN: usize = 4096;
 
 #[tauri::command]
 pub fn pty_spawn(
@@ -13,7 +15,33 @@ pub fn pty_spawn(
     opts: SpawnOpts,
     on_data: Channel<Vec<u8>>,
 ) -> Result<u32, String> {
-    state.pty.spawn(opts, on_data).map_err(command_error)
+    let config = state.store.load_config().map_err(command_error)?;
+    let profile = config
+        .profile(opts.shell_profile_id.as_deref())
+        .ok_or_else(|| "no shell profile available".to_string())?;
+    let cwd = opts
+        .cwd
+        .filter(|cwd| !cwd.trim().is_empty())
+        .or_else(|| profile.cwd.clone());
+    validate_spawn_cwd(cwd.as_deref()).map_err(command_error)?;
+
+    state
+        .pty
+        .spawn(
+            LaunchOpts {
+                command: if profile.command.trim().is_empty() {
+                    None
+                } else {
+                    Some(profile.command.clone())
+                },
+                args: profile.args.clone(),
+                cwd,
+                rows: opts.rows,
+                cols: opts.cols,
+            },
+            on_data,
+        )
+        .map_err(command_error)
 }
 
 #[tauri::command]
@@ -61,4 +89,20 @@ pub fn config_set(state: State<AppState>, config: AppConfig) -> Result<(), Strin
 #[tauri::command]
 pub fn home_dir() -> Option<String> {
     directories::BaseDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
+}
+
+fn validate_spawn_cwd(cwd: Option<&str>) -> crate::error::AppResult<()> {
+    if let Some(cwd) = cwd {
+        if cwd.len() > MAX_SPAWN_CWD_LEN {
+            return Err(crate::error::AppError::InvalidConfig(
+                "working directory path is too long".to_string(),
+            ));
+        }
+        if cwd.contains('\0') {
+            return Err(crate::error::AppError::InvalidConfig(
+                "working directory cannot contain NUL bytes".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }

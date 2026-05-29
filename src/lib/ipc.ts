@@ -5,19 +5,21 @@ export const isTauri = (): boolean =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export interface SpawnOpts {
-  command?: string | null;
-  args?: string[];
+  shell_profile_id?: string | null;
   cwd?: string | null;
   rows: number;
   cols: number;
 }
 
 export interface TabRecord {
+  id?: string | null;
   title: string;
   cwd: string;
   sort_order?: number;
   is_active?: boolean;
   shell_profile_id?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface Theme {
@@ -51,12 +53,22 @@ export interface ShellProfile {
   cwd?: string | null;
 }
 
+export interface Keybinding {
+  id: string;
+  action: string;
+  keys: string;
+}
+
 export interface AppConfig {
   font_family: string;
   font_size: number;
+  line_height: number;
+  cursor_style: "block" | "bar" | "underline";
+  cursor_blink: boolean;
   theme: Theme;
   shell_profiles: ShellProfile[];
   default_shell_profile_id: string;
+  keybindings: Keybinding[];
   restore_on_launch: boolean;
   /** In-memory scrollback lines per terminal; never persisted to disk. */
   scrollback_lines: number;

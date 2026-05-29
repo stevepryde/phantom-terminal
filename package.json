@@ -10,27 +10,30 @@
     "tauri": "tauri",
     "update": "bash scripts/update-local.sh",
     "typecheck": "tsc --noEmit",
-    "lint": "biome check src package.json tsconfig.json vite.config.ts biome.json",
+    "lint": "biome check src scripts package.json tsconfig.json vite.config.ts biome.json",
     "format": "biome format --write .",
-    "audit": "bun audit --audit-level=high"
+    "test": "bun test",
+    "audit": "bun audit --audit-level=high",
+    "sbom:js": "bun scripts/sbom-js.ts sbom-js.json"
   },
   "trustedDependencies": [],
   "dependencies": {
-    "@tauri-apps/api": "^2",
-    "ghostty-web": "^0.4.0",
-    "lucide-react": "^0.460.0",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "@tauri-apps/api": "2.11.0",
+    "ghostty-web": "0.4.0",
+    "lucide-react": "1.16.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
   },
   "devDependencies": {
-    "@biomejs/biome": "^1.9.4",
-    "@tailwindcss/vite": "^4.3.0",
-    "@tauri-apps/cli": "^2",
-    "@types/react": "^19.1.8",
-    "@types/react-dom": "^19.1.6",
-    "@vitejs/plugin-react": "^4.6.0",
-    "tailwindcss": "^4.3.0",
-    "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "@biomejs/biome": "2.4.15",
+    "@tailwindcss/vite": "4.3.0",
+    "@tauri-apps/cli": "2.11.2",
+    "@types/bun": "1.3.14",
+    "@types/react": "19.2.15",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "tailwindcss": "4.3.0",
+    "typescript": "6.0.3",
+    "vite": "8.0.14"
   }
 }

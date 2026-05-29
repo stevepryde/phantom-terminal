@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
 use rusqlite::Connection;
@@ -10,6 +11,8 @@ use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabRecord {
+    #[serde(default)]
+    pub id: Option<String>,
     pub title: String,
     pub cwd: String,
     #[serde(default)]
@@ -19,6 +22,10 @@ pub struct TabRecord {
     /// Which shell profile this tab was launched with, for faithful restore.
     #[serde(default)]
     pub shell_profile_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 pub struct SessionStore {
@@ -30,10 +37,12 @@ impl SessionStore {
         let path = db_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            restrict_dir_permissions(parent);
         }
         let conn = Connection::open(&path)?;
-        restrict_permissions(&path);
+        restrict_db_permissions(&path);
         migrate(&conn)?;
+        restrict_db_permissions(&path);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -46,16 +55,19 @@ impl SessionStore {
     pub fn load_tabs(&self) -> AppResult<Vec<TabRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT title, cwd, sort_order, is_active, shell_profile_id \
+            "SELECT tab_uid, title, cwd, sort_order, is_active, shell_profile_id, created_at, updated_at \
              FROM tabs ORDER BY sort_order",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(TabRecord {
-                title: row.get(0)?,
-                cwd: row.get(1)?,
-                sort_order: row.get(2)?,
-                is_active: row.get::<_, i64>(3)? != 0,
-                shell_profile_id: row.get(4)?,
+                id: row.get(0)?,
+                title: row.get(1)?,
+                cwd: row.get(2)?,
+                sort_order: row.get(3)?,
+                is_active: row.get::<_, i64>(4)? != 0,
+                shell_profile_id: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -67,14 +79,17 @@ impl SessionStore {
         tx.execute("DELETE FROM tabs", [])?;
         for (i, t) in tabs.iter().enumerate() {
             tx.execute(
-                "INSERT INTO tabs (title, cwd, sort_order, is_active, shell_profile_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO tabs (tab_uid, title, cwd, sort_order, is_active, shell_profile_id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
+                    t.id,
                     t.title,
                     t.cwd,
                     i as i64,
                     t.is_active as i64,
-                    t.shell_profile_id
+                    t.shell_profile_id,
+                    t.created_at,
+                    t.updated_at
                 ],
             )?;
         }
@@ -84,39 +99,52 @@ impl SessionStore {
 
     pub fn load_config(&self) -> AppResult<AppConfig> {
         let conn = self.lock();
-        let value: Option<String> = conn
-            .query_row("SELECT value FROM config WHERE key = 'app'", [], |r| {
+        let value: Option<String> =
+            match conn.query_row("SELECT value FROM config WHERE key = 'app'", [], |r| {
                 r.get(0)
-            })
-            .ok();
+            }) {
+                Ok(value) => Some(value),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(error) => return Err(error.into()),
+            };
         match value {
-            Some(json) => Ok(serde_json::from_str(&json)?),
-            None => Ok(AppConfig::default()),
+            Some(json) => match serde_json::from_str::<AppConfig>(&json)
+                .map_err(AppError::from)
+                .and_then(AppConfig::validated)
+            {
+                Ok(config) => Ok(config),
+                Err(error) => {
+                    let _ = backup_invalid_config(&conn, &json, &error.to_string());
+                    let default = AppConfig::default().validated()?;
+                    save_config_conn(&conn, &default)?;
+                    Ok(default)
+                }
+            },
+            None => Ok(AppConfig::default().validated()?),
         }
     }
 
     pub fn save_config(&self, config: &AppConfig) -> AppResult<()> {
-        let json = serde_json::to_string(config)?;
         let conn = self.lock();
-        conn.execute(
-            "INSERT INTO config (key, value) VALUES ('app', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![json],
-        )?;
-        Ok(())
+        config.validate()?;
+        save_config_conn(&conn, config)
     }
 }
 
 fn migrate(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
+         PRAGMA secure_delete=ON;
          CREATE TABLE IF NOT EXISTS tabs (
             id               INTEGER PRIMARY KEY,
+            tab_uid          TEXT,
             title            TEXT NOT NULL,
             cwd              TEXT NOT NULL,
             sort_order       INTEGER NOT NULL,
             is_active        INTEGER NOT NULL DEFAULT 0,
-            shell_profile_id TEXT
+            shell_profile_id TEXT,
+            created_at       TEXT,
+            updated_at       TEXT
          );
          CREATE TABLE IF NOT EXISTS config (
             key   TEXT PRIMARY KEY,
@@ -127,6 +155,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     // `CREATE TABLE IF NOT EXISTS` above leaves a pre-existing `tabs` table
     // untouched, so new columns must be added explicitly here.
     add_column_if_missing(conn, "tabs", "shell_profile_id", "TEXT")?;
+    add_column_if_missing(conn, "tabs", "tab_uid", "TEXT")?;
+    add_column_if_missing(conn, "tabs", "created_at", "TEXT")?;
+    add_column_if_missing(conn, "tabs", "updated_at", "TEXT")?;
     Ok(())
 }
 
@@ -153,6 +184,33 @@ fn add_column_if_missing(
     Ok(())
 }
 
+fn save_config_conn(conn: &Connection, config: &AppConfig) -> AppResult<()> {
+    let json = serde_json::to_string(config)?;
+    conn.execute(
+        "INSERT INTO config (key, value) VALUES ('app', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![json],
+    )?;
+    Ok(())
+}
+
+fn backup_invalid_config(conn: &Connection, json: &str, reason: &str) -> AppResult<()> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let key = format!("app.invalid.{stamp}");
+    let backup = serde_json::json!({
+        "reason": reason,
+        "value": json,
+    });
+    conn.execute(
+        "INSERT INTO config (key, value) VALUES (?1, ?2)",
+        rusqlite::params![key, backup.to_string()],
+    )?;
+    Ok(())
+}
+
 fn db_path() -> AppResult<PathBuf> {
     let dirs = ProjectDirs::from("com", "phantom", "terminal")
         .ok_or_else(|| AppError::Other("could not resolve app data directory".to_string()))?;
@@ -160,7 +218,20 @@ fn db_path() -> AppResult<PathBuf> {
 }
 
 #[cfg(unix)]
-fn restrict_permissions(path: &std::path::Path) {
+fn restrict_dir_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_permissions(_path: &std::path::Path) {}
+
+#[cfg(unix)]
+fn restrict_file_permissions(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
         let mut perms = meta.permissions();
@@ -170,7 +241,15 @@ fn restrict_permissions(path: &std::path::Path) {
 }
 
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &std::path::Path) {}
+fn restrict_file_permissions(_path: &std::path::Path) {}
+
+fn restrict_db_permissions(path: &std::path::Path) {
+    restrict_file_permissions(path);
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        restrict_file_permissions(&path.with_file_name(format!("{name}-wal")));
+        restrict_file_permissions(&path.with_file_name(format!("{name}-shm")));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -186,11 +265,14 @@ mod tests {
 
     fn tab(title: &str, cwd: &str, active: bool) -> TabRecord {
         TabRecord {
+            id: None,
             title: title.into(),
             cwd: cwd.into(),
             sort_order: 0,
             is_active: active,
             shell_profile_id: None,
+            created_at: None,
+            updated_at: None,
         }
     }
 
@@ -306,5 +388,41 @@ mod tests {
         cfg.font_size = 11;
         store.save_config(&cfg).unwrap();
         assert_eq!(store.load_config().unwrap().font_size, 11);
+    }
+
+    #[test]
+    fn save_config_rejects_invalid_config() {
+        let store = in_memory();
+        let cfg = AppConfig {
+            shell_profiles: Vec::new(),
+            ..AppConfig::default()
+        };
+        assert!(store.save_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn load_config_recovers_from_invalid_json_and_keeps_backup() {
+        let store = in_memory();
+        {
+            let conn = store.lock();
+            conn.execute(
+                "INSERT INTO config (key, value) VALUES ('app', '{bad json')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let cfg = store.load_config().unwrap();
+        assert_eq!(cfg.font_size, AppConfig::default().font_size);
+
+        let conn = store.lock();
+        let backup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config WHERE key LIKE 'app.invalid.%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backup_count, 1);
     }
 }

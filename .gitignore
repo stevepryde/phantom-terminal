@@ -45,3 +45,5 @@ pnpm-debug.log*
 
 # SBOM / audit artifacts
 *.sbom.json
+sbom-*.json
+src-tauri/sbom-*.json

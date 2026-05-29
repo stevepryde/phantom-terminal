@@ -1,4 +1,4 @@
-import { History, Palette, Plus, SlidersHorizontal, Terminal, Trash2 } from "lucide-react";
+import { History, Palette, Plus, SlidersHorizontal, Terminal, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CustomDropdown } from "../components/CustomDropdown";
 import type { AppConfig, ShellProfile, Theme } from "../lib/ipc";
@@ -175,6 +175,43 @@ function AppearanceSection({ config, onChange }: Props) {
           onChange={(e) => onChange({ font_size: Number(e.target.value) })}
         />
       </Field>
+
+      <Field label={`Line height (${config.line_height.toFixed(2)})`}>
+        <input
+          type="range"
+          min={1}
+          max={2.5}
+          step={0.05}
+          value={config.line_height}
+          className="w-full accent-white/80"
+          onChange={(e) => onChange({ line_height: Number(e.target.value) })}
+        />
+      </Field>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Cursor style">
+          <CustomDropdown
+            value={config.cursor_style}
+            options={[
+              { value: "block", label: "Block" },
+              { value: "bar", label: "Bar" },
+              { value: "underline", label: "Underline" },
+            ]}
+            onChange={(value) => onChange({ cursor_style: value as AppConfig["cursor_style"] })}
+          />
+        </Field>
+        <Field label="Cursor">
+          <label className="flex h-8 cursor-pointer items-center gap-2 rounded border border-white/10 bg-black/20 px-2 text-white/70">
+            <input
+              type="checkbox"
+              checked={config.cursor_blink}
+              className="accent-white/80"
+              onChange={(e) => onChange({ cursor_blink: e.target.checked })}
+            />
+            <span>Blink</span>
+          </label>
+        </Field>
+      </div>
     </Section>
   );
 }
@@ -284,18 +321,8 @@ function ProfilesSection({ config, onChange }: Props) {
                   onChange={(e) => updateProfile(p.id, { command: e.target.value })}
                 />
               </Field>
-              <Field label="Args (space-separated)">
-                <input
-                  type="text"
-                  value={p.args.join(" ")}
-                  spellCheck={false}
-                  className="w-full rounded border border-white/10 bg-black/30 px-2 py-1 font-mono text-xs outline-none focus:border-white/30"
-                  onChange={(e) =>
-                    updateProfile(p.id, {
-                      args: e.target.value.split(/\s+/).filter(Boolean),
-                    })
-                  }
-                />
+              <Field label="Arguments">
+                <ArgsList args={p.args} onChange={(args) => updateProfile(p.id, { args })} />
               </Field>
               <Field label="Working directory (optional)">
                 <input
@@ -319,6 +346,54 @@ function ProfilesSection({ config, onChange }: Props) {
         </button>
       </div>
     </Section>
+  );
+}
+
+function ArgsList({ args, onChange }: { args: string[]; onChange: (args: string[]) => void }) {
+  const updateArg = (index: number, value: string) => {
+    onChange(args.map((arg, i) => (i === index ? value : arg)));
+  };
+  const removeArg = (index: number) => {
+    onChange(args.filter((_, i) => i !== index));
+  };
+  return (
+    <div className="space-y-1.5">
+      {args.length === 0 ? (
+        <div className="rounded border border-white/10 border-dashed px-2 py-1.5 text-white/30 text-xs">
+          No arguments
+        </div>
+      ) : (
+        args.map((arg, index) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: shell args are an ordered vector and duplicate values are valid.
+          <div key={index} className="flex items-center gap-1.5">
+            <input
+              type="text"
+              value={arg}
+              aria-label={`Argument ${index + 1}`}
+              spellCheck={false}
+              className="min-w-0 flex-1 rounded border border-white/10 bg-black/30 px-2 py-1 font-mono text-xs outline-none focus:border-white/30"
+              onChange={(e) => updateArg(index, e.target.value)}
+            />
+            <button
+              type="button"
+              aria-label={`Remove argument ${index + 1}`}
+              title="Remove argument"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-white/50 hover:bg-white/10 hover:text-white"
+              onClick={() => removeArg(index)}
+            >
+              <X size={13} />
+            </button>
+          </div>
+        ))
+      )}
+      <button
+        type="button"
+        className="flex items-center gap-1.5 rounded border border-white/15 border-dashed px-2 py-1 text-white/55 text-xs hover:border-white/30 hover:text-white"
+        onClick={() => onChange([...args, ""])}
+      >
+        <Plus size={12} /> Add argument
+      </button>
+    </div>
   );
 }
 

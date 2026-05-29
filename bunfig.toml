@@ -4,3 +4,7 @@
 # dangerous in its first hours before it is caught and yanked; this cooldown
 # means we never install into that window.
 minimumReleaseAge = 604800
+
+# Bun blocks dependency lifecycle scripts unless a package is listed here.
+# Keep this empty unless a package has been explicitly reviewed.
+trustedDependencies = []

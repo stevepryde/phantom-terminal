@@ -2,11 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { CommandPalette } from "./command-palette/CommandPalette";
 import {
   type AppConfig,
-  type TabRecord,
   configGet,
   configSet,
   homeDir,
   ptyCwd,
+  type TabRecord,
   tabsLoad,
   tabsSave,
 } from "./lib/ipc";
@@ -14,7 +14,6 @@ import { setHomeDir } from "./lib/paths";
 import { useStore } from "./lib/store";
 import { SettingsView } from "./settings/SettingsView";
 import {
-  type Tab,
   activateIndex,
   activateRelative,
   activateTab,
@@ -24,6 +23,7 @@ import {
   renameTab,
   setTabCwd,
   setTabPty,
+  type Tab,
   tabsStore,
   toggleSettingsTab,
 } from "./store/tabs";
@@ -104,9 +104,12 @@ export default function App() {
         let activate: string | null = null;
         for (const r of restored) {
           const id = addTab({
+            id: r.id ?? null,
             cwd: r.cwd,
             customTitle: r.title || null,
             shellProfileId: r.shell_profile_id ?? null,
+            createdAt: r.created_at ?? null,
+            updatedAt: r.updated_at ?? null,
           });
           if (r.is_active) activate = id;
         }
@@ -134,10 +137,13 @@ export default function App() {
         }
       }
       records.push({
+        id: t.id,
         title: t.customTitle ?? "",
         cwd,
         is_active: t.id === activeId,
         shell_profile_id: t.shellProfileId,
+        created_at: t.createdAt,
+        updated_at: t.updatedAt,
       });
     }
     try {

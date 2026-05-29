@@ -66,6 +66,9 @@ jobs:
       - name: Lint (Biome)
         run: bun run lint
 
+      - name: Frontend unit tests
+        run: bun run test
+
       - name: Rust format check
         working-directory: src-tauri
         run: cargo fmt --all --check
@@ -254,7 +257,7 @@ jobs:
         run: cargo cyclonedx --format json --override-filename sbom-rust
 
       - name: JS SBOM
-        run: bunx @cyclonedx/cdxgen@11 -t bun -o sbom-js.json . || echo "cdxgen produced no output"
+        run: bun run sbom:js
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

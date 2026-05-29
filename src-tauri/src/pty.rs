@@ -11,12 +11,20 @@ use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize)]
 pub struct SpawnOpts {
+    /// Shell profile to resolve on the backend. Empty/None falls back to the
+    /// configured default profile.
+    #[serde(default)]
+    pub shell_profile_id: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+pub struct LaunchOpts {
     /// Executable to run. Empty/None falls back to the user's `$SHELL`.
-    #[serde(default)]
     pub command: Option<String>,
-    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
     pub cwd: Option<String>,
     pub rows: u16,
     pub cols: u16,
@@ -41,7 +49,7 @@ impl PtyManager {
     }
 
     /// Spawn a shell in a new PTY. Output bytes are streamed back over `on_data`.
-    pub fn spawn(&self, opts: SpawnOpts, on_data: Channel<Vec<u8>>) -> AppResult<u32> {
+    pub fn spawn(&self, opts: LaunchOpts, on_data: Channel<Vec<u8>>) -> AppResult<u32> {
         let size = PtySize {
             rows: opts.rows.max(1),
             cols: opts.cols.max(1),

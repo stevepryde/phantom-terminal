@@ -13,6 +13,8 @@ export interface Tab {
   cwd: string;
   ptyId: number | null;
   shellProfileId: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /**
@@ -32,7 +34,11 @@ interface TabsState {
 export const tabsStore = createStore<TabsState>({ tabs: [], activeId: null });
 
 let counter = 0;
-const newId = () => `${Date.now().toString(36)}-${(counter++).toString(36)}`;
+const nowIso = () => new Date().toISOString();
+const newId = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? `tab_${crypto.randomUUID()}`
+    : `tab_${Date.now().toString(36)}_${(counter++).toString(36)}`;
 
 export function addTab(
   opts: {
@@ -40,11 +46,15 @@ export function addTab(
     cwd?: string;
     customTitle?: string | null;
     shellProfileId?: string | null;
+    id?: string | null;
+    createdAt?: string | null;
+    updatedAt?: string | null;
     /** Insert the new tab immediately after this tab id; appends if omitted. */
     afterId?: string;
   } = {},
 ): string {
-  const id = newId();
+  const id = opts.id || newId();
+  const createdAt = opts.createdAt || nowIso();
   const tab: Tab = {
     id,
     kind: opts.kind ?? "terminal",
@@ -52,6 +62,8 @@ export function addTab(
     cwd: opts.cwd ?? "",
     ptyId: null,
     shellProfileId: opts.shellProfileId ?? null,
+    createdAt,
+    updatedAt: opts.updatedAt || createdAt,
   };
   tabsStore.setState((s) => {
     const idx = opts.afterId ? s.tabs.findIndex((t) => t.id === opts.afterId) : -1;
@@ -118,7 +130,9 @@ export function renameTab(id: string, title: string) {
   const clean = title.trim();
   tabsStore.setState((s) => ({
     ...s,
-    tabs: s.tabs.map((t) => (t.id === id ? { ...t, customTitle: clean || null } : t)),
+    tabs: s.tabs.map((t) =>
+      t.id === id ? { ...t, customTitle: clean || null, updatedAt: nowIso() } : t,
+    ),
   }));
 }
 
@@ -164,6 +178,14 @@ export function setTabCwd(id: string, cwd: string) {
   tabsStore.setState((s) => {
     const tab = s.tabs.find((t) => t.id === id);
     if (!tab || tab.cwd === cwd) return s; // no-op when unchanged (avoids churn)
-    return { ...s, tabs: s.tabs.map((t) => (t.id === id ? { ...t, cwd } : t)) };
+    return {
+      ...s,
+      tabs: s.tabs.map((t) => (t.id === id ? { ...t, cwd, updatedAt: nowIso() } : t)),
+    };
   });
+}
+
+export function resetTabsForTest() {
+  counter = 0;
+  tabsStore.setState({ tabs: [], activeId: null });
 }

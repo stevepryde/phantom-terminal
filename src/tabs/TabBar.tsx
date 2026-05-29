@@ -2,7 +2,7 @@ import { Plus, Settings, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { IconButton } from "../components/IconButton";
 import { WindowControls } from "../components/WindowControls";
-import { type Tab, moveTab, tabTitle } from "../store/tabs";
+import { moveTab, type Tab, tabTitle } from "../store/tabs";
 import { TabContextMenu } from "./TabContextMenu";
 
 interface Props {
@@ -113,6 +113,8 @@ export function TabBar({
         <div className="relative flex min-w-0 items-stretch">
           <div
             ref={scrollRef}
+            role="tablist"
+            aria-label="Terminal tabs"
             onScroll={updateOverflow}
             className="tab-scrollbar flex items-stretch gap-1 overflow-x-auto px-1"
             onDragOver={(e) => {
@@ -277,10 +279,19 @@ function TabItem({
       // fix for Warp's hostile double-click-to-rename behaviour. Renaming is an
       // explicit action from the right-click menu (or F2).
       onClick={() => onActivate(tab.id)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onActivate(tab.id);
+        }
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         onContextMenu(tab.id, e.clientX, e.clientY);
       }}
+      role="tab"
+      aria-selected={active}
+      tabIndex={0}
       className={[
         "no-drag group my-1.5 flex min-w-[7rem] max-w-[14rem] cursor-pointer items-center gap-2 rounded px-3 text-sm",
         active ? "bg-white/15 text-white" : "text-white/55 hover:bg-white/8 hover:text-white/85",

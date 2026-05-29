@@ -1,14 +1,6 @@
-import { FitAddon, Terminal, init } from "ghostty-web";
+import { FitAddon, init, Terminal } from "ghostty-web";
 import { useEffect, useLayoutEffect, useRef } from "react";
-import {
-  type AppConfig,
-  ghosttyTheme,
-  ptyKill,
-  ptyResize,
-  ptyWrite,
-  resolveProfile,
-  spawnPty,
-} from "../lib/ipc";
+import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
 
 // ghostty-web's WASM is initialised once for the whole app.
 let initPromise: Promise<void> | null = null;
@@ -51,9 +43,12 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         fontFamily: config.font_family,
         fontSize: config.font_size,
         theme: ghosttyTheme(config.theme),
-        cursorBlink: true,
+        cursorBlink: config.cursor_blink,
+        cursorStyle: config.cursor_style,
         scrollback: config.scrollback_lines,
       });
+      const termOptions = term as unknown as { options?: Record<string, unknown> };
+      if (termOptions.options) termOptions.options.lineHeight = config.line_height;
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(containerRef.current);
@@ -61,12 +56,10 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       termRef.current = term;
       fitRef.current = fit;
 
-      const profile = resolveProfile(config, shellProfileId);
       const ptyId = await spawnPty(
         {
-          command: profile?.command || null,
-          args: profile?.args ?? [],
-          cwd: cwd || profile?.cwd || null,
+          shell_profile_id: shellProfileId,
+          cwd: cwd || null,
           rows: term.rows,
           cols: term.cols,
         },
@@ -133,15 +126,28 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
     if (term?.options) {
       term.options.fontSize = config.font_size;
       term.options.fontFamily = config.font_family;
+      term.options.lineHeight = config.line_height;
       term.options.theme = ghosttyTheme(config.theme);
+      term.options.cursorBlink = config.cursor_blink;
+      term.options.cursorStyle = config.cursor_style;
       term.options.scrollback = config.scrollback_lines;
       fitRef.current?.fit();
     }
-  }, [config.font_family, config.font_size, config.theme, config.scrollback_lines]);
+  }, [
+    config.font_family,
+    config.font_size,
+    config.line_height,
+    config.theme,
+    config.cursor_blink,
+    config.cursor_style,
+    config.scrollback_lines,
+  ]);
 
   return (
     <div
       ref={containerRef}
+      role="application"
+      aria-label="Terminal"
       className="h-full w-full"
       style={{ display: active ? "block" : "none" }}
       onMouseDown={() => termRef.current?.focus()}

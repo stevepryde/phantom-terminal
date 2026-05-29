@@ -17,7 +17,7 @@ type Item =
   | { kind: "action"; id: string; label: string; hint: string; run: () => void };
 
 /** Subsequence fuzzy match. Returns a score (higher = better) or null if no match. */
-function fuzzyScore(query: string, target: string): number | null {
+export function fuzzyScore(query: string, target: string): number | null {
   if (!query) return 0;
   const q = query.toLowerCase();
   const t = target.toLowerCase();
@@ -128,6 +128,9 @@ export function CommandPalette({
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Command palette"
       className="absolute inset-0 z-50 flex justify-center bg-black/50 pt-[12vh]"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
