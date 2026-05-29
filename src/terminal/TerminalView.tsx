@@ -9,6 +9,10 @@ function ensureInit(): Promise<void> {
   return initPromise;
 }
 
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 interface Props {
   tabId: string;
   cwd: string;
@@ -52,16 +56,20 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(containerRef.current);
-      fit.fit();
       termRef.current = term;
       fitRef.current = fit;
+      fit.observeResize();
+
+      await nextFrame();
+      if (disposed || !containerRef.current) return;
+      fit.fit();
 
       const ptyId = await spawnPty(
         {
           shell_profile_id: shellProfileId,
           cwd: cwd || null,
-          rows: term.rows,
-          cols: term.cols,
+          rows: Math.max(24, term.rows),
+          cols: Math.max(80, term.cols),
         },
         (bytes) => term.write(bytes),
       );
@@ -86,7 +94,6 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       const dResize = term.onResize(({ cols, rows }) => {
         ptyResize(ptyId, rows, cols);
       });
-      fit.observeResize();
 
       disposers.push(
         () => dData.dispose(),
