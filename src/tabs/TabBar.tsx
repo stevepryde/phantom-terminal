@@ -1,5 +1,5 @@
 import { Plus, Settings, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { IconButton } from "../components/IconButton";
 import { WindowControls } from "../components/WindowControls";
 import { type Tab, moveTab, tabTitle } from "../store/tabs";
@@ -38,6 +38,48 @@ export function TabBar({
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropGap, setDropGap] = useState<number | null>(null);
 
+  // The tab strip hides its scrollbar; instead we fade the strip's edges to
+  // signal that tabs continue off-screen. `overflow` tracks which side(s) have
+  // hidden tabs so each fade only shows when it's actually scrollable that way.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [overflow, setOverflow] = useState({ left: false, right: false });
+
+  const updateOverflow = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const { scrollLeft, scrollWidth, clientWidth } = el;
+    setOverflow({
+      left: scrollLeft > 1,
+      right: scrollLeft + clientWidth < scrollWidth - 1,
+    });
+  }, []);
+
+  // Recompute on mount and whenever the strip resizes (window resize, sidebar
+  // changes, etc.). A ResizeObserver catches size changes the scroll handler
+  // can't.
+  useEffect(() => {
+    updateOverflow();
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(updateOverflow);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [updateOverflow]);
+
+  // Adding/removing tabs changes the scrollable content width without resizing
+  // the strip, so re-check when the tab count changes.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-run on tab count change to refresh the fades.
+  useEffect(updateOverflow, [tabs.length, updateOverflow]);
+
+  // Scroll the active tab into view whenever it changes, so newly-opened tabs
+  // (terminal or settings) and far-off tabs selected via shortcut/palette are
+  // never left off-screen. `nearest` avoids jumping when it's already visible.
+  useEffect(() => {
+    if (!activeId) return;
+    const el = scrollRef.current?.querySelector(`[data-tab-id="${CSS.escape(activeId)}"]`);
+    el?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeId]);
+
   const endDrag = () => {
     setDragId(null);
     setDropGap(null);
@@ -64,50 +106,74 @@ export function TabBar({
         data-tauri-drag-region
         className="flex h-10 shrink-0 items-stretch gap-1 border-white/10 border-b bg-[#111116] px-1"
       >
-        <div
-          className="flex items-stretch gap-1 overflow-x-auto px-1"
-          onDragOver={(e) => {
-            // Allow dropping past the last tab (in the trailing empty space).
-            if (dragId == null) return;
-            e.preventDefault();
-            e.dataTransfer.dropEffect = "move";
-          }}
-          onDrop={onDrop}
-        >
-          {tabs.map((tab, i) => (
-            <div key={tab.id} className="no-drag flex items-stretch">
-              {marker(i)}
-              <TabItem
-                tab={tab}
-                index={i}
-                active={tab.id === activeId}
-                editing={tab.id === editingId}
-                dragging={tab.id === dragId}
-                onActivate={onActivate}
-                onClose={onClose}
-                onCommitRename={onCommitRename}
-                onCancelRename={onCancelRename}
-                onContextMenu={(id, x, y) => {
-                  onActivate(id);
-                  setMenu({ id, x, y });
-                }}
-                onDragStart={(id) => setDragId(id)}
-                onDragEnd={endDrag}
-                onDragOverTab={(gap) => setDropGap(gap)}
-                onDropTab={onDrop}
-              />
-            </div>
-          ))}
-          {marker(tabs.length)}
-          <IconButton
-            icon={Plus}
-            label="New tab"
-            title="New tab (⌘T)"
-            size={18}
-            className="my-1.5 w-8"
-            onClick={onAdd}
+        {/* Sizes to the tabs' width, but shrinks (min-w-0) to scroll when they
+            overflow. Because it isn't flex-1, the New Tab button after it sits
+            right next to the tabs when they fit and pins to the right edge of
+            the strip once they overflow. */}
+        <div className="relative flex min-w-0 items-stretch">
+          <div
+            ref={scrollRef}
+            onScroll={updateOverflow}
+            className="tab-scrollbar flex items-stretch gap-1 overflow-x-auto px-1"
+            onDragOver={(e) => {
+              // Allow dropping past the last tab (in the trailing empty space).
+              if (dragId == null) return;
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+            }}
+            onDrop={onDrop}
+          >
+            {tabs.map((tab, i) => (
+              <div key={tab.id} data-tab-id={tab.id} className="no-drag flex items-stretch">
+                {marker(i)}
+                <TabItem
+                  tab={tab}
+                  index={i}
+                  active={tab.id === activeId}
+                  editing={tab.id === editingId}
+                  dragging={tab.id === dragId}
+                  onActivate={onActivate}
+                  onClose={onClose}
+                  onCommitRename={onCommitRename}
+                  onCancelRename={onCancelRename}
+                  onContextMenu={(id, x, y) => {
+                    onActivate(id);
+                    setMenu({ id, x, y });
+                  }}
+                  onDragStart={(id) => setDragId(id)}
+                  onDragEnd={endDrag}
+                  onDragOverTab={(gap) => setDropGap(gap)}
+                  onDropTab={onDrop}
+                />
+              </div>
+            ))}
+            {marker(tabs.length)}
+          </div>
+          {/* Edge fades: shown only when tabs are scrolled off that side. They
+              take no layout space (absolute) and let clicks/drags pass through. */}
+          <div
+            aria-hidden
+            className={[
+              "pointer-events-none absolute inset-y-0 left-0 w-8 bg-gradient-to-r from-[#111116] to-transparent transition-opacity",
+              overflow.left ? "opacity-100" : "opacity-0",
+            ].join(" ")}
+          />
+          <div
+            aria-hidden
+            className={[
+              "pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-[#111116] to-transparent transition-opacity",
+              overflow.right ? "opacity-100" : "opacity-0",
+            ].join(" ")}
           />
         </div>
+        <IconButton
+          icon={Plus}
+          label="New tab"
+          title="New tab (⌘T)"
+          size={18}
+          className="my-1.5 w-8 shrink-0"
+          onClick={onAdd}
+        />
         <div className="ml-auto flex items-stretch gap-1">
           <IconButton
             icon={Settings}

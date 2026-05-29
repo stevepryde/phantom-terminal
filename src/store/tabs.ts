@@ -1,8 +1,13 @@
 import { formatCwdName } from "../lib/paths";
 import { createStore } from "../lib/store";
 
+/** A regular terminal tab, or the singleton settings tab. */
+export type TabKind = "terminal" | "settings";
+
 export interface Tab {
   id: string;
+  /** "terminal" (default) or the special "settings" tab. */
+  kind: TabKind;
   /** Explicit user-given name. When null, the tab is named after its cwd. */
   customTitle: string | null;
   cwd: string;
@@ -10,8 +15,12 @@ export interface Tab {
   shellProfileId: string | null;
 }
 
-/** The label shown for a tab: explicit name, else cwd-derived, else "shell". */
+/**
+ * The label shown for a tab. The settings tab is always titled "Settings";
+ * otherwise: explicit name, else cwd-derived, else "shell".
+ */
 export function tabTitle(tab: Tab): string {
+  if (tab.kind === "settings") return "Settings";
   return tab.customTitle?.trim() || formatCwdName(tab.cwd) || "shell";
 }
 
@@ -27,6 +36,7 @@ const newId = () => `${Date.now().toString(36)}-${(counter++).toString(36)}`;
 
 export function addTab(
   opts: {
+    kind?: TabKind;
     cwd?: string;
     customTitle?: string | null;
     shellProfileId?: string | null;
@@ -37,6 +47,7 @@ export function addTab(
   const id = newId();
   const tab: Tab = {
     id,
+    kind: opts.kind ?? "terminal",
     customTitle: opts.customTitle ?? null,
     cwd: opts.cwd ?? "",
     ptyId: null,
@@ -116,6 +127,37 @@ export function setTabPty(id: string, ptyId: number) {
     ...s,
     tabs: s.tabs.map((t) => (t.id === id ? { ...t, ptyId } : t)),
   }));
+}
+
+/** The id of the (at most one) settings tab, or null when none is open. */
+export function settingsTabId(): string | null {
+  return tabsStore.state.tabs.find((t) => t.kind === "settings")?.id ?? null;
+}
+
+/**
+ * Open the settings tab, enforcing the "0 or 1 settings tabs" invariant: if one
+ * already exists it is activated, otherwise a new one is appended. Returns its id.
+ */
+export function openSettingsTab(): string {
+  const existing = settingsTabId();
+  if (existing) {
+    activateTab(existing);
+    return existing;
+  }
+  return addTab({ kind: "settings" });
+}
+
+/**
+ * Toggle the settings tab: if it is the active tab, close it; otherwise open or
+ * focus it. Mirrors the old modal's ⌘, toggle behaviour.
+ */
+export function toggleSettingsTab() {
+  const existing = settingsTabId();
+  if (existing && tabsStore.state.activeId === existing) {
+    closeTab(existing);
+  } else {
+    openSettingsTab();
+  }
 }
 
 export function setTabCwd(id: string, cwd: string) {
