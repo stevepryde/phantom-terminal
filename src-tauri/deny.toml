@@ -1,0 +1,70 @@
+# cargo-deny configuration — supply-chain policy for the Rust backend.
+# Run: cargo deny check
+
+[advisories]
+version = 2
+# Fail on any crate with a known security advisory or a yanked release.
+yanked = "deny"
+# The entries below are *unmaintained* advisories only (not vulnerabilities), and
+# every one is a transitive dependency pulled in by Tauri itself — none is in our
+# direct dependency tree and none has a safe upgrade available. We list each ID
+# explicitly (rather than disabling the unmaintained check wholesale) so that an
+# unmaintained crate we DO control would still fail CI. Actual security
+# vulnerabilities remain hard-denied. Revisit when Tauri migrates off GTK3 / unic.
+ignore = [
+  # gtk-rs GTK3 bindings — Tauri's Linux webview backend (wry → webkit2gtk).
+  "RUSTSEC-2024-0411",
+  "RUSTSEC-2024-0412",
+  "RUSTSEC-2024-0413",
+  "RUSTSEC-2024-0414",
+  "RUSTSEC-2024-0415",
+  "RUSTSEC-2024-0416",
+  "RUSTSEC-2024-0417",
+  "RUSTSEC-2024-0418",
+  "RUSTSEC-2024-0419",
+  "RUSTSEC-2024-0420",
+  # unic-* family — via tauri-utils → urlpattern → unic-ucd-*.
+  "RUSTSEC-2025-0075",
+  "RUSTSEC-2025-0080",
+  "RUSTSEC-2025-0081",
+  "RUSTSEC-2025-0098",
+  "RUSTSEC-2025-0100",
+  # proc-macro-error — build-time macro dependency in the Tauri toolchain.
+  "RUSTSEC-2024-0370",
+]
+
+[bans]
+# Flag duplicate versions (bloat / unexpected forks) but don't hard-fail v1.
+multiple-versions = "warn"
+# Wildcard ("*") version requirements are forbidden — they undermine the lockfile.
+wildcards = "deny"
+# Networking clients we never want to add ourselves. (Tauri pulls reqwest/hyper
+# internally for its core; that is covered by the capability lockdown + CSP and
+# by scripts/check-no-network.sh, not banned here.)
+deny = [
+  { name = "openssl" },
+  { name = "openssl-sys" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+]
+
+[sources]
+# Only the official crates.io registry is allowed — no arbitrary git/registry sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

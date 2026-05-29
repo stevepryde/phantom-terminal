@@ -1,0 +1,153 @@
+import { FitAddon, Terminal, init } from "ghostty-web";
+import { useEffect, useLayoutEffect, useRef } from "react";
+import {
+  type AppConfig,
+  ghosttyTheme,
+  ptyKill,
+  ptyResize,
+  ptyWrite,
+  resolveProfile,
+  spawnPty,
+} from "../lib/ipc";
+
+// ghostty-web's WASM is initialised once for the whole app.
+let initPromise: Promise<void> | null = null;
+function ensureInit(): Promise<void> {
+  if (!initPromise) initPromise = init();
+  return initPromise;
+}
+
+interface Props {
+  tabId: string;
+  cwd: string;
+  active: boolean;
+  config: AppConfig;
+  shellProfileId: string | null;
+  onSpawn: (tabId: string, ptyId: number) => void;
+}
+
+export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpawn }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  const ptyIdRef = useRef<number | null>(null);
+  // Mirror `active` so the async mount can focus the terminal once it's ready
+  // if this tab is still the active one (the focus effect below runs before the
+  // terminal exists, so a freshly-created active tab needs this).
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
+  // Mount: create terminal, spawn PTY, wire data flow. Runs once per tab.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional mount-once; config/cwd captured at spawn time, live updates handled by the effects below.
+  useEffect(() => {
+    let disposed = false;
+    const disposers: Array<() => void> = [];
+
+    (async () => {
+      await ensureInit();
+      if (disposed || !containerRef.current) return;
+
+      const term = new Terminal({
+        fontFamily: config.font_family,
+        fontSize: config.font_size,
+        theme: ghosttyTheme(config.theme),
+        cursorBlink: true,
+        scrollback: config.scrollback_lines,
+      });
+      const fit = new FitAddon();
+      term.loadAddon(fit);
+      term.open(containerRef.current);
+      fit.fit();
+      termRef.current = term;
+      fitRef.current = fit;
+
+      const profile = resolveProfile(config, shellProfileId);
+      const ptyId = await spawnPty(
+        {
+          command: profile?.command || null,
+          args: profile?.args ?? [],
+          cwd: cwd || profile?.cwd || null,
+          rows: term.rows,
+          cols: term.cols,
+        },
+        (bytes) => term.write(bytes),
+      );
+      if (disposed) {
+        ptyKill(ptyId);
+        term.dispose();
+        return;
+      }
+      ptyIdRef.current = ptyId;
+      onSpawn(tabId, ptyId);
+
+      // If this tab is the active one, grab keyboard focus now that the terminal
+      // exists. The focus effect below already ran (on mount, before this async
+      // block created the terminal), so a freshly-created active tab would
+      // otherwise be highlighted but not focused.
+      if (activeRef.current) term.focus();
+
+      const enc = new TextEncoder();
+      const dData = term.onData((s) => {
+        ptyWrite(ptyId, enc.encode(s));
+      });
+      const dResize = term.onResize(({ cols, rows }) => {
+        ptyResize(ptyId, rows, cols);
+      });
+      fit.observeResize();
+
+      disposers.push(
+        () => dData.dispose(),
+        () => dResize.dispose(),
+      );
+    })();
+
+    return () => {
+      disposed = true;
+      for (const d of disposers) d();
+      if (ptyIdRef.current != null) ptyKill(ptyIdRef.current);
+      termRef.current?.dispose();
+      termRef.current = null;
+    };
+  }, []);
+
+  // Focus the terminal the instant it becomes active, and re-fit it.
+  //
+  // Focus must happen *synchronously* inside the activating user gesture (tab
+  // click / shortcut keydown). WKWebView only honors programmatic focus() while
+  // a user-activation token is live; deferring it to requestAnimationFrame (as
+  // we used to) drops that token, so WebKit silently ignores the focus move and
+  // keystrokes keep going to the previously-focused terminal — i.e. opening a
+  // new tab made every other tab unable to type. useLayoutEffect is flushed
+  // synchronously for discrete events, so the gesture is still active here.
+  // Only the layout-dependent fit() is left in rAF.
+  useLayoutEffect(() => {
+    if (!active) return;
+    termRef.current?.focus();
+    const id = requestAnimationFrame(() => fitRef.current?.fit());
+    return () => cancelAnimationFrame(id);
+  }, [active]);
+
+  // Live theme/font updates without respawning the shell.
+  useEffect(() => {
+    const term = termRef.current as unknown as { options?: Record<string, unknown> } | null;
+    if (term?.options) {
+      term.options.fontSize = config.font_size;
+      term.options.fontFamily = config.font_family;
+      term.options.theme = ghosttyTheme(config.theme);
+      term.options.scrollback = config.scrollback_lines;
+      fitRef.current?.fit();
+    }
+  }, [config.font_family, config.font_size, config.theme, config.scrollback_lines]);
+
+  return (
+    <div
+      ref={containerRef}
+      className="h-full w-full"
+      style={{ display: active ? "block" : "none" }}
+      onMouseDown={() => termRef.current?.focus()}
+    />
+  );
+}
+
+// Keep onExit referenced for future PTY-exit handling.
+export type { Props as TerminalViewProps };
