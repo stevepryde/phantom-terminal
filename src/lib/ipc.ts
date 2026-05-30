@@ -85,6 +85,7 @@ export interface AppConfig {
   cursor_blink: boolean;
   ui_theme: UiThemeId;
   terminal_background: TerminalBackgroundId;
+  terminal_background_opacity: number;
   theme: Theme;
   shell_profiles: ShellProfile[];
   default_shell_profile_id: string;

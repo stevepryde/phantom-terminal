@@ -197,6 +197,22 @@ function AppearanceSection({ config, onChange }: Props) {
         />
       </Field>
 
+      <Field label={`Image opacity (${config.terminal_background_opacity}%)`}>
+        <input
+          type="range"
+          min={0}
+          max={60}
+          value={config.terminal_background_opacity}
+          disabled={config.terminal_background === "none"}
+          className="w-full accent-white/80 disabled:cursor-not-allowed disabled:opacity-35"
+          onChange={(e) =>
+            onChange({
+              terminal_background_opacity: Number(e.target.value),
+            })
+          }
+        />
+      </Field>
+
       <Field label="Font family">
         <CustomDropdown
           value={terminalFontDropdownValue(config.font_family)}

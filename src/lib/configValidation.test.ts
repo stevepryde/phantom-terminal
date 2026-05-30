@@ -37,6 +37,13 @@ test("rejects unknown terminal backgrounds before live-applying config", () => {
   expect(validateAppConfig(cfg)).toBe("terminal background must be one of: phantom, dragon, none");
 });
 
+test("rejects invalid terminal background opacity before live-applying config", () => {
+  const cfg = config();
+  cfg.terminal_background_opacity = 61;
+
+  expect(validateAppConfig(cfg)).toBe("terminal background opacity must be between 0 and 60");
+});
+
 function config(): AppConfig {
   return {
     font_family: "monospace",
@@ -46,6 +53,7 @@ function config(): AppConfig {
     cursor_blink: true,
     ui_theme: "phantom",
     terminal_background: "phantom",
+    terminal_background_opacity: 24,
     theme: {
       background: "#0b0b0e",
       foreground: "#e6e6e6",

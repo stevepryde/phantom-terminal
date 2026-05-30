@@ -250,7 +250,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         ref={containerRef}
         role="application"
         aria-label="Terminal"
-        className="relative z-0 h-full w-full"
+        className="absolute inset-2 z-10"
         onMouseDown={() => termRef.current?.focus()}
       />
       <div aria-hidden className="terminal-ui-background" />

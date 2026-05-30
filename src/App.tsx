@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { CommandPalette } from "./command-palette/CommandPalette";
 import { useAppConfig } from "./hooks/useAppConfig";
 import { useDisplayLayoutRefresh } from "./hooks/useDisplayLayoutRefresh";
@@ -175,6 +175,7 @@ export default function App() {
         }`}
         data-ui-theme="phantom"
         data-terminal-background="phantom"
+        style={terminalBackgroundOpacityStyle(24)}
       >
         Loading…
       </div>
@@ -210,9 +211,9 @@ export default function App() {
         // accepts pointer events; the rest let clicks fall through.
         <div
           key={tab.id}
-          // Terminal tabs keep a real pane inset on every side; the renderer
-          // handles trimming any fake first-row blank from the emulator.
-          className={`absolute inset-0 ${tab.kind === "settings" ? "" : "terminal-pane p-2"}`}
+          // TerminalView owns the text inset so its artwork layer can fill the
+          // whole pane edge-to-edge behind the emulator.
+          className={`absolute inset-0 ${tab.kind === "settings" ? "" : "terminal-pane"}`}
           style={{
             pointerEvents: tab.id === activeId ? "auto" : "none",
             // TerminalView hides itself when inactive, but SettingsView does
@@ -245,6 +246,7 @@ export default function App() {
       }`}
       data-ui-theme={config.ui_theme}
       data-terminal-background={config.terminal_background}
+      style={terminalBackgroundOpacityStyle(config.terminal_background_opacity)}
     >
       {tabLayout === "horizontal" ? (
         <>
@@ -282,4 +284,10 @@ function defaultLaunchCwd(config: AppConfig | null, home: string | null): string
     config.shell_profiles.find((p) => p.id === config.default_shell_profile_id) ??
     config.shell_profiles[0];
   return profile?.cwd?.trim() || home;
+}
+
+function terminalBackgroundOpacityStyle(opacity: number): CSSProperties {
+  return {
+    "--terminal-ui-image-opacity": String(opacity / 100),
+  } as CSSProperties;
 }

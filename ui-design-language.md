@@ -11,7 +11,7 @@ These rules capture deliberate product decisions and should not be changed casua
 | Area | Locked Rule |
 | --- | --- |
 | Terminal tabs | Horizontal tabs fill the full space between vertical separators. Active state is a bottom underline only: no bubble, pill, or persistent filled background. Vertical tabs use the same transparent tab surface in a left sidebar, with horizontal separators and an active right border. |
-| Terminal pane inset | Terminal content has a consistent `8px` inset on all sides. If the terminal emulator creates a single empty top screen row, visually trim that row rather than removing the intentional pane inset. |
+| Terminal pane inset | Terminal text has a consistent `8px` inset on all sides, while backdrop artwork fills the pane edge-to-edge. If the terminal emulator creates a single empty top screen row, visually trim that row rather than removing the intentional pane inset. |
 | Font settings | Terminal font is app-wide and lives in Appearance. Shell profiles must not expose font or appearance controls unless a full appearance-profile feature is intentionally designed. |
 | Profile settings | Profiles are listed first, then edited one at a time. Do not show multiple profile forms inline. |
 | Default profile | Default selection happens with the icon-only star action on each profile row. Do not reintroduce a separate default-profile dropdown. |
@@ -69,6 +69,8 @@ local assets only. The selected backdrop is a separate validated setting from
 the UI color theme, surfaced directly below the UI theme dropdown in Appearance.
 Keep them dark, low-detail, and low-opacity; artwork should read as embossed
 texture behind text, not as an illustration competing with the terminal buffer.
+Image opacity is a separate bounded setting from `0` to `60`; disable the
+slider when the selected backdrop is `None`.
 
 | Backdrop | Rule |
 | --- | --- |
@@ -139,7 +141,7 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 | Back navigation | Detail screens should offer a clear back action near the title |
 | Editable rows | The primary row area should be clickable, with separate icon affordances for secondary actions |
 | Terminal tabs | Horizontal tabs fill the full space between vertical separators; selected tabs use only a bottom underline, while inactive tabs stay transparent except for temporary hover fill. Vertical tabs live in a left sidebar, use horizontal separators, and show selection with a right-aligned border. |
-| Terminal pane | Use a consistent `8px` inset on all sides; keep emulator blank-row trimming separate from intentional layout padding |
+| Terminal pane | Use a consistent `8px` text inset on all sides while letting the backdrop fill edge-to-edge; keep emulator blank-row trimming separate from intentional layout padding |
 
 ## Accessibility
 

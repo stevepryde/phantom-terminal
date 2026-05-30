@@ -26,12 +26,13 @@ body {
   --app-border: rgba(255, 255, 255, 0.1);
   --app-accent: rgba(125, 211, 252, 0.9);
   --terminal-ui-image: none;
+  --terminal-ui-image-opacity: 0.24;
   --terminal-ui-wash: radial-gradient(
     circle at 78% 16%,
     rgba(125, 211, 252, 0.16),
     transparent 32%
   );
-  --terminal-ui-opacity: 0.12;
+  --terminal-ui-wash-opacity: 0.12;
   height: 100%;
   overflow: hidden;
   border-radius: 14px;
@@ -59,7 +60,7 @@ body {
     radial-gradient(circle at 14% 16%, rgba(34, 211, 238, 0.48), transparent 30%),
     radial-gradient(circle at 82% 18%, rgba(168, 85, 247, 0.38), transparent 32%),
     linear-gradient(135deg, transparent, rgba(16, 185, 129, 0.2) 54%, transparent);
-  --terminal-ui-opacity: 0.18;
+  --terminal-ui-wash-opacity: 0.18;
 }
 
 .app-window[data-ui-theme="ember"] {
@@ -71,7 +72,7 @@ body {
     radial-gradient(circle at 18% 84%, rgba(248, 113, 113, 0.42), transparent 34%),
     radial-gradient(circle at 92% 12%, rgba(251, 191, 36, 0.34), transparent 28%),
     linear-gradient(150deg, transparent 18%, rgba(168, 85, 247, 0.16), transparent 72%);
-  --terminal-ui-opacity: 0.16;
+  --terminal-ui-wash-opacity: 0.16;
 }
 
 .app-window[data-ui-theme="cobalt"] {
@@ -83,7 +84,7 @@ body {
     radial-gradient(circle at 80% 20%, rgba(59, 130, 246, 0.48), transparent 32%),
     radial-gradient(circle at 18% 72%, rgba(45, 212, 191, 0.28), transparent 30%),
     linear-gradient(135deg, transparent 8%, rgba(129, 140, 248, 0.18), transparent 70%);
-  --terminal-ui-opacity: 0.17;
+  --terminal-ui-wash-opacity: 0.17;
 }
 
 .app-window[data-ui-theme="verdant"] {
@@ -95,7 +96,7 @@ body {
     radial-gradient(circle at 12% 18%, rgba(52, 211, 153, 0.4), transparent 32%),
     radial-gradient(circle at 86% 74%, rgba(56, 189, 248, 0.28), transparent 34%),
     linear-gradient(145deg, transparent 22%, rgba(250, 204, 21, 0.12), transparent 70%);
-  --terminal-ui-opacity: 0.16;
+  --terminal-ui-wash-opacity: 0.16;
 }
 
 .app-window[data-ui-theme="violet"] {
@@ -107,7 +108,7 @@ body {
     radial-gradient(circle at 18% 20%, rgba(168, 85, 247, 0.44), transparent 32%),
     radial-gradient(circle at 84% 72%, rgba(236, 72, 153, 0.2), transparent 30%),
     linear-gradient(135deg, transparent 14%, rgba(99, 102, 241, 0.18), transparent 72%);
-  --terminal-ui-opacity: 0.18;
+  --terminal-ui-wash-opacity: 0.18;
 }
 
 .app-window[data-ui-theme="amethyst"] {
@@ -119,7 +120,7 @@ body {
     radial-gradient(circle at 74% 18%, rgba(192, 132, 252, 0.42), transparent 34%),
     radial-gradient(circle at 16% 78%, rgba(244, 114, 182, 0.18), transparent 32%),
     linear-gradient(155deg, transparent 18%, rgba(59, 130, 246, 0.14), transparent 72%);
-  --terminal-ui-opacity: 0.18;
+  --terminal-ui-wash-opacity: 0.18;
 }
 
 .app-window[data-ui-theme="ultraviolet"] {
@@ -131,7 +132,7 @@ body {
     radial-gradient(circle at 82% 22%, rgba(124, 58, 237, 0.42), transparent 34%),
     radial-gradient(circle at 16% 24%, rgba(14, 165, 233, 0.24), transparent 28%),
     linear-gradient(145deg, transparent 18%, rgba(217, 70, 239, 0.14), transparent 74%);
-  --terminal-ui-opacity: 0.19;
+  --terminal-ui-wash-opacity: 0.19;
 }
 
 .app-window[data-ui-theme="sapphire"] {
@@ -143,7 +144,7 @@ body {
     radial-gradient(circle at 78% 18%, rgba(37, 99, 235, 0.46), transparent 34%),
     radial-gradient(circle at 16% 72%, rgba(125, 211, 252, 0.2), transparent 30%),
     linear-gradient(150deg, transparent 20%, rgba(99, 102, 241, 0.14), transparent 72%);
-  --terminal-ui-opacity: 0.17;
+  --terminal-ui-wash-opacity: 0.17;
 }
 
 .app-window[data-ui-theme="glacier"] {
@@ -155,7 +156,7 @@ body {
     radial-gradient(circle at 18% 18%, rgba(34, 211, 238, 0.4), transparent 32%),
     radial-gradient(circle at 84% 78%, rgba(96, 165, 250, 0.24), transparent 34%),
     linear-gradient(140deg, transparent 18%, rgba(186, 230, 253, 0.12), transparent 70%);
-  --terminal-ui-opacity: 0.16;
+  --terminal-ui-wash-opacity: 0.16;
 }
 
 .app-window[data-ui-theme="lagoon"] {
@@ -167,7 +168,7 @@ body {
     radial-gradient(circle at 84% 20%, rgba(20, 184, 166, 0.4), transparent 32%),
     radial-gradient(circle at 18% 72%, rgba(56, 189, 248, 0.22), transparent 32%),
     linear-gradient(145deg, transparent 20%, rgba(16, 185, 129, 0.14), transparent 72%);
-  --terminal-ui-opacity: 0.16;
+  --terminal-ui-wash-opacity: 0.16;
 }
 
 .app-window[data-ui-theme="emerald"] {
@@ -179,7 +180,7 @@ body {
     radial-gradient(circle at 78% 18%, rgba(16, 185, 129, 0.42), transparent 34%),
     radial-gradient(circle at 14% 76%, rgba(132, 204, 22, 0.18), transparent 30%),
     linear-gradient(150deg, transparent 20%, rgba(45, 212, 191, 0.12), transparent 72%);
-  --terminal-ui-opacity: 0.16;
+  --terminal-ui-wash-opacity: 0.16;
 }
 
 .app-window[data-ui-theme="jade"] {
@@ -191,7 +192,7 @@ body {
     radial-gradient(circle at 18% 18%, rgba(45, 212, 191, 0.4), transparent 32%),
     radial-gradient(circle at 84% 74%, rgba(34, 197, 94, 0.2), transparent 32%),
     linear-gradient(140deg, transparent 20%, rgba(250, 204, 21, 0.08), transparent 72%);
-  --terminal-ui-opacity: 0.16;
+  --terminal-ui-wash-opacity: 0.16;
 }
 
 .app-window[data-ui-theme="silver"] {
@@ -203,7 +204,7 @@ body {
     radial-gradient(circle at 18% 18%, rgba(203, 213, 225, 0.22), transparent 30%),
     radial-gradient(circle at 82% 76%, rgba(148, 163, 184, 0.18), transparent 34%),
     linear-gradient(145deg, transparent 18%, rgba(56, 189, 248, 0.08), transparent 72%);
-  --terminal-ui-opacity: 0.14;
+  --terminal-ui-wash-opacity: 0.14;
 }
 
 .app-chrome {
@@ -227,10 +228,25 @@ body {
   inset: 0;
   z-index: 10;
   pointer-events: none;
-  background: var(--terminal-ui-wash), var(--terminal-ui-image);
-  background-position: center, center;
-  background-size: cover, cover;
-  opacity: var(--terminal-ui-opacity);
+}
+
+.terminal-ui-background::before,
+.terminal-ui-background::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background-position: center;
+  background-size: cover;
+}
+
+.terminal-ui-background::before {
+  background: var(--terminal-ui-wash);
+  opacity: var(--terminal-ui-wash-opacity);
+}
+
+.terminal-ui-background::after {
+  background-image: var(--terminal-ui-image);
+  opacity: var(--terminal-ui-image-opacity);
 }
 
 .app-active-tab-indicator,

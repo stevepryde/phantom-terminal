@@ -7,6 +7,7 @@ const MAX_FONT_SIZE = 48;
 const MIN_LINE_HEIGHT = 1;
 const MAX_LINE_HEIGHT = 2.5;
 const MAX_SCROLLBACK_LINES = 1_000_000;
+const MAX_TERMINAL_BACKGROUND_OPACITY = 60;
 const MAX_PROFILE_COUNT = 64;
 const MAX_ID_LEN = 128;
 const MAX_NAME_LEN = 128;
@@ -27,6 +28,12 @@ export function validateAppConfig(config: AppConfig): string | null {
     validateCursorStyle(config.cursor_style) ??
     validateUiTheme(config.ui_theme) ??
     validateTerminalBackground(config.terminal_background) ??
+    validateIntegerRange(
+      "terminal background opacity",
+      config.terminal_background_opacity,
+      0,
+      MAX_TERMINAL_BACKGROUND_OPACITY,
+    ) ??
     validateScrollback(config.scrollback_lines) ??
     validateTabLayout(config.tab_layout) ??
     validateTheme(config.theme) ??

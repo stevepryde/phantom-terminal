@@ -22,6 +22,8 @@ const OLD_DEFAULT_SELECTION: &str = "#33415580";
 const DEFAULT_SELECTION: &str = "#ffffff24";
 const DEFAULT_UI_THEME: &str = "phantom";
 const DEFAULT_TERMINAL_BACKGROUND: &str = "phantom";
+const MAX_TERMINAL_BACKGROUND_OPACITY: u8 = 60;
+const DEFAULT_TERMINAL_BACKGROUND_OPACITY: u8 = 24;
 
 /// Full 16-color ANSI palette plus the special UI colors. Keys are snake_case on
 /// the wire; the frontend maps them onto ghostty-web's camelCase Terminal theme.
@@ -174,6 +176,7 @@ pub struct AppConfig {
     pub cursor_blink: bool,
     pub ui_theme: String,
     pub terminal_background: String,
+    pub terminal_background_opacity: u8,
     pub theme: Theme,
     pub shell_profiles: Vec<ShellProfile>,
     pub default_shell_profile_id: String,
@@ -195,6 +198,7 @@ impl Default for AppConfig {
             cursor_blink: true,
             ui_theme: DEFAULT_UI_THEME.to_string(),
             terminal_background: DEFAULT_TERMINAL_BACKGROUND.to_string(),
+            terminal_background_opacity: DEFAULT_TERMINAL_BACKGROUND_OPACITY,
             theme: Theme::default(),
             shell_profiles: vec![ShellProfile {
                 id: "default".to_string(),
@@ -256,6 +260,11 @@ impl AppConfig {
                     "terminal background must be one of: phantom, dragon, none".to_string(),
                 ));
             }
+        }
+        if self.terminal_background_opacity > MAX_TERMINAL_BACKGROUND_OPACITY {
+            return Err(AppError::InvalidConfig(format!(
+                "terminal background opacity must be between 0 and {MAX_TERMINAL_BACKGROUND_OPACITY}"
+            )));
         }
         if self.scrollback_lines > MAX_SCROLLBACK_LINES {
             return Err(AppError::InvalidConfig(format!(
@@ -471,6 +480,15 @@ mod tests {
     fn rejects_invalid_terminal_background() {
         let config = AppConfig {
             terminal_background: "castle".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_terminal_background_opacity() {
+        let config = AppConfig {
+            terminal_background_opacity: MAX_TERMINAL_BACKGROUND_OPACITY + 1,
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());
