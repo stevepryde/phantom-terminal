@@ -37,6 +37,33 @@ These rules capture deliberate product decisions and should not be changed casua
 
 Rows and menu items must define hover states. Avoid single-hue pages by using neutral surfaces with restrained blue focus accents and red only for destructive actions.
 
+## UI Themes
+
+UI themes are separate from terminal color themes. They may tint the title bar,
+tab chrome, active tab accent, and a very dim terminal backdrop wash, but they
+must not rewrite ANSI foreground/background colors or reduce terminal text
+contrast.
+
+| Preset | Chrome Direction | Terminal Backdrop Rule |
+| --- | --- | --- |
+| Phantom | Neutral graphite | No decorative wash |
+| Aurora | Cool cyan with restrained violet | Low-opacity multi-stop gradient wash |
+| Ember | Warm red/orange balanced with violet | Low-opacity multi-stop gradient wash |
+| Cobalt | Blue with teal and indigo accents | Low-opacity multi-stop gradient wash |
+| Verdant | Green balanced with cyan and muted gold | Low-opacity multi-stop gradient wash |
+| Violet | Purple with restrained magenta and indigo | Low-opacity multi-stop gradient wash |
+| Amethyst | Gemlike purple with soft rose and blue | Low-opacity multi-stop gradient wash |
+| Ultraviolet | Saturated violet balanced by blue | Low-opacity multi-stop gradient wash |
+| Sapphire | Deep blue with cyan and indigo accents | Low-opacity multi-stop gradient wash |
+| Glacier | Icy cyan-blue with pale highlight | Low-opacity multi-stop gradient wash |
+| Lagoon | Teal-blue with green undertones | Low-opacity multi-stop gradient wash |
+| Emerald | Rich green with teal and lime undertones | Low-opacity multi-stop gradient wash |
+| Jade | Muted green-teal with a warm glint | Low-opacity multi-stop gradient wash |
+| Silver | Dark metallic gray with cool highlights | Low-opacity multi-stop gradient wash |
+
+Theme presets should remain a validated enum in Rust. Do not allow arbitrary CSS
+strings, external images, or remote background URLs through config.
+
 ## Typography
 
 | Role | Face | Weight | Size | Notes |

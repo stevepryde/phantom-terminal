@@ -60,6 +60,21 @@ export interface Keybinding {
 }
 
 export type TabLayout = "horizontal" | "vertical";
+export type UiThemeId =
+  | "phantom"
+  | "aurora"
+  | "ember"
+  | "cobalt"
+  | "verdant"
+  | "violet"
+  | "amethyst"
+  | "ultraviolet"
+  | "sapphire"
+  | "glacier"
+  | "lagoon"
+  | "emerald"
+  | "jade"
+  | "silver";
 
 export interface AppConfig {
   font_family: string;
@@ -67,6 +82,7 @@ export interface AppConfig {
   line_height: number;
   cursor_style: "block" | "bar" | "underline";
   cursor_blink: boolean;
+  ui_theme: UiThemeId;
   theme: Theme;
   shell_profiles: ShellProfile[];
   default_shell_profile_id: string;

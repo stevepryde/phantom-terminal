@@ -242,16 +242,20 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   ]);
 
   return (
-    <div className="relative h-full w-full" style={{ display: active ? "block" : "none" }}>
+    <div
+      className="terminal-view relative h-full w-full"
+      style={{ display: active ? "block" : "none" }}
+    >
       <div
         ref={containerRef}
         role="application"
         aria-label="Terminal"
-        className="h-full w-full"
+        className="relative z-0 h-full w-full"
         onMouseDown={() => termRef.current?.focus()}
       />
+      <div aria-hidden className="terminal-ui-background" />
       {terminalNotice && (
-        <div className="pointer-events-none absolute inset-x-3 bottom-3 flex justify-center">
+        <div className="pointer-events-none absolute inset-x-3 bottom-3 z-20 flex justify-center">
           <div
             role="status"
             className="rounded border border-white/10 bg-[#111116]/95 px-3 py-2 text-center text-white/70 text-xs shadow-lg"

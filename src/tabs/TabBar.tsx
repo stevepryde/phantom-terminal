@@ -36,7 +36,7 @@ export function TitleBarChrome({ paintRevision = 0, onOpenSettings }: TitleBarCh
   return (
     <div
       data-tauri-drag-region
-      className="flex h-10 shrink-0 items-stretch gap-1 border-white/10 border-b bg-[#111116] px-1 will-change-transform"
+      className="app-chrome flex h-10 shrink-0 items-stretch gap-1 border-b px-1 will-change-transform"
       style={{
         transform: paintRevision % 2 === 0 ? "translateZ(0)" : "translateZ(0.001px)",
       }}
@@ -178,7 +178,7 @@ export function TabBar({
       <div
         aria-hidden
         className={[
-          "pointer-events-none absolute z-10 rounded-full bg-sky-400",
+          "app-drop-marker pointer-events-none absolute z-10 rounded-full",
           layout === "vertical"
             ? `${edge === "after" ? "right-2 bottom-0 left-2" : "top-0 right-2 left-2"} h-0.5`
             : `${edge === "after" ? "top-1.5 right-0 bottom-1.5" : "top-1.5 bottom-1.5 left-0"} w-0.5`,
@@ -210,7 +210,7 @@ export function TabBar({
   if (layout === "vertical") {
     return (
       <>
-        <aside className="flex shrink-0 flex-col bg-[#111116]" style={{ width: sidebarWidth }}>
+        <aside className="app-sidebar flex shrink-0 flex-col" style={{ width: sidebarWidth }}>
           <div className="flex h-10 shrink-0 items-center gap-2 border-white/10 border-b px-2">
             <span className="min-w-0 flex-1 truncate px-1 font-semibold text-white/40 text-xs uppercase tracking-wide">
               Tabs
@@ -281,14 +281,14 @@ export function TabBar({
             <div
               aria-hidden
               className={[
-                "pointer-events-none absolute top-0 right-0 left-0 h-8 bg-gradient-to-b from-[#111116] to-transparent transition-opacity",
+                "chrome-scroll-fade chrome-scroll-fade--top pointer-events-none absolute top-0 right-0 left-0 h-8 transition-opacity",
                 overflow.before ? "opacity-100" : "opacity-0",
               ].join(" ")}
             />
             <div
               aria-hidden
               className={[
-                "pointer-events-none absolute right-0 bottom-0 left-0 h-8 bg-gradient-to-t from-[#111116] to-transparent transition-opacity",
+                "chrome-scroll-fade chrome-scroll-fade--bottom pointer-events-none absolute right-0 bottom-0 left-0 h-8 transition-opacity",
                 overflow.after ? "opacity-100" : "opacity-0",
               ].join(" ")}
             />
@@ -326,7 +326,7 @@ export function TabBar({
     <>
       <div
         data-tauri-drag-region
-        className="flex h-10 shrink-0 items-stretch gap-1 border-white/10 border-b bg-[#111116] px-1 will-change-transform"
+        className="app-chrome flex h-10 shrink-0 items-stretch gap-1 border-b px-1 will-change-transform"
         style={{
           transform: paintRevision % 2 === 0 ? "translateZ(0)" : "translateZ(0.001px)",
         }}
@@ -394,14 +394,14 @@ export function TabBar({
           <div
             aria-hidden
             className={[
-              "pointer-events-none absolute inset-y-0 left-0 w-8 bg-gradient-to-r from-[#111116] to-transparent transition-opacity",
+              "chrome-scroll-fade chrome-scroll-fade--left pointer-events-none absolute inset-y-0 left-0 w-8 transition-opacity",
               overflow.before ? "opacity-100" : "opacity-0",
             ].join(" ")}
           />
           <div
             aria-hidden
             className={[
-              "pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-[#111116] to-transparent transition-opacity",
+              "chrome-scroll-fade chrome-scroll-fade--right pointer-events-none absolute inset-y-0 right-0 w-8 transition-opacity",
               overflow.after ? "opacity-100" : "opacity-0",
             ].join(" ")}
           />
@@ -535,8 +535,8 @@ function TabItem({
           aria-hidden
           className={
             layout === "vertical"
-              ? "absolute top-1.5 right-0 bottom-1.5 w-0.5 rounded-l-full bg-sky-300/90"
-              : "absolute right-2 bottom-0 left-2 h-0.5 rounded-full bg-sky-300/90"
+              ? "app-active-tab-indicator absolute top-1.5 right-0 bottom-1.5 w-0.5 rounded-l-full"
+              : "app-active-tab-indicator absolute right-2 bottom-0 left-2 h-0.5 rounded-full"
           }
         />
       )}

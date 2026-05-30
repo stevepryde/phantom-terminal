@@ -173,6 +173,7 @@ export default function App() {
         className={`app-window grid place-items-center text-white/40 ${
           windowMaximized ? "app-window--maximized" : ""
         }`}
+        data-ui-theme="phantom"
       >
         Loading…
       </div>
@@ -199,7 +200,7 @@ export default function App() {
   };
 
   const tabContent = (
-    <div className="relative min-h-0 flex-1 bg-[#0b0b0e]">
+    <div className="terminal-surface relative min-h-0 flex-1">
       {tabs.map((tab) => (
         // Every tab stays mounted (keeps its PTY alive) and is absolutely
         // stacked. Without this, an inactive tab later in the array overlays
@@ -210,7 +211,7 @@ export default function App() {
           key={tab.id}
           // Terminal tabs keep a real pane inset on every side; the renderer
           // handles trimming any fake first-row blank from the emulator.
-          className={`absolute inset-0 ${tab.kind === "settings" ? "" : "p-2"}`}
+          className={`absolute inset-0 ${tab.kind === "settings" ? "" : "terminal-pane p-2"}`}
           style={{
             pointerEvents: tab.id === activeId ? "auto" : "none",
             // TerminalView hides itself when inactive, but SettingsView does
@@ -241,6 +242,7 @@ export default function App() {
       className={`app-window relative flex flex-col ${
         windowMaximized ? "app-window--maximized" : ""
       }`}
+      data-ui-theme={config.ui_theme}
     >
       {tabLayout === "horizontal" ? (
         <>

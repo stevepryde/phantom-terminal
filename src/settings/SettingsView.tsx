@@ -16,6 +16,7 @@ import { CustomDropdown } from "../components/CustomDropdown";
 import { terminalFontDropdownValue, terminalFontOptions } from "../lib/fonts";
 import type { AppConfig, Keybinding, ShellProfile, Theme } from "../lib/ipc";
 import { DEFAULT_KEYBINDINGS, KEYBINDING_ACTION_LABELS } from "../lib/keybindings";
+import { UI_THEME_OPTIONS } from "../lib/uiThemes";
 
 interface Props {
   config: AppConfig;
@@ -48,7 +49,7 @@ const COLOR_FIELDS: Array<{ key: keyof Theme; label: string }> = [
 // The settings sections, each rendered as a sidebar tab.
 const SECTIONS = [
   { id: "appearance", label: "Appearance", icon: SlidersHorizontal },
-  { id: "theme", label: "Theme", icon: Palette },
+  { id: "theme", label: "Terminal Colors", icon: Palette },
   { id: "profiles", label: "Shell Profiles", icon: Terminal },
   { id: "keybindings", label: "Keybindings", icon: Keyboard },
   { id: "session", label: "Session", icon: History },
@@ -100,10 +101,10 @@ export function SettingsView({ config, error, onChange }: Props) {
   }, [sidebarWidth]);
 
   return (
-    <div ref={containerRef} className="flex h-full bg-[#0b0b0e] text-sm text-white/90">
+    <div ref={containerRef} className="settings-shell flex h-full text-sm text-white/90">
       {/* Left sidebar: vertical section tabs. */}
       <nav
-        className="flex shrink-0 flex-col gap-0.5 overflow-y-auto border-white/10 border-r bg-[#111116] p-2"
+        className="app-sidebar flex shrink-0 flex-col gap-0.5 overflow-y-auto border-r p-2"
         style={{ width: sidebarWidth }}
       >
         <h2 className="px-2 pt-1 pb-2 font-semibold text-white/40 text-xs uppercase tracking-wide">
@@ -176,12 +177,20 @@ export function SettingsView({ config, error, onChange }: Props) {
 
 function AppearanceSection({ config, onChange }: Props) {
   return (
-    <Section title="Appearance" hint="Font & theme changes apply live across all tabs.">
+    <Section title="Appearance" hint="Font and UI theme changes apply live across all tabs.">
       <Field label="Font family">
         <CustomDropdown
           value={terminalFontDropdownValue(config.font_family)}
           options={terminalFontOptions(config.font_family)}
           onChange={(value) => onChange({ font_family: value })}
+        />
+      </Field>
+
+      <Field label="UI theme">
+        <CustomDropdown
+          value={config.ui_theme}
+          options={UI_THEME_OPTIONS}
+          onChange={(value) => onChange({ ui_theme: value as AppConfig["ui_theme"] })}
         />
       </Field>
 
@@ -297,7 +306,7 @@ function KeybindingsSection({ config, onChange }: Props) {
 function ThemeSection({ config, onChange }: Props) {
   const setTheme = (patch: Partial<Theme>) => onChange({ theme: { ...config.theme, ...patch } });
   return (
-    <Section title="Theme" hint="Colors apply live across all tabs.">
+    <Section title="Terminal Colors" hint="ANSI colors apply live across all tabs.">
       <div className="grid grid-cols-2 gap-3">
         <Field label="Background">
           <ColorInput

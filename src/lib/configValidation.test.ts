@@ -21,6 +21,15 @@ test("rejects invalid keybinding fields", () => {
   expect(validateAppConfig(cfg)).toBe("keybinding keys cannot be empty");
 });
 
+test("rejects unknown UI themes before live-applying config", () => {
+  const cfg = config();
+  cfg.ui_theme = "laser" as AppConfig["ui_theme"];
+
+  expect(validateAppConfig(cfg)).toBe(
+    "ui theme must be one of: phantom, aurora, ember, cobalt, verdant, violet, amethyst, ultraviolet, sapphire, glacier, lagoon, emerald, jade, silver",
+  );
+});
+
 function config(): AppConfig {
   return {
     font_family: "monospace",
@@ -28,6 +37,7 @@ function config(): AppConfig {
     line_height: 1.2,
     cursor_style: "block",
     cursor_blink: true,
+    ui_theme: "phantom",
     theme: {
       background: "#0b0b0e",
       foreground: "#e6e6e6",

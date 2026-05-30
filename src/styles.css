@@ -19,14 +19,224 @@ body {
 }
 
 .app-window {
+  --app-bg: #0b0b0e;
+  --app-chrome-bg: #111116;
+  --app-chrome-solid: #111116;
+  --app-sidebar-bg: #111116;
+  --app-border: rgba(255, 255, 255, 0.1);
+  --app-accent: rgba(125, 211, 252, 0.9);
+  --terminal-ui-background: none;
+  --terminal-ui-opacity: 0;
   height: 100%;
   overflow: hidden;
   border-radius: 14px;
-  background: #0b0b0e;
+  background: var(--app-bg);
 }
 
 .app-window--maximized {
   border-radius: 0;
+}
+
+.app-window[data-ui-theme="aurora"] {
+  --app-chrome-bg: linear-gradient(120deg, #111116 0%, #14313b 50%, #2a203a 100%);
+  --app-chrome-solid: #14313b;
+  --app-sidebar-bg: #10171b;
+  --app-accent: rgba(103, 232, 249, 0.9);
+  --terminal-ui-background:
+    radial-gradient(circle at 14% 16%, rgba(34, 211, 238, 0.48), transparent 30%),
+    radial-gradient(circle at 82% 18%, rgba(168, 85, 247, 0.38), transparent 32%),
+    linear-gradient(135deg, transparent, rgba(16, 185, 129, 0.2) 54%, transparent);
+  --terminal-ui-opacity: 0.16;
+}
+
+.app-window[data-ui-theme="ember"] {
+  --app-chrome-bg: linear-gradient(120deg, #171115 0%, #3a171b 48%, #2d2634 100%);
+  --app-chrome-solid: #231317;
+  --app-sidebar-bg: #151114;
+  --app-accent: rgba(251, 146, 60, 0.9);
+  --terminal-ui-background:
+    radial-gradient(circle at 18% 84%, rgba(248, 113, 113, 0.42), transparent 34%),
+    radial-gradient(circle at 92% 12%, rgba(251, 191, 36, 0.34), transparent 28%),
+    linear-gradient(150deg, transparent 18%, rgba(168, 85, 247, 0.16), transparent 72%);
+  --terminal-ui-opacity: 0.14;
+}
+
+.app-window[data-ui-theme="cobalt"] {
+  --app-chrome-bg: linear-gradient(120deg, #101219 0%, #102b45 46%, #18213d 100%);
+  --app-chrome-solid: #102034;
+  --app-sidebar-bg: #10141d;
+  --app-accent: rgba(96, 165, 250, 0.92);
+  --terminal-ui-background:
+    radial-gradient(circle at 80% 20%, rgba(59, 130, 246, 0.48), transparent 32%),
+    radial-gradient(circle at 18% 72%, rgba(45, 212, 191, 0.28), transparent 30%),
+    linear-gradient(135deg, transparent 8%, rgba(129, 140, 248, 0.18), transparent 70%);
+  --terminal-ui-opacity: 0.15;
+}
+
+.app-window[data-ui-theme="verdant"] {
+  --app-chrome-bg: linear-gradient(120deg, #101414 0%, #123025 48%, #252a33 100%);
+  --app-chrome-solid: #12251f;
+  --app-sidebar-bg: #101715;
+  --app-accent: rgba(74, 222, 128, 0.86);
+  --terminal-ui-background:
+    radial-gradient(circle at 12% 18%, rgba(52, 211, 153, 0.4), transparent 32%),
+    radial-gradient(circle at 86% 74%, rgba(56, 189, 248, 0.28), transparent 34%),
+    linear-gradient(145deg, transparent 22%, rgba(250, 204, 21, 0.12), transparent 70%);
+  --terminal-ui-opacity: 0.13;
+}
+
+.app-window[data-ui-theme="violet"] {
+  --app-chrome-bg: linear-gradient(120deg, #121018 0%, #302056 48%, #1f1d3c 100%);
+  --app-chrome-solid: #211836;
+  --app-sidebar-bg: #14111b;
+  --app-accent: rgba(192, 132, 252, 0.9);
+  --terminal-ui-background:
+    radial-gradient(circle at 18% 20%, rgba(168, 85, 247, 0.44), transparent 32%),
+    radial-gradient(circle at 84% 72%, rgba(236, 72, 153, 0.2), transparent 30%),
+    linear-gradient(135deg, transparent 14%, rgba(99, 102, 241, 0.18), transparent 72%);
+  --terminal-ui-opacity: 0.15;
+}
+
+.app-window[data-ui-theme="amethyst"] {
+  --app-chrome-bg: linear-gradient(120deg, #111018 0%, #42206d 44%, #2b1f4a 100%);
+  --app-chrome-solid: #28193f;
+  --app-sidebar-bg: #15111d;
+  --app-accent: rgba(216, 180, 254, 0.9);
+  --terminal-ui-background:
+    radial-gradient(circle at 74% 18%, rgba(192, 132, 252, 0.42), transparent 34%),
+    radial-gradient(circle at 16% 78%, rgba(244, 114, 182, 0.18), transparent 32%),
+    linear-gradient(155deg, transparent 18%, rgba(59, 130, 246, 0.14), transparent 72%);
+  --terminal-ui-opacity: 0.15;
+}
+
+.app-window[data-ui-theme="ultraviolet"] {
+  --app-chrome-bg: linear-gradient(120deg, #0f1020 0%, #302d7a 48%, #4a1d63 100%);
+  --app-chrome-solid: #232055;
+  --app-sidebar-bg: #111324;
+  --app-accent: rgba(167, 139, 250, 0.94);
+  --terminal-ui-background:
+    radial-gradient(circle at 82% 22%, rgba(124, 58, 237, 0.42), transparent 34%),
+    radial-gradient(circle at 16% 24%, rgba(14, 165, 233, 0.24), transparent 28%),
+    linear-gradient(145deg, transparent 18%, rgba(217, 70, 239, 0.14), transparent 74%);
+  --terminal-ui-opacity: 0.16;
+}
+
+.app-window[data-ui-theme="sapphire"] {
+  --app-chrome-bg: linear-gradient(120deg, #0f131d 0%, #0d2a58 48%, #172554 100%);
+  --app-chrome-solid: #102140;
+  --app-sidebar-bg: #10141d;
+  --app-accent: rgba(147, 197, 253, 0.92);
+  --terminal-ui-background:
+    radial-gradient(circle at 78% 18%, rgba(37, 99, 235, 0.46), transparent 34%),
+    radial-gradient(circle at 16% 72%, rgba(125, 211, 252, 0.2), transparent 30%),
+    linear-gradient(150deg, transparent 20%, rgba(99, 102, 241, 0.14), transparent 72%);
+  --terminal-ui-opacity: 0.15;
+}
+
+.app-window[data-ui-theme="glacier"] {
+  --app-chrome-bg: linear-gradient(120deg, #101519 0%, #145066 48%, #1d3762 100%);
+  --app-chrome-solid: #143749;
+  --app-sidebar-bg: #10181d;
+  --app-accent: rgba(103, 232, 249, 0.92);
+  --terminal-ui-background:
+    radial-gradient(circle at 18% 18%, rgba(34, 211, 238, 0.4), transparent 32%),
+    radial-gradient(circle at 84% 78%, rgba(96, 165, 250, 0.24), transparent 34%),
+    linear-gradient(140deg, transparent 18%, rgba(186, 230, 253, 0.12), transparent 70%);
+  --terminal-ui-opacity: 0.14;
+}
+
+.app-window[data-ui-theme="lagoon"] {
+  --app-chrome-bg: linear-gradient(120deg, #0f1617 0%, #0f3945 48%, #114b49 100%);
+  --app-chrome-solid: #11333a;
+  --app-sidebar-bg: #101817;
+  --app-accent: rgba(45, 212, 191, 0.9);
+  --terminal-ui-background:
+    radial-gradient(circle at 84% 20%, rgba(20, 184, 166, 0.4), transparent 32%),
+    radial-gradient(circle at 18% 72%, rgba(56, 189, 248, 0.22), transparent 32%),
+    linear-gradient(145deg, transparent 20%, rgba(16, 185, 129, 0.14), transparent 72%);
+  --terminal-ui-opacity: 0.14;
+}
+
+.app-window[data-ui-theme="emerald"] {
+  --app-chrome-bg: linear-gradient(120deg, #101513 0%, #113b2d 48%, #1f3b28 100%);
+  --app-chrome-solid: #122d23;
+  --app-sidebar-bg: #101713;
+  --app-accent: rgba(52, 211, 153, 0.9);
+  --terminal-ui-background:
+    radial-gradient(circle at 78% 18%, rgba(16, 185, 129, 0.42), transparent 34%),
+    radial-gradient(circle at 14% 76%, rgba(132, 204, 22, 0.18), transparent 30%),
+    linear-gradient(150deg, transparent 20%, rgba(45, 212, 191, 0.12), transparent 72%);
+  --terminal-ui-opacity: 0.13;
+}
+
+.app-window[data-ui-theme="jade"] {
+  --app-chrome-bg: linear-gradient(120deg, #0f1515 0%, #104239 48%, #183734 100%);
+  --app-chrome-solid: #12312c;
+  --app-sidebar-bg: #101716;
+  --app-accent: rgba(94, 234, 212, 0.9);
+  --terminal-ui-background:
+    radial-gradient(circle at 18% 18%, rgba(45, 212, 191, 0.4), transparent 32%),
+    radial-gradient(circle at 84% 74%, rgba(34, 197, 94, 0.2), transparent 32%),
+    linear-gradient(140deg, transparent 20%, rgba(250, 204, 21, 0.08), transparent 72%);
+  --terminal-ui-opacity: 0.13;
+}
+
+.app-window[data-ui-theme="silver"] {
+  --app-chrome-bg: linear-gradient(120deg, #121318 0%, #2f333c 48%, #181c24 100%);
+  --app-chrome-solid: #252932;
+  --app-sidebar-bg: #14161c;
+  --app-accent: rgba(226, 232, 240, 0.88);
+  --terminal-ui-background:
+    radial-gradient(circle at 18% 18%, rgba(203, 213, 225, 0.22), transparent 30%),
+    radial-gradient(circle at 82% 76%, rgba(148, 163, 184, 0.18), transparent 34%),
+    linear-gradient(145deg, transparent 18%, rgba(56, 189, 248, 0.08), transparent 72%);
+  --terminal-ui-opacity: 0.12;
+}
+
+.app-chrome {
+  border-color: var(--app-border);
+  background: var(--app-chrome-bg);
+}
+
+.app-sidebar {
+  border-color: var(--app-border);
+  background: var(--app-sidebar-bg);
+}
+
+.settings-shell,
+.terminal-surface,
+.terminal-view {
+  background: var(--app-bg);
+}
+
+.terminal-ui-background {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  background: var(--terminal-ui-background);
+  opacity: var(--terminal-ui-opacity);
+}
+
+.app-active-tab-indicator,
+.app-drop-marker {
+  background: var(--app-accent);
+}
+
+.chrome-scroll-fade--top {
+  background: linear-gradient(to bottom, var(--app-chrome-solid), transparent);
+}
+
+.chrome-scroll-fade--bottom {
+  background: linear-gradient(to top, var(--app-chrome-solid), transparent);
+}
+
+.chrome-scroll-fade--left {
+  background: linear-gradient(to right, var(--app-chrome-solid), transparent);
+}
+
+.chrome-scroll-fade--right {
+  background: linear-gradient(to left, var(--app-chrome-solid), transparent);
 }
 
 /* The tab bar is a custom-drag region on macOS; interactive controls opt out. */

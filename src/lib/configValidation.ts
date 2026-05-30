@@ -1,4 +1,5 @@
 import type { AppConfig, ShellProfile, Theme } from "./ipc";
+import { UI_THEME_IDS } from "./uiThemes";
 
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 48;
@@ -23,6 +24,7 @@ export function validateAppConfig(config: AppConfig): string | null {
     validateIntegerRange("font size", config.font_size, MIN_FONT_SIZE, MAX_FONT_SIZE) ??
     validateRange("line height", config.line_height, MIN_LINE_HEIGHT, MAX_LINE_HEIGHT) ??
     validateCursorStyle(config.cursor_style) ??
+    validateUiTheme(config.ui_theme) ??
     validateScrollback(config.scrollback_lines) ??
     validateTabLayout(config.tab_layout) ??
     validateTheme(config.theme) ??
@@ -145,6 +147,12 @@ function validateCursorStyle(value: string): string | null {
   return value === "block" || value === "bar" || value === "underline"
     ? null
     : "cursor style must be block, bar, or underline";
+}
+
+function validateUiTheme(value: string): string | null {
+  return UI_THEME_IDS.includes(value as AppConfig["ui_theme"])
+    ? null
+    : `ui theme must be one of: ${UI_THEME_IDS.join(", ")}`;
 }
 
 function validateTabLayout(value: string): string | null {
