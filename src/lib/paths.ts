@@ -14,7 +14,7 @@ export function setHomeDir(dir: string | null | undefined): void {
  *
  * Returns "" for an empty cwd so callers can fall back to a default label.
  */
-export function formatCwdName(cwd: string, maxLen = 22): string {
+export function formatCwdName(cwd: string, maxLen = 48): string {
   if (!cwd) return "";
 
   let path = cwd;

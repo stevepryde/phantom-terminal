@@ -198,6 +198,17 @@ function AppearanceSection({ config, onChange }: Props) {
         />
       </Field>
 
+      <Field label="Tabs">
+        <CustomDropdown
+          value={config.tab_layout}
+          options={[
+            { value: "horizontal", label: "Horizontal tabs" },
+            { value: "vertical", label: "Vertical tabs" },
+          ]}
+          onChange={(value) => onChange({ tab_layout: value as AppConfig["tab_layout"] })}
+        />
+      </Field>
+
       <div className="grid grid-cols-2 gap-3">
         <Field label="Cursor style">
           <CustomDropdown

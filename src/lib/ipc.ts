@@ -59,6 +59,8 @@ export interface Keybinding {
   keys: string;
 }
 
+export type TabLayout = "horizontal" | "vertical";
+
 export interface AppConfig {
   font_family: string;
   font_size: number;
@@ -70,6 +72,7 @@ export interface AppConfig {
   default_shell_profile_id: string;
   keybindings: Keybinding[];
   restore_on_launch: boolean;
+  tab_layout: TabLayout;
   /** In-memory scrollback lines per terminal; never persisted to disk. */
   scrollback_lines: number;
 }

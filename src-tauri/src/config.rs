@@ -175,6 +175,7 @@ pub struct AppConfig {
     pub default_shell_profile_id: String,
     pub keybindings: Vec<Keybinding>,
     pub restore_on_launch: bool,
+    pub tab_layout: String,
     /// Lines of scrollback kept per terminal. In-memory only — never written to
     /// disk, so terminal output never persists across relaunch.
     pub scrollback_lines: u32,
@@ -199,6 +200,7 @@ impl Default for AppConfig {
             default_shell_profile_id: "default".to_string(),
             keybindings: default_keybindings(),
             restore_on_launch: true,
+            tab_layout: "horizontal".to_string(),
             scrollback_lines: 10_000,
         }
     }
@@ -235,6 +237,14 @@ impl AppConfig {
             return Err(AppError::InvalidConfig(format!(
                 "scrollback_lines must be no more than {MAX_SCROLLBACK_LINES}"
             )));
+        }
+        match self.tab_layout.as_str() {
+            "horizontal" | "vertical" => {}
+            _ => {
+                return Err(AppError::InvalidConfig(
+                    "tab layout must be horizontal or vertical".to_string(),
+                ));
+            }
         }
         self.theme.validate()?;
         validate_profiles(&self.shell_profiles, &self.default_shell_profile_id)?;
@@ -421,6 +431,15 @@ mod tests {
     fn rejects_invalid_theme_color() {
         let mut config = AppConfig::default();
         config.theme.background = "black".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_tab_layout() {
+        let config = AppConfig {
+            tab_layout: "diagonal".to_string(),
+            ..AppConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 

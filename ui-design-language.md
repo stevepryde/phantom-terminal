@@ -10,7 +10,7 @@ These rules capture deliberate product decisions and should not be changed casua
 
 | Area | Locked Rule |
 | --- | --- |
-| Terminal tabs | Tabs fill the full space between vertical separators. Active state is a bottom underline only: no bubble, pill, or persistent filled background. Inactive tabs stay transparent except for temporary hover fill. |
+| Terminal tabs | Horizontal tabs fill the full space between vertical separators. Active state is a bottom underline only: no bubble, pill, or persistent filled background. Vertical tabs use the same transparent tab surface in a left sidebar, with horizontal separators and an active right border. |
 | Terminal pane inset | Terminal content has a consistent `8px` inset on all sides. If the terminal emulator creates a single empty top screen row, visually trim that row rather than removing the intentional pane inset. |
 | Font settings | Terminal font is app-wide and lives in Appearance. Shell profiles must not expose font or appearance controls unless a full appearance-profile feature is intentionally designed. |
 | Profile settings | Profiles are listed first, then edited one at a time. Do not show multiple profile forms inline. |
@@ -72,6 +72,7 @@ Settings forms should group related fields with `12px` gaps and avoid nesting ca
 | Icon button | `28px` or larger | Toolbar and inline actions |
 | Row hit target | `40px` minimum | Clickable list rows |
 | Settings sidebar | `160px` to `400px` | Resizable navigation |
+| Tab sidebar | `144px` to `360px` | Resizable vertical terminal tabs |
 | Settings content | `672px` max | Keeps form rows readable |
 
 Inputs, dropdowns, and adjacent buttons should share heights within a row.
@@ -98,7 +99,7 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 | Destructive actions | Put delete actions in the detail/edit screen, not the list row, and use inline confirmation before deleting |
 | Back navigation | Detail screens should offer a clear back action near the title |
 | Editable rows | The primary row area should be clickable, with separate icon affordances for secondary actions |
-| Terminal tabs | Tabs fill the full space between separators; selected tabs use only a bottom underline, while inactive tabs stay transparent except for temporary hover fill |
+| Terminal tabs | Horizontal tabs fill the full space between vertical separators; selected tabs use only a bottom underline, while inactive tabs stay transparent except for temporary hover fill. Vertical tabs live in a left sidebar, use horizontal separators, and show selection with a right-aligned border. |
 | Terminal pane | Use a consistent `8px` inset on all sides; keep emulator blank-row trimming separate from intentional layout padding |
 
 ## Accessibility

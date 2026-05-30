@@ -31,7 +31,7 @@ import {
   tabsStore,
   toggleSettingsTab,
 } from "./store/tabs";
-import { TabBar } from "./tabs/TabBar";
+import { TabBar, TitleBarChrome } from "./tabs/TabBar";
 import { TerminalView } from "./terminal/TerminalView";
 
 const isMac = /mac/i.test(navigator.platform || navigator.userAgent);
@@ -362,64 +362,83 @@ export default function App() {
     );
   }
 
+  const tabLayout = config.tab_layout;
+  const tabBarProps = {
+    paintRevision: chromePaintRevision,
+    tabs,
+    activeId,
+    editingId,
+    onActivate: activateTab,
+    onClose: closeTab,
+    onAdd: newTab,
+    onNewTabAfter: newTabAfter,
+    onStartRename: setEditingId,
+    onCommitRename: (id: string, title: string) => {
+      renameTab(id, title);
+      setEditingId(null);
+    },
+    onCancelRename: () => setEditingId(null),
+    onOpenSettings: openSettingsTab,
+  };
+
+  const tabContent = (
+    <div className="relative min-h-0 flex-1 bg-[#0b0b0e]">
+      {tabs.map((tab) => (
+        // Every tab stays mounted (keeps its PTY alive) and is absolutely
+        // stacked. Without this, an inactive tab later in the array overlays
+        // the active terminal and swallows clicks — the terminal then can't be
+        // focused, so you see a cursor but can't type. Only the active wrapper
+        // accepts pointer events; the rest let clicks fall through.
+        <div
+          key={tab.id}
+          // Terminal tabs keep a real pane inset on every side; the renderer
+          // handles trimming any fake first-row blank from the emulator.
+          className={`absolute inset-0 ${tab.kind === "settings" ? "" : "p-2"}`}
+          style={{
+            pointerEvents: tab.id === activeId ? "auto" : "none",
+            // TerminalView hides itself when inactive, but SettingsView does
+            // not — so an inactive settings tab would keep painting on top of
+            // the active terminal. Hide its wrapper when it isn't active.
+            display: tab.kind === "settings" && tab.id !== activeId ? "none" : undefined,
+          }}
+        >
+          {tab.kind === "settings" ? (
+            <SettingsView config={config} onChange={updateConfig} />
+          ) : (
+            <TerminalView
+              tabId={tab.id}
+              cwd={tab.cwd}
+              active={tab.id === activeId}
+              config={config}
+              shellProfileId={tab.shellProfileId}
+              onSpawn={setTabPty}
+            />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+
   return (
     <div
       className={`app-window relative flex flex-col ${
         windowMaximized ? "app-window--maximized" : ""
       }`}
     >
-      <TabBar
-        paintRevision={chromePaintRevision}
-        tabs={tabs}
-        activeId={activeId}
-        editingId={editingId}
-        onActivate={activateTab}
-        onClose={closeTab}
-        onAdd={newTab}
-        onNewTabRight={newTabAfter}
-        onStartRename={setEditingId}
-        onCommitRename={(id, title) => {
-          renameTab(id, title);
-          setEditingId(null);
-        }}
-        onCancelRename={() => setEditingId(null)}
-        onOpenSettings={openSettingsTab}
-      />
-      <div className="relative min-h-0 flex-1 bg-[#0b0b0e]">
-        {tabs.map((tab) => (
-          // Every tab stays mounted (keeps its PTY alive) and is absolutely
-          // stacked. Without this, an inactive tab later in the array overlays
-          // the active terminal and swallows clicks — the terminal then can't be
-          // focused, so you see a cursor but can't type. Only the active wrapper
-          // accepts pointer events; the rest let clicks fall through.
-          <div
-            key={tab.id}
-            // Terminal tabs keep a real pane inset on every side; the renderer
-            // handles trimming any fake first-row blank from the emulator.
-            className={`absolute inset-0 ${tab.kind === "settings" ? "" : "p-2"}`}
-            style={{
-              pointerEvents: tab.id === activeId ? "auto" : "none",
-              // TerminalView hides itself when inactive, but SettingsView does
-              // not — so an inactive settings tab would keep painting on top of
-              // the active terminal. Hide its wrapper when it isn't active.
-              display: tab.kind === "settings" && tab.id !== activeId ? "none" : undefined,
-            }}
-          >
-            {tab.kind === "settings" ? (
-              <SettingsView config={config} onChange={updateConfig} />
-            ) : (
-              <TerminalView
-                tabId={tab.id}
-                cwd={tab.cwd}
-                active={tab.id === activeId}
-                config={config}
-                shellProfileId={tab.shellProfileId}
-                onSpawn={setTabPty}
-              />
-            )}
+      {tabLayout === "horizontal" ? (
+        <>
+          <TabBar layout={tabLayout} {...tabBarProps} />
+          {tabContent}
+        </>
+      ) : (
+        <>
+          <TitleBarChrome paintRevision={chromePaintRevision} onOpenSettings={openSettingsTab} />
+          <div className="flex min-h-0 flex-1">
+            <TabBar layout={tabLayout} {...tabBarProps} />
+            {tabContent}
           </div>
-        ))}
-      </div>
+        </>
+      )}
       {paletteOpen && (
         <CommandPalette
           tabs={tabs}

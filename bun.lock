@@ -6,7 +6,7 @@
       "name": "phantom-terminal",
       "dependencies": {
         "@tauri-apps/api": "2.11.0",
-        "ghostty-web": "0.4.0",
+        "ghostty-web": "0.4.0-next.14.g6a1a50d",
         "lucide-react": "1.16.0",
         "react": "19.2.6",
         "react-dom": "19.2.6",
@@ -176,7 +176,7 @@
 
     "fsevents": ["fsevents@2.3.3", "", { "os": "darwin" }, "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw=="],
 
-    "ghostty-web": ["ghostty-web@0.4.0", "", {}, "sha512-0puDBik2qapbD/QQBW9o5ZHfXnZBqZWx/ctBiVtKZ6ZLds4NYb+wZuw1cRLXZk9zYovIQ908z3rvFhexAvc5Hg=="],
+    "ghostty-web": ["ghostty-web@0.4.0-next.14.g6a1a50d", "", {}, "sha512-01H59pAKq43Y8ZZiIhH98cu0ahZaoGoPQPtW4KnZPT0JFdQYen2djsXrOnt27JnMv64D4eLeAq8D6h72mo52xQ=="],
 
     "graceful-fs": ["graceful-fs@4.2.11", "", {}, "sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ=="],
 

@@ -48,7 +48,7 @@ export function TabContextMenu({ x, y, onNewTab, onRename, onCloseTab, onDismiss
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-white/80 hover:bg-white/10"
         onClick={onNewTab}
       >
-        <Plus size={14} /> New tab to the right
+        <Plus size={14} /> New tab after
       </button>
       <button
         type="button"
