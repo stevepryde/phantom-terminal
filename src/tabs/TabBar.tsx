@@ -332,7 +332,7 @@ export function TabBar({
         }}
       >
         <WindowControls placement="leading" />
-        {/* Sizes to the tabs' width, but shrinks (min-w-0) to scroll when they
+        {/* Sizes to the fixed-width tabs, but shrinks (min-w-0) to scroll when they
             overflow. Because it isn't flex-1, the New Tab button after it sits
             right next to the tabs when they fit and pins to the right edge of
             the strip once they overflow. */}
@@ -356,7 +356,7 @@ export function TabBar({
                 // biome-ignore lint/suspicious/noArrayIndexKey: duplicated restored ids are repaired by addTab, but index keeps this render stable during repair.
                 key={`${tab.id}-${i}`}
                 data-tab-id={tab.id}
-                className="no-drag relative flex items-stretch"
+                className="no-drag relative flex shrink-0 items-stretch"
               >
                 {marker(i)}
                 {i > 0 && (
@@ -522,9 +522,7 @@ function TabItem({
       tabIndex={0}
       className={[
         "no-drag group relative flex cursor-pointer items-center gap-1 bg-transparent text-sm transition-colors",
-        layout === "vertical"
-          ? "min-h-10 w-full px-2.5"
-          : "h-full min-w-[7rem] max-w-[14rem] pr-2 pl-3",
+        layout === "vertical" ? "min-h-10 w-full px-2.5" : "h-full w-48 shrink-0 pr-2 pl-3",
         active ? "text-white" : "text-white/55 hover:bg-white/[0.07] hover:text-white/85",
         dragging ? "opacity-40" : "",
       ].join(" ")}
