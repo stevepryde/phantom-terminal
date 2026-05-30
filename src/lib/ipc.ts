@@ -75,6 +75,7 @@ export type UiThemeId =
   | "emerald"
   | "jade"
   | "silver";
+export type TerminalBackgroundId = "none" | "phantom" | "dragon";
 
 export interface AppConfig {
   font_family: string;
@@ -83,6 +84,7 @@ export interface AppConfig {
   cursor_style: "block" | "bar" | "underline";
   cursor_blink: boolean;
   ui_theme: UiThemeId;
+  terminal_background: TerminalBackgroundId;
   theme: Theme;
   shell_profiles: ShellProfile[];
   default_shell_profile_id: string;

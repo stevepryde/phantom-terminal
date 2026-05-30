@@ -174,6 +174,7 @@ export default function App() {
           windowMaximized ? "app-window--maximized" : ""
         }`}
         data-ui-theme="phantom"
+        data-terminal-background="phantom"
       >
         Loading…
       </div>
@@ -243,6 +244,7 @@ export default function App() {
         windowMaximized ? "app-window--maximized" : ""
       }`}
       data-ui-theme={config.ui_theme}
+      data-terminal-background={config.terminal_background}
     >
       {tabLayout === "horizontal" ? (
         <>

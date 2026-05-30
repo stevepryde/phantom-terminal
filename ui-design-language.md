@@ -40,9 +40,9 @@ Rows and menu items must define hover states. Avoid single-hue pages by using ne
 ## UI Themes
 
 UI themes are separate from terminal color themes. They may tint the title bar,
-tab chrome, active tab accent, and a very dim terminal backdrop wash, but they
-must not rewrite ANSI foreground/background colors or reduce terminal text
-contrast.
+tab chrome, active tab accent, and a very dim terminal backdrop wash or local
+fantasy background image, but they must not rewrite ANSI foreground/background
+colors or reduce terminal text contrast.
 
 | Preset | Chrome Direction | Terminal Backdrop Rule |
 | --- | --- | --- |
@@ -63,6 +63,18 @@ contrast.
 
 Theme presets should remain a validated enum in Rust. Do not allow arbitrary CSS
 strings, external images, or remote background URLs through config.
+
+Terminal backdrop images live under `public/backgrounds/` and are referenced as
+local assets only. The selected backdrop is a separate validated setting from
+the UI color theme, surfaced directly below the UI theme dropdown in Appearance.
+Keep them dark, low-detail, and low-opacity; artwork should read as embossed
+texture behind text, not as an illustration competing with the terminal buffer.
+
+| Backdrop | Rule |
+| --- | --- |
+| Phantom | Default branded fantasy backdrop |
+| Dragon | Alternate fantasy backdrop |
+| None | No image; keep only the theme's dim gradient wash |
 
 ## Typography
 

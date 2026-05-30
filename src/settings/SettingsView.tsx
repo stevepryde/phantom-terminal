@@ -16,6 +16,7 @@ import { CustomDropdown } from "../components/CustomDropdown";
 import { terminalFontDropdownValue, terminalFontOptions } from "../lib/fonts";
 import type { AppConfig, Keybinding, ShellProfile, Theme } from "../lib/ipc";
 import { DEFAULT_KEYBINDINGS, KEYBINDING_ACTION_LABELS } from "../lib/keybindings";
+import { TERMINAL_BACKGROUND_OPTIONS } from "../lib/terminalBackgrounds";
 import { UI_THEME_OPTIONS } from "../lib/uiThemes";
 
 interface Props {
@@ -177,12 +178,22 @@ export function SettingsView({ config, error, onChange }: Props) {
 
 function AppearanceSection({ config, onChange }: Props) {
   return (
-    <Section title="Appearance" hint="Font and UI theme changes apply live across all tabs.">
+    <Section title="Appearance" hint="UI, background, and font changes apply live across all tabs.">
       <Field label="UI theme">
         <CustomDropdown
           value={config.ui_theme}
           options={UI_THEME_OPTIONS}
           onChange={(value) => onChange({ ui_theme: value as AppConfig["ui_theme"] })}
+        />
+      </Field>
+
+      <Field label="Terminal background">
+        <CustomDropdown
+          value={config.terminal_background}
+          options={TERMINAL_BACKGROUND_OPTIONS}
+          onChange={(value) =>
+            onChange({ terminal_background: value as AppConfig["terminal_background"] })
+          }
         />
       </Field>
 

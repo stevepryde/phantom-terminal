@@ -1,4 +1,5 @@
 import type { AppConfig, ShellProfile, Theme } from "./ipc";
+import { TERMINAL_BACKGROUND_IDS } from "./terminalBackgrounds";
 import { UI_THEME_IDS } from "./uiThemes";
 
 const MIN_FONT_SIZE = 8;
@@ -25,6 +26,7 @@ export function validateAppConfig(config: AppConfig): string | null {
     validateRange("line height", config.line_height, MIN_LINE_HEIGHT, MAX_LINE_HEIGHT) ??
     validateCursorStyle(config.cursor_style) ??
     validateUiTheme(config.ui_theme) ??
+    validateTerminalBackground(config.terminal_background) ??
     validateScrollback(config.scrollback_lines) ??
     validateTabLayout(config.tab_layout) ??
     validateTheme(config.theme) ??
@@ -153,6 +155,12 @@ function validateUiTheme(value: string): string | null {
   return UI_THEME_IDS.includes(value as AppConfig["ui_theme"])
     ? null
     : `ui theme must be one of: ${UI_THEME_IDS.join(", ")}`;
+}
+
+function validateTerminalBackground(value: string): string | null {
+  return TERMINAL_BACKGROUND_IDS.includes(value as AppConfig["terminal_background"])
+    ? null
+    : `terminal background must be one of: ${TERMINAL_BACKGROUND_IDS.join(", ")}`;
 }
 
 function validateTabLayout(value: string): string | null {
