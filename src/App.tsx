@@ -1,23 +1,23 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState } from "react";
 import { CommandPalette } from "./command-palette/CommandPalette";
-import { validateAppConfig } from "./lib/configValidation";
+import { useAppConfig } from "./hooks/useAppConfig";
+import { useDisplayLayoutRefresh } from "./hooks/useDisplayLayoutRefresh";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useLiveCwdPolling } from "./hooks/useLiveCwdPolling";
+import { useSessionPersistence } from "./hooks/useSessionPersistence";
+import { useWindowShape } from "./hooks/useWindowShape";
 import {
   type AppConfig,
   configGet,
-  configSet,
   homeDir,
-  isTauri,
   ptyCwd,
   type TabRecord,
   tabsLoad,
   tabsSave,
 } from "./lib/ipc";
-import { findKeybindingAction } from "./lib/keybindings";
 import { setHomeDir } from "./lib/paths";
 import { useStore } from "./lib/store";
 import { SettingsView } from "./settings/SettingsView";
-import { TabSessionSaver } from "./store/tabPersistence";
 import {
   activateIndex,
   activateRelative,
@@ -36,40 +36,23 @@ import {
 import { TabBar, TitleBarChrome } from "./tabs/TabBar";
 import { TerminalView } from "./terminal/TerminalView";
 
-const isMac = /mac/i.test(navigator.platform || navigator.userAgent);
-
 export default function App() {
   const tabs = useStore(tabsStore, (s) => s.tabs);
   const activeId = useStore(tabsStore, (s) => s.activeId);
-  const [config, setConfig] = useState<AppConfig | null>(null);
+  const { config, configError, configRef, initConfig, updateConfig } = useAppConfig();
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [configError, setConfigError] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [chromePaintRevision, setChromePaintRevision] = useState(0);
-  const [windowMaximized, setWindowMaximized] = useState(false);
-  const readyRef = useRef(false);
   const homePathRef = useRef<string | null>(null);
-  const sessionSaverRef = useRef<TabSessionSaver | null>(null);
-  // Mirror config into a ref so the (deps-free) keyboard/command handlers can
-  // read the current default profile without re-binding listeners.
-  const configRef = useRef<AppConfig | null>(null);
-  const persistedConfigRef = useRef<AppConfig | null>(null);
-  const configSaveSeqRef = useRef(0);
-  configRef.current = config;
 
-  // The live cwd of a tab: query the PTY (authoritative) and fall back to the
-  // last-known stored cwd.
-  async function liveCwd(tab: Tab): Promise<string | null> {
-    if (tab.ptyId != null) {
-      const live = await ptyCwd(tab.ptyId);
-      if (live) return live;
-    }
-    return tab.cwd;
-  }
+  const chromePaintRevision = useDisplayLayoutRefresh();
+  const windowMaximized = useWindowShape();
+  useLiveCwdPolling();
 
-  sessionSaverRef.current ??= new TabSessionSaver({
+  // The session saver reads the store's `tab.cwd` (kept current by the cwd
+  // poller above) rather than resolving cwd again — one cwd-resolution path.
+  const persistence = useSessionPersistence({
     getSnapshot: () => tabsStore.state,
-    resolveCwd: liveCwd,
+    resolveCwd: (tab: Tab) => Promise.resolve(tab.cwd),
     saveTabs: tabsSave,
     onCwdResolved: setTabCwd,
     onError: (err) => {
@@ -77,14 +60,15 @@ export default function App() {
     },
   });
 
-  function requestSessionSave() {
-    if (!readyRef.current) return;
-    sessionSaverRef.current?.requestSave();
-  }
-
-  async function saveSessionNow() {
-    if (!readyRef.current) return;
-    await sessionSaverRef.current?.saveNow();
+  // The live cwd of a tab: query the PTY (authoritative) and fall back to the
+  // last-known stored cwd. Used when opening a tab so it inherits the freshest
+  // directory even between cwd-poll ticks.
+  async function liveCwd(tab: Tab): Promise<string | null> {
+    if (tab.ptyId != null) {
+      const live = await ptyCwd(tab.ptyId);
+      if (live) return live;
+    }
+    return tab.cwd;
   }
 
   // Open a new tab that inherits `fromId`'s cwd. When `afterId` is given the tab
@@ -114,50 +98,35 @@ export default function App() {
     });
   }
 
-  // Apply a config patch live only after frontend validation, then persist it.
-  // The backend still owns validation; this prevents silent UI/disk divergence
-  // and rolls back if Rust rejects something the frontend missed.
-  function updateConfig(patch: Partial<AppConfig>) {
-    setConfig((prev) => {
-      if (!prev) return prev;
-      const next = { ...prev, ...patch };
-      const validationError = validateAppConfig(next);
-      if (validationError) {
-        setConfigError(validationError);
-        return prev;
-      }
-
-      setConfigError(null);
-      const saveSeq = ++configSaveSeqRef.current;
-      void configSet(next)
-        .then(() => {
-          persistedConfigRef.current = next;
-        })
-        .catch((err) => {
-          console.error("phantom: failed to persist config", err);
-          if (saveSeq === configSaveSeqRef.current) {
-            setConfig(persistedConfigRef.current);
-            setConfigError(String(err));
-          }
-        });
-      return next;
-    });
-  }
+  useKeyboardShortcuts(config, {
+    toggleSettings: toggleSettingsTab,
+    togglePalette: () => setPaletteOpen((v) => !v),
+    newTab,
+    closeActiveTab: () => {
+      const id = tabsStore.state.activeId;
+      if (id) closeTab(id);
+    },
+    renameActiveTab: () => {
+      const id = tabsStore.state.activeId;
+      if (id) setEditingId(id);
+    },
+    activateRelative,
+    activateIndex,
+  });
 
   // Load config + restore saved session on launch.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: launch bootstrap runs once; session saver reads live store refs.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: launch bootstrap runs once; the config + persistence controllers are stable.
   useEffect(() => {
     (async () => {
       const cfg = await configGet();
-      setConfig(cfg);
-      persistedConfigRef.current = cfg;
+      initConfig(cfg);
       const home = await homeDir().catch(() => null);
       homePathRef.current = home;
       setHomeDir(home);
 
       if (tabsStore.state.tabs.length) {
-        readyRef.current = true;
-        requestSessionSave();
+        persistence.markReady();
+        persistence.requestSave();
         return;
       }
 
@@ -170,7 +139,7 @@ export default function App() {
           restored = [];
         }
       }
-      sessionSaverRef.current?.remember(restored);
+      persistence.remember(restored);
 
       if (restored.length) {
         replaceTabs(
@@ -193,193 +162,9 @@ export default function App() {
           },
         ]);
       }
-      readyRef.current = true;
-      requestSessionSave();
+      persistence.markReady();
+      persistence.requestSave();
     })();
-  }, []);
-
-  // Save on tab add/close/rename/activate (debounced) + periodically + on blur.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: subscribes once for the app's lifetime; the session saver reads live state from the store.
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const sub = tabsStore.subscribe(() => {
-      clearTimeout(timer);
-      timer = setTimeout(requestSessionSave, 500);
-    });
-    const interval = setInterval(requestSessionSave, 10_000);
-    const onBlur = () => {
-      void saveSessionNow();
-    };
-    window.addEventListener("blur", onBlur);
-    return () => {
-      sub();
-      clearTimeout(timer);
-      clearInterval(interval);
-      window.removeEventListener("blur", onBlur);
-    };
-  }, []);
-
-  // Keyboard shortcuts.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: listeners bound once; handlers read live state from refs/store and the stable newTab closure.
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const config = configRef.current;
-      const action = config ? findKeybindingAction(e, config.keybindings) : null;
-
-      if (action === "settings.toggle") {
-        consumeShortcut(e);
-        toggleSettingsTab();
-        return;
-      }
-      if (action === "palette.toggle") {
-        consumeShortcut(e);
-        setPaletteOpen((v) => !v);
-        return;
-      }
-      if (action === "tab.new") {
-        consumeShortcut(e);
-        newTab();
-        return;
-      }
-      if (action === "tab.close") {
-        consumeShortcut(e);
-        const id = tabsStore.state.activeId;
-        if (id) closeTab(id);
-        return;
-      }
-      if (action === "tab.rename") {
-        const id = tabsStore.state.activeId;
-        if (id) {
-          consumeShortcut(e);
-          setEditingId(id);
-        }
-        return;
-      }
-      if (e.ctrlKey && e.code === "Tab") {
-        consumeShortcut(e);
-        activateRelative(e.shiftKey ? -1 : 1);
-        return;
-      }
-      if (isMac && e.metaKey && e.shiftKey && e.code === "BracketLeft") {
-        consumeShortcut(e);
-        activateRelative(-1);
-        return;
-      }
-      if (isMac && e.metaKey && e.shiftKey && e.code === "BracketRight") {
-        consumeShortcut(e);
-        activateRelative(1);
-        return;
-      }
-      const numMod = isMac ? e.metaKey : e.altKey;
-      if (numMod && /^Digit[1-9]$/.test(e.code)) {
-        consumeShortcut(e);
-        activateIndex(Number(e.code.slice(5)) - 1);
-        return;
-      }
-    }
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, []);
-
-  // Poll live cwd so cwd-named tabs track `cd`. setTabCwd is a no-op when the
-  // path is unchanged, so this only mutates the store on a real directory change.
-  useEffect(() => {
-    const id = setInterval(async () => {
-      for (const t of tabsStore.state.tabs) {
-        if (t.ptyId == null) continue;
-        const live = await ptyCwd(t.ptyId);
-        if (live) setTabCwd(t.id, live);
-      }
-    }, 1500);
-    return () => clearInterval(id);
-  }, []);
-
-  // Moving a WKWebView between macOS displays can leave custom draggable chrome
-  // in a stale paint state until the next resize. Nudge chrome + terminals after
-  // display-affecting window events so crossing screens behaves like a resize.
-  useEffect(() => {
-    if (!isTauri()) return;
-
-    const win = getCurrentWindow();
-    let timers: Array<ReturnType<typeof setTimeout>> = [];
-    let disposed = false;
-    const unlisteners: Array<() => void> = [];
-
-    const clearRefreshTimers = () => {
-      for (const timer of timers) clearTimeout(timer);
-      timers = [];
-    };
-
-    const emitDisplayLayoutRefresh = () => {
-      if (disposed) return;
-      setChromePaintRevision((revision) => revision + 1);
-      window.dispatchEvent(new Event("phantom:display-layout-change"));
-    };
-
-    const refreshDisplayLayout = () => {
-      clearRefreshTimers();
-      timers = [0, 50, 150, 300].map((delay) => setTimeout(emitDisplayLayoutRefresh, delay));
-    };
-
-    void Promise.all([
-      win.onScaleChanged(refreshDisplayLayout),
-      win.onMoved(refreshDisplayLayout),
-      win.onResized(refreshDisplayLayout),
-      win.onFocusChanged(({ payload: focused }) => {
-        if (focused) refreshDisplayLayout();
-      }),
-    ]).then((listeners) => {
-      if (disposed) {
-        for (const unlisten of listeners) unlisten();
-      } else {
-        unlisteners.push(...listeners);
-      }
-    });
-
-    return () => {
-      disposed = true;
-      clearRefreshTimers();
-      for (const unlisten of unlisteners) unlisten();
-    };
-  }, []);
-
-  // Rounded transparent windows should square off when maximized/fullscreen so
-  // the content still reaches the display edges.
-  useEffect(() => {
-    if (!isTauri()) return;
-
-    const win = getCurrentWindow();
-    let disposed = false;
-    const unlisteners: Array<() => void> = [];
-
-    const updateWindowShape = () => {
-      void Promise.all([win.isMaximized(), win.isFullscreen()])
-        .then(([maximized, fullscreen]) => {
-          if (!disposed) setWindowMaximized(maximized || fullscreen);
-        })
-        .catch((err) => {
-          console.error("phantom: failed to read window shape state", err);
-        });
-    };
-
-    updateWindowShape();
-
-    void Promise.all([
-      win.onResized(updateWindowShape),
-      win.onMoved(updateWindowShape),
-      win.onFocusChanged(updateWindowShape),
-    ]).then((listeners) => {
-      if (disposed) {
-        for (const unlisten of listeners) unlisten();
-      } else {
-        unlisteners.push(...listeners);
-      }
-    });
-
-    return () => {
-      disposed = true;
-      for (const unlisten of unlisteners) unlisten();
-    };
   }, []);
 
   if (!config) {
@@ -493,10 +278,4 @@ function defaultLaunchCwd(config: AppConfig | null, home: string | null): string
     config.shell_profiles.find((p) => p.id === config.default_shell_profile_id) ??
     config.shell_profiles[0];
   return profile?.cwd?.trim() || home;
-}
-
-function consumeShortcut(event: KeyboardEvent) {
-  event.preventDefault();
-  event.stopPropagation();
-  event.stopImmediatePropagation();
 }

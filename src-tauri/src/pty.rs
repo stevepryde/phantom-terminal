@@ -117,7 +117,7 @@ impl PtyManager {
         // GUI apps launch with a sparse environment compared with login shells.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("PATH", shell_path());
+        cmd.env("PATH", shell_path(&account));
         apply_account_env(&mut cmd, &account);
 
         let child = pair
@@ -336,22 +336,27 @@ fn fallback_account_env() -> AccountEnv {
     }
 }
 
-fn shell_path() -> String {
-    merge_path_parts([
-        std::env::var("PATH").ok(),
-        macos_path_helper_path(),
-        Some(default_unix_path().to_string()),
-    ])
+fn shell_path(account: &AccountEnv) -> String {
+    merge_path_parts(
+        [
+            std::env::var("PATH").ok(),
+            macos_path_helper_path(),
+            Some(default_unix_path().to_string()),
+        ],
+        account.home.as_deref(),
+    )
 }
 
 fn default_unix_path() -> &'static str {
     "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:~/.cargo/bin:~/.local/bin"
 }
 
-fn merge_path_parts(parts: impl IntoIterator<Item = Option<String>>) -> String {
+fn merge_path_parts(parts: impl IntoIterator<Item = Option<String>>, home: Option<&str>) -> String {
     let mut paths = Vec::<PathBuf>::new();
     for part in parts.into_iter().flatten() {
-        paths.extend(std::env::split_paths(&expand_home_in_path_list(&part)));
+        paths.extend(std::env::split_paths(&expand_home_in_path_list(
+            &part, home,
+        )));
     }
 
     let mut merged = Vec::<PathBuf>::new();
@@ -367,8 +372,8 @@ fn merge_path_parts(parts: impl IntoIterator<Item = Option<String>>) -> String {
         .unwrap_or_else(|| default_unix_path().to_string())
 }
 
-fn expand_home_in_path_list(path: &str) -> String {
-    let Some(home) = account_env().home else {
+fn expand_home_in_path_list(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
         return path.to_string();
     };
 
@@ -482,12 +487,94 @@ mod tests {
 
     #[test]
     fn merge_path_parts_preserves_order_and_removes_duplicates() {
-        let merged = merge_path_parts([
-            Some("/usr/bin:/bin".to_string()),
-            Some("/bin:/opt/homebrew/bin".to_string()),
-        ]);
+        let merged = merge_path_parts(
+            [
+                Some("/usr/bin:/bin".to_string()),
+                Some("/bin:/opt/homebrew/bin".to_string()),
+            ],
+            None,
+        );
 
         assert_eq!(merged, "/usr/bin:/bin:/opt/homebrew/bin");
+    }
+
+    fn account(home: Option<&str>, shell: Option<&str>, user: Option<&str>) -> AccountEnv {
+        AccountEnv {
+            home: home.map(str::to_string),
+            shell: shell.map(str::to_string),
+            user: user.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn default_shell_prefers_account_shell() {
+        let account = account(None, Some("/usr/bin/fish"), None);
+        assert_eq!(default_shell(&account), "/usr/bin/fish");
+    }
+
+    #[test]
+    fn default_shell_falls_back_to_sh_without_account_or_env() {
+        // The account has no shell; the only fallbacks are $SHELL then /bin/sh.
+        // We cannot rely on $SHELL being unset in CI, so just assert the result
+        // is a non-empty absolute path (either the env shell or /bin/sh).
+        let account = account(None, None, None);
+        let shell = default_shell(&account);
+        assert!(
+            shell.starts_with('/'),
+            "expected absolute shell, got {shell:?}"
+        );
+    }
+
+    #[test]
+    fn expand_home_in_path_list_expands_tilde_segments() {
+        let expanded =
+            expand_home_in_path_list("~/.cargo/bin:/usr/bin:~/.local/bin", Some("/home/x"));
+        assert_eq!(expanded, "/home/x/.cargo/bin:/usr/bin:/home/x/.local/bin");
+    }
+
+    #[test]
+    fn expand_home_in_path_list_is_noop_without_home() {
+        let path = "~/.cargo/bin:/usr/bin";
+        assert_eq!(expand_home_in_path_list(path, None), path);
+    }
+
+    #[test]
+    fn merge_path_parts_expands_home_once_and_dedupes() {
+        let merged = merge_path_parts(
+            [
+                Some("~/.local/bin:/usr/bin".to_string()),
+                Some("/usr/bin:~/.local/bin".to_string()),
+            ],
+            Some("/home/x"),
+        );
+        assert_eq!(merged, "/home/x/.local/bin:/usr/bin");
+    }
+
+    #[test]
+    fn apply_account_env_sets_identity_vars() {
+        let account = account(Some("/home/x"), Some("/bin/zsh"), Some("x"));
+        let mut cmd = CommandBuilder::new("/bin/true");
+        apply_account_env(&mut cmd, &account);
+
+        assert_eq!(cmd.get_env("HOME"), Some(std::ffi::OsStr::new("/home/x")));
+        assert_eq!(cmd.get_env("SHELL"), Some(std::ffi::OsStr::new("/bin/zsh")));
+        assert_eq!(cmd.get_env("USER"), Some(std::ffi::OsStr::new("x")));
+        assert_eq!(cmd.get_env("LOGNAME"), Some(std::ffi::OsStr::new("x")));
+    }
+
+    #[test]
+    fn apply_account_env_skips_missing_fields() {
+        let account = account(None, None, None);
+        let mut cmd = CommandBuilder::new("/bin/true");
+        // `CommandBuilder::new` seeds the process env; clear it so the test
+        // observes only what `apply_account_env` adds (i.e. nothing here).
+        cmd.env_clear();
+        apply_account_env(&mut cmd, &account);
+
+        assert_eq!(cmd.get_env("HOME"), None);
+        assert_eq!(cmd.get_env("SHELL"), None);
+        assert_eq!(cmd.get_env("USER"), None);
+        assert_eq!(cmd.get_env("LOGNAME"), None);
     }
 
     #[test]

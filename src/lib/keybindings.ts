@@ -43,6 +43,46 @@ export function findKeybindingAction(
   return null;
 }
 
+/**
+ * A resolved keyboard command. Configurable `action`s come from
+ * `config.keybindings`; the navigation commands below are fixed shortcuts that
+ * are intentionally not user-rebindable (ctrl+Tab cycling, ⌘⇧[ / ⌘⇧] on macOS,
+ * and the numeric "jump to tab N" modifier+digit chords).
+ */
+export type ShortcutCommand =
+  | { kind: "action"; action: KeybindingAction }
+  | { kind: "activateRelative"; delta: number }
+  | { kind: "activateIndex"; index: number };
+
+/**
+ * Map a keydown to the command it should run, or null when nothing matches.
+ * Pure and platform-parameterized so the keyboard layer can be tested without a
+ * DOM. Configurable actions take precedence over the fixed navigation chords.
+ */
+export function resolveShortcut(
+  event: KeyboardEvent,
+  keybindings: Keybinding[],
+  platformIsMac = isMac,
+): ShortcutCommand | null {
+  const action = findKeybindingAction(event, keybindings, platformIsMac);
+  if (action) return { kind: "action", action };
+
+  if (event.ctrlKey && event.code === "Tab") {
+    return { kind: "activateRelative", delta: event.shiftKey ? -1 : 1 };
+  }
+  if (platformIsMac && event.metaKey && event.shiftKey && event.code === "BracketLeft") {
+    return { kind: "activateRelative", delta: -1 };
+  }
+  if (platformIsMac && event.metaKey && event.shiftKey && event.code === "BracketRight") {
+    return { kind: "activateRelative", delta: 1 };
+  }
+  const numMod = platformIsMac ? event.metaKey : event.altKey;
+  if (numMod && /^Digit[1-9]$/.test(event.code)) {
+    return { kind: "activateIndex", index: Number(event.code.slice(5)) - 1 };
+  }
+  return null;
+}
+
 export function matchesKeybinding(
   event: KeyboardEvent,
   keys: string,

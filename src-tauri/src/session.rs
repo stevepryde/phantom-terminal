@@ -38,7 +38,7 @@ impl SessionStore {
         let path = db_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
-            restrict_dir_permissions(parent);
+            set_mode(parent, 0o700);
         }
         let conn = Connection::open(&path)?;
         restrict_db_permissions(&path);
@@ -286,37 +286,27 @@ fn db_path() -> AppResult<PathBuf> {
     Ok(dirs.data_dir().join("phantom.db"))
 }
 
+/// Best-effort `chmod` for the session store's files and dir. Failures are
+/// ignored: the store still works without the tightened mode, and the parent
+/// `0700` dir already gates access. No-op on non-unix targets.
 #[cfg(unix)]
-fn restrict_dir_permissions(path: &std::path::Path) {
+fn set_mode(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
         let mut perms = meta.permissions();
-        perms.set_mode(0o700);
+        perms.set_mode(mode);
         let _ = std::fs::set_permissions(path, perms);
     }
 }
 
 #[cfg(not(unix))]
-fn restrict_dir_permissions(_path: &std::path::Path) {}
-
-#[cfg(unix)]
-fn restrict_file_permissions(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mut perms = meta.permissions();
-        perms.set_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-}
-
-#[cfg(not(unix))]
-fn restrict_file_permissions(_path: &std::path::Path) {}
+fn set_mode(_path: &std::path::Path, _mode: u32) {}
 
 fn restrict_db_permissions(path: &std::path::Path) {
-    restrict_file_permissions(path);
+    set_mode(path, 0o600);
     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        restrict_file_permissions(&path.with_file_name(format!("{name}-wal")));
-        restrict_file_permissions(&path.with_file_name(format!("{name}-shm")));
+        set_mode(&path.with_file_name(format!("{name}-wal")), 0o600);
+        set_mode(&path.with_file_name(format!("{name}-shm")), 0o600);
     }
 }
 

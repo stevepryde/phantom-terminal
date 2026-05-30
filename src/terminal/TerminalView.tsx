@@ -1,7 +1,12 @@
-import { FitAddon, type FontMetrics, Ghostty, Terminal } from "ghostty-web";
+import { FitAddon, Ghostty, Terminal } from "ghostty-web";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { terminalFontFamilyForRendering } from "../lib/fonts";
 import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
+import {
+  assertGhosttyContract,
+  forceTerminalRender,
+  refreshTerminalDisplay,
+} from "./ghosttyAdapter";
 import { enableTerminalLigatures } from "./ligatures";
 
 // ghostty-web's WASM is initialised once for the whole app.
@@ -13,25 +18,6 @@ function ensureGhostty(): Promise<Ghostty> {
 
 function nextFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
-}
-
-interface LineHeightRenderer {
-  devicePixelRatio?: number;
-  metrics?: FontMetrics;
-  getMetrics: () => FontMetrics;
-  render: (
-    buffer: unknown,
-    forceAll?: boolean,
-    viewportY?: number,
-    scrollbackProvider?: unknown,
-    scrollbarOpacity?: number,
-  ) => void;
-  remeasureFont: () => void;
-  resize: (cols: number, rows: number) => void;
-}
-
-interface TerminalInternals {
-  renderer?: LineHeightRenderer;
 }
 
 interface Props {
@@ -87,6 +73,9 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(containerRef.current);
+      // Fail fast (in dev) if a ghostty-web bump changed the internals the
+      // adapter depends on, rather than silently rendering with wrong metrics.
+      assertGhosttyContract(term);
       enableTerminalLigatures(term);
       termRef.current = term;
       fitRef.current = fit;
@@ -276,24 +265,6 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
 }
 export type { Props as TerminalViewProps };
 
-function refreshTerminalDisplay(term: Terminal, lineHeight: number) {
-  const renderer = (term as unknown as TerminalInternals).renderer;
-  if (!renderer) return;
-
-  renderer.devicePixelRatio = window.devicePixelRatio || 1;
-  renderer.remeasureFont();
-  const metrics = renderer.getMetrics();
-  const height = Math.max(metrics.height, Math.ceil(metrics.height * lineHeight));
-  const extra = height - metrics.height;
-  renderer.metrics = {
-    ...metrics,
-    height,
-    baseline: metrics.baseline + Math.floor(extra / 2),
-  };
-  renderer.resize(term.cols, term.rows);
-  forceTerminalRender(term);
-}
-
 function scheduleFontSettledRefresh(
   term: Terminal,
   fontFamily: string,
@@ -315,10 +286,4 @@ function scheduleFontSettledRefresh(
       fit?.fit();
       forceTerminalRender(term);
     });
-}
-
-function forceTerminalRender(term: Terminal) {
-  const renderer = (term as unknown as TerminalInternals).renderer;
-  if (!renderer || !term.wasmTerm) return;
-  renderer.render(term.wasmTerm, true, term.viewportY, term);
 }

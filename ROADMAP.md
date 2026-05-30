@@ -158,6 +158,16 @@ failures are visible in the terminal pane.
 
 ## P2 — Maintainability & Testability
 
+Status 2026-05-30: MAINT-1 through MAINT-5 have been implemented. `App.tsx` is
+now composition + layout that delegates to focused hooks (`useAppConfig`,
+`useKeyboardShortcuts`, `useSessionPersistence`, `useLiveCwdPolling`,
+`useDisplayLayoutRefresh`, `useWindowShape`); all ghostty-web internals access is
+isolated in `terminal/ghosttyAdapter.ts` with a fail-fast contract check; the
+PATH/env builders and `validate_spawn_cwd` have direct Rust tests and the
+keyboard resolver (`resolveShortcut`) has Bun tests; cwd is resolved by a single
+owner (the poller); and the session-store permission helpers are folded into one
+`set_mode` while `account_env()` is computed once per spawn and threaded through.
+
 ### MAINT-1 — `App.tsx` is a 464-line god-component
 - **Where:** `src/App.tsx`.
 - **Problem:** One component owns launch bootstrap, keyboard shortcuts, debounced
