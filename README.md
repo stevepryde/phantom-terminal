@@ -1,59 +1,69 @@
-# phantom-terminal
+# Phantom Terminal
 
-Terminal app with some features I want. Built with Tauri 2 (Rust) + React + Vite,
-managed with [Bun](https://bun.sh).
+Phantom Terminal is a minimal desktop terminal that remembers your tabs.
+It is built with Tauri 2, Rust, React 19, TypeScript, Vite, and Bun.
+It's basically a wrapper around ghostty-web.
 
-## Prerequisites
+![Phantom Terminal preview](docs/assets/phantom-terminal-preview.webp)
 
-- [Bun](https://bun.sh) (`1.3.9`, matching CI)
-- A stable Rust toolchain (`rustup` + `cargo`)
-- Tauri's platform build deps — see the [Tauri prerequisites](https://tauri.app/start/prerequisites/).
-  On macOS that's just the Xcode command-line tools.
+## Features
+
+- It's a terminal app.
+- Horizontal or vertical tab layouts, custom tab names, and keyboard shortcuts.
+- Theme, font, cursor, shell profile, and session settings.
+- Scrollback is memory-only, nothing gets written to disk except settings.
+
+## Why
+
+I wanted a simple terminal that remembers tabs and the CWD of each tab.
+
+## Requirements
+
+- [Bun](https://bun.sh) 1.3.9 or newer.
+- A stable Rust toolchain with `cargo`.
+- Tauri platform dependencies. See the
+  [Tauri prerequisites](https://tauri.app/start/prerequisites/).
+
+Install JavaScript dependencies:
 
 ```sh
 bun install
 ```
 
-## Develop
+## Development
+
+Run the hot-reloading desktop app:
 
 ```sh
-bun run tauri dev      # hot-reloading desktop app
+bun run tauri dev
 ```
 
-## Update your local install
-
-There is **no network auto-updater** — by design. Phantom Terminal enforces a
-no-outbound-network posture (see `scripts/check-no-network.sh`, gated in CI), so
-`tauri-plugin-updater` and any HTTP client are forbidden. Instead you "update"
-by rebuilding from source. Pull (or switch branches) however you normally would,
-then build and install the current checkout with a single command:
+Build the frontend:
 
 ```sh
-git pull          # your normal git workflow — optional
-bun run update    # build the current checkout and install it
+bun run build
 ```
 
-This builds a release bundle from **what is checked out** and installs it over
-the previous copy — into `/Applications` on macOS, or `~/.local/bin` (AppImage)
-on Linux. It does not touch git, so you always know exactly what you're
-installing.
+## Update Local Install
+
+Phantom Terminal does not include a network auto-updater. To update an installed
+copy, pull or switch to the source you want, then build and install that checkout:
 
 ```sh
-bun run update -- --no-install   # build only; leave the bundle in target/
-INSTALL_DIR="$HOME/Applications" bun run update   # install elsewhere (macOS)
+git pull
+bun run update
 ```
 
-The macOS app is ad-hoc signed locally, so the script also strips the
-quarantine flag to avoid the "unidentified developer" prompt.
-
-## Checks (what CI runs)
+Useful variants:
 
 ```sh
-bun run typecheck   # tsc --noEmit
-bun run lint        # Biome
-bun run build       # tsc + vite production build
-bun run audit       # bun audit (high/critical)
-(cd src-tauri && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings)
-(cd src-tauri && cargo build --locked && cargo test --locked)
-bash scripts/check-no-network.sh
+bun run update -- --no-install
+INSTALL_DIR="$HOME/Applications" bun run update
 ```
+
+On macOS, the local install script ad-hoc signs the app and removes the
+quarantine flag for the rebuilt bundle.
+
+## License
+
+Phantom Terminal is released under the MIT License. See [LICENSE](LICENSE).
