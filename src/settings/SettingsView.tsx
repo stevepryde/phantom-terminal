@@ -178,19 +178,19 @@ export function SettingsView({ config, error, onChange }: Props) {
 function AppearanceSection({ config, onChange }: Props) {
   return (
     <Section title="Appearance" hint="Font and UI theme changes apply live across all tabs.">
-      <Field label="Font family">
-        <CustomDropdown
-          value={terminalFontDropdownValue(config.font_family)}
-          options={terminalFontOptions(config.font_family)}
-          onChange={(value) => onChange({ font_family: value })}
-        />
-      </Field>
-
       <Field label="UI theme">
         <CustomDropdown
           value={config.ui_theme}
           options={UI_THEME_OPTIONS}
           onChange={(value) => onChange({ ui_theme: value as AppConfig["ui_theme"] })}
+        />
+      </Field>
+
+      <Field label="Font family">
+        <CustomDropdown
+          value={terminalFontDropdownValue(config.font_family)}
+          options={terminalFontOptions(config.font_family)}
+          onChange={(value) => onChange({ font_family: value })}
         />
       </Field>
 
