@@ -1,6 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState } from "react";
 import { CommandPalette } from "./command-palette/CommandPalette";
+import { validateAppConfig } from "./lib/configValidation";
 import {
   type AppConfig,
   configGet,
@@ -12,6 +13,7 @@ import {
   tabsLoad,
   tabsSave,
 } from "./lib/ipc";
+import { findKeybindingAction } from "./lib/keybindings";
 import { setHomeDir } from "./lib/paths";
 import { useStore } from "./lib/store";
 import { SettingsView } from "./settings/SettingsView";
@@ -41,6 +43,7 @@ export default function App() {
   const activeId = useStore(tabsStore, (s) => s.activeId);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [chromePaintRevision, setChromePaintRevision] = useState(0);
   const [windowMaximized, setWindowMaximized] = useState(false);
@@ -50,6 +53,8 @@ export default function App() {
   // Mirror config into a ref so the (deps-free) keyboard/command handlers can
   // read the current default profile without re-binding listeners.
   const configRef = useRef<AppConfig | null>(null);
+  const persistedConfigRef = useRef<AppConfig | null>(null);
+  const configSaveSeqRef = useRef(0);
   configRef.current = config;
 
   // The live cwd of a tab: query the PTY (authoritative) and fall back to the
@@ -102,14 +107,39 @@ export default function App() {
   // Context-menu new tab: inherit the clicked tab's cwd, insert to its right.
   const newTabAfter = (id: string) => openTab(id, id);
 
-  // Apply a config patch live and persist it (best-effort).
+  function closeCommandPalette() {
+    setPaletteOpen(false);
+    requestAnimationFrame(() => {
+      window.dispatchEvent(new Event("phantom:focus-active-terminal"));
+    });
+  }
+
+  // Apply a config patch live only after frontend validation, then persist it.
+  // The backend still owns validation; this prevents silent UI/disk divergence
+  // and rolls back if Rust rejects something the frontend missed.
   function updateConfig(patch: Partial<AppConfig>) {
     setConfig((prev) => {
       if (!prev) return prev;
       const next = { ...prev, ...patch };
-      void configSet(next).catch((err) => {
-        console.error("phantom: failed to persist config", err);
-      });
+      const validationError = validateAppConfig(next);
+      if (validationError) {
+        setConfigError(validationError);
+        return prev;
+      }
+
+      setConfigError(null);
+      const saveSeq = ++configSaveSeqRef.current;
+      void configSet(next)
+        .then(() => {
+          persistedConfigRef.current = next;
+        })
+        .catch((err) => {
+          console.error("phantom: failed to persist config", err);
+          if (saveSeq === configSaveSeqRef.current) {
+            setConfig(persistedConfigRef.current);
+            setConfigError(String(err));
+          }
+        });
       return next;
     });
   }
@@ -120,6 +150,7 @@ export default function App() {
     (async () => {
       const cfg = await configGet();
       setConfig(cfg);
+      persistedConfigRef.current = cfg;
       const home = await homeDir().catch(() => null);
       homePathRef.current = home;
       setHomeDir(home);
@@ -192,57 +223,58 @@ export default function App() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: listeners bound once; handlers read live state from refs/store and the stable newTab closure.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      const primary = isMac ? e.metaKey : e.ctrlKey && e.shiftKey;
-      const k = e.key.toLowerCase();
+      const config = configRef.current;
+      const action = config ? findKeybindingAction(e, config.keybindings) : null;
 
-      if ((isMac ? e.metaKey : e.ctrlKey) && k === ",") {
-        e.preventDefault();
+      if (action === "settings.toggle") {
+        consumeShortcut(e);
         toggleSettingsTab();
         return;
       }
-      if ((isMac ? e.metaKey : e.ctrlKey) && k === "k") {
-        e.preventDefault();
+      if (action === "palette.toggle") {
+        consumeShortcut(e);
         setPaletteOpen((v) => !v);
         return;
       }
-      if (primary && k === "t") {
-        e.preventDefault();
+      if (action === "tab.new") {
+        consumeShortcut(e);
         newTab();
         return;
       }
-      if (primary && k === "w") {
-        e.preventDefault();
+      if (action === "tab.close") {
+        consumeShortcut(e);
         const id = tabsStore.state.activeId;
         if (id) closeTab(id);
         return;
       }
+      if (action === "tab.rename") {
+        const id = tabsStore.state.activeId;
+        if (id) {
+          consumeShortcut(e);
+          setEditingId(id);
+        }
+        return;
+      }
       if (e.ctrlKey && e.code === "Tab") {
-        e.preventDefault();
+        consumeShortcut(e);
         activateRelative(e.shiftKey ? -1 : 1);
         return;
       }
       if (isMac && e.metaKey && e.shiftKey && e.code === "BracketLeft") {
-        e.preventDefault();
+        consumeShortcut(e);
         activateRelative(-1);
         return;
       }
       if (isMac && e.metaKey && e.shiftKey && e.code === "BracketRight") {
-        e.preventDefault();
+        consumeShortcut(e);
         activateRelative(1);
         return;
       }
       const numMod = isMac ? e.metaKey : e.altKey;
       if (numMod && /^Digit[1-9]$/.test(e.code)) {
-        e.preventDefault();
+        consumeShortcut(e);
         activateIndex(Number(e.code.slice(5)) - 1);
         return;
-      }
-      if (e.key === "F2") {
-        const id = tabsStore.state.activeId;
-        if (id) {
-          e.preventDefault();
-          setEditingId(id);
-        }
       }
     }
     window.addEventListener("keydown", onKey, true);
@@ -403,7 +435,7 @@ export default function App() {
           }}
         >
           {tab.kind === "settings" ? (
-            <SettingsView config={config} onChange={updateConfig} />
+            <SettingsView config={config} error={configError} onChange={updateConfig} />
           ) : (
             <TerminalView
               tabId={tab.id}
@@ -443,7 +475,7 @@ export default function App() {
         <CommandPalette
           tabs={tabs}
           activeId={activeId}
-          onClose={() => setPaletteOpen(false)}
+          onClose={closeCommandPalette}
           onSelectTab={activateTab}
           onNewTab={newTab}
           onCloseTab={closeTab}
@@ -461,4 +493,10 @@ function defaultLaunchCwd(config: AppConfig | null, home: string | null): string
     config.shell_profiles.find((p) => p.id === config.default_shell_profile_id) ??
     config.shell_profiles[0];
   return profile?.cwd?.trim() || home;
+}
+
+function consumeShortcut(event: KeyboardEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
 }

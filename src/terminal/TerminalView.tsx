@@ -1,5 +1,5 @@
 import { FitAddon, type FontMetrics, Ghostty, Terminal } from "ghostty-web";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { terminalFontFamilyForRendering } from "../lib/fonts";
 import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
 import { enableTerminalLigatures } from "./ligatures";
@@ -48,6 +48,8 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const ptyIdRef = useRef<number | null>(null);
+  const deadRef = useRef(false);
+  const [terminalNotice, setTerminalNotice] = useState<string | null>(null);
   const terminalFontFamily = terminalFontFamilyForRendering(config.font_family);
   // Mirror `active` so the async mount can focus the terminal once it's ready
   // if this tab is still the active one (the focus effect below runs before the
@@ -60,10 +62,18 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   useEffect(() => {
     let disposed = false;
     const disposers: Array<() => void> = [];
+    const markDead = (message: string) => {
+      if (disposed || deadRef.current) return;
+      deadRef.current = true;
+      setTerminalNotice(message);
+    };
 
     (async () => {
-      const ghostty = await ensureGhostty();
-      if (disposed || !containerRef.current) return;
+      const ghostty = await ensureGhostty().catch((err) => {
+        markDead(`Terminal failed to start: ${String(err)}`);
+        return null;
+      });
+      if (!ghostty || disposed || !containerRef.current) return;
 
       const term = new Terminal({
         ghostty,
@@ -102,14 +112,25 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
           rows: Math.max(24, term.rows),
           cols: Math.max(80, term.cols),
         },
-        (bytes) => term.write(bytes),
-      );
+        (bytes) => {
+          if (bytes.length === 0) {
+            markDead("Process exited");
+            return;
+          }
+          term.write(bytes);
+        },
+      ).catch((err) => {
+        markDead(`Process failed to start: ${String(err)}`);
+        return null;
+      });
+      if (ptyId == null) return;
       if (disposed) {
-        ptyKill(ptyId);
+        void ptyKill(ptyId);
         term.dispose();
         return;
       }
       ptyIdRef.current = ptyId;
+      if (!deadRef.current) setTerminalNotice(null);
       onSpawn(tabId, ptyId);
 
       // If this tab is the active one, grab keyboard focus now that the terminal
@@ -120,10 +141,16 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
 
       const enc = new TextEncoder();
       const dData = term.onData((s) => {
-        ptyWrite(ptyId, enc.encode(s));
+        if (deadRef.current) return;
+        void ptyWrite(ptyId, enc.encode(s)).catch((err) => {
+          markDead(`Process is no longer accepting input: ${String(err)}`);
+        });
       });
       const dResize = term.onResize(({ cols, rows }) => {
-        ptyResize(ptyId, rows, cols);
+        if (deadRef.current) return;
+        void ptyResize(ptyId, rows, cols).catch((err) => {
+          markDead(`Process is no longer accepting resize events: ${String(err)}`);
+        });
       });
 
       disposers.push(
@@ -135,7 +162,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
     return () => {
       disposed = true;
       for (const d of disposers) d();
-      if (ptyIdRef.current != null) ptyKill(ptyIdRef.current);
+      if (ptyIdRef.current != null) void ptyKill(ptyIdRef.current);
       termRef.current?.dispose();
       termRef.current = null;
     };
@@ -163,6 +190,14 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
     });
     return () => cancelAnimationFrame(id);
   }, [active, config.line_height]);
+
+  useEffect(() => {
+    const onFocusActiveTerminal = () => {
+      if (activeRef.current) termRef.current?.focus();
+    };
+    window.addEventListener("phantom:focus-active-terminal", onFocusActiveTerminal);
+    return () => window.removeEventListener("phantom:focus-active-terminal", onFocusActiveTerminal);
+  }, []);
 
   // Display scale changes do not always trigger a useful ResizeObserver event
   // inside WKWebView. Re-apply metrics and fit when the app-level chrome nudge
@@ -218,18 +253,27 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   ]);
 
   return (
-    <div
-      ref={containerRef}
-      role="application"
-      aria-label="Terminal"
-      className="h-full w-full"
-      style={{ display: active ? "block" : "none" }}
-      onMouseDown={() => termRef.current?.focus()}
-    />
+    <div className="relative h-full w-full" style={{ display: active ? "block" : "none" }}>
+      <div
+        ref={containerRef}
+        role="application"
+        aria-label="Terminal"
+        className="h-full w-full"
+        onMouseDown={() => termRef.current?.focus()}
+      />
+      {terminalNotice && (
+        <div className="pointer-events-none absolute inset-x-3 bottom-3 flex justify-center">
+          <div
+            role="status"
+            className="rounded border border-white/10 bg-[#111116]/95 px-3 py-2 text-center text-white/70 text-xs shadow-lg"
+          >
+            {terminalNotice}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
-
-// Keep onExit referenced for future PTY-exit handling.
 export type { Props as TerminalViewProps };
 
 function refreshTerminalDisplay(term: Terminal, lineHeight: number) {

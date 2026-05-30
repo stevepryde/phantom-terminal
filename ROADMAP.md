@@ -32,6 +32,9 @@ Maintainability **3.5**, Testability **3**, Performance **3**.
 
 The posture is already strong. These are hardening items, not open holes.
 
+Status 2026-05-30: SEC-1, SEC-2, and SEC-3 have been implemented. SEC-4 remains
+an explicit dependency watch item for the next stable `ghostty-web` release.
+
 ### SEC-1 — No cap on concurrent PTY sessions (local DoS)
 - **Where:** `src-tauri/src/pty.rs` `PtyManager::spawn` (≈L61); `commands.rs::pty_spawn`.
 - **Problem:** `pty_spawn` has no upper bound. A compromised or buggy webview can
@@ -84,6 +87,11 @@ The posture is already strong. These are hardening items, not open holes.
 ---
 
 ## P1 — Correctness
+
+Status 2026-05-30: COR-1 through COR-4 have been implemented. Keybindings are
+now editable and active, config changes are frontend-validated with rollback on
+backend rejection, the font-size UI range matches Rust bounds, and PTY exit/write
+failures are visible in the terminal pane.
 
 ### COR-1 — Keybindings config is vestigial (half-wired feature)
 - **Where:** `config.rs` (`default_keybindings`, validated + persisted), mirrored

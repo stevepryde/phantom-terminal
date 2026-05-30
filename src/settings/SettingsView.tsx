@@ -1,6 +1,7 @@
 import {
   ArrowLeft,
   History,
+  Keyboard,
   Palette,
   Pencil,
   Plus,
@@ -13,10 +14,12 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CustomDropdown } from "../components/CustomDropdown";
 import { terminalFontDropdownValue, terminalFontOptions } from "../lib/fonts";
-import type { AppConfig, ShellProfile, Theme } from "../lib/ipc";
+import type { AppConfig, Keybinding, ShellProfile, Theme } from "../lib/ipc";
+import { DEFAULT_KEYBINDINGS, KEYBINDING_ACTION_LABELS } from "../lib/keybindings";
 
 interface Props {
   config: AppConfig;
+  error?: string | null;
   onChange: (patch: Partial<AppConfig>) => void;
 }
 
@@ -47,6 +50,7 @@ const SECTIONS = [
   { id: "appearance", label: "Appearance", icon: SlidersHorizontal },
   { id: "theme", label: "Theme", icon: Palette },
   { id: "profiles", label: "Shell Profiles", icon: Terminal },
+  { id: "keybindings", label: "Keybindings", icon: Keyboard },
   { id: "session", label: "Session", icon: History },
 ] as const;
 type SectionId = (typeof SECTIONS)[number]["id"];
@@ -59,7 +63,7 @@ const SIDEBAR_DEFAULT = 220;
 let profileSeq = 0;
 const newProfileId = () => `profile-${Date.now().toString(36)}-${(profileSeq++).toString(36)}`;
 
-export function SettingsView({ config, onChange }: Props) {
+export function SettingsView({ config, error, onChange }: Props) {
   const [section, setSection] = useState<SectionId>("appearance");
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const saved = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
@@ -154,9 +158,15 @@ export function SettingsView({ config, onChange }: Props) {
       {/* Right: the active section's content. */}
       <div className="min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl px-8 py-6">
+          {error && (
+            <div className="mb-4 rounded border border-red-400/25 bg-red-950/30 px-3 py-2 text-red-50/85 text-xs">
+              {error}
+            </div>
+          )}
           {section === "appearance" && <AppearanceSection config={config} onChange={onChange} />}
           {section === "theme" && <ThemeSection config={config} onChange={onChange} />}
           {section === "profiles" && <ProfilesSection config={config} onChange={onChange} />}
+          {section === "keybindings" && <KeybindingsSection config={config} onChange={onChange} />}
           {section === "session" && <SessionSection config={config} onChange={onChange} />}
         </div>
       </div>
@@ -179,7 +189,7 @@ function AppearanceSection({ config, onChange }: Props) {
         <input
           type="range"
           min={8}
-          max={32}
+          max={48}
           value={config.font_size}
           className="w-full accent-white/80"
           onChange={(e) => onChange({ font_size: Number(e.target.value) })}
@@ -233,6 +243,53 @@ function AppearanceSection({ config, onChange }: Props) {
           </label>
         </Field>
       </div>
+    </Section>
+  );
+}
+
+function KeybindingsSection({ config, onChange }: Props) {
+  const updateKeybinding = (id: string, patch: Partial<Keybinding>) => {
+    onChange({
+      keybindings: config.keybindings.map((keybinding) =>
+        keybinding.id === id ? { ...keybinding, ...patch } : keybinding,
+      ),
+    });
+  };
+
+  return (
+    <Section title="Keybindings" hint="Changes apply immediately.">
+      <div className="space-y-2">
+        {config.keybindings.map((keybinding) => {
+          const label =
+            KEYBINDING_ACTION_LABELS[keybinding.action as keyof typeof KEYBINDING_ACTION_LABELS] ??
+            keybinding.action;
+          return (
+            <div
+              key={keybinding.id}
+              className="grid min-h-10 grid-cols-[minmax(0,1fr)_minmax(11rem,14rem)] items-center gap-3 rounded border border-white/10 bg-black/20 px-3 py-2"
+            >
+              <div className="min-w-0">
+                <div className="truncate font-medium text-white/85 text-sm">{label}</div>
+                <div className="truncate text-white/35 text-xs">{keybinding.action}</div>
+              </div>
+              <input
+                type="text"
+                value={keybinding.keys}
+                spellCheck={false}
+                className="w-full rounded border border-white/10 bg-black/30 px-2 py-1 font-mono text-xs outline-none focus:border-white/30"
+                onChange={(e) => updateKeybinding(keybinding.id, { keys: e.target.value })}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <button
+        type="button"
+        className="flex min-h-8 items-center gap-2 rounded border border-white/15 px-3 py-1.5 text-white/60 hover:border-white/30 hover:text-white"
+        onClick={() => onChange({ keybindings: DEFAULT_KEYBINDINGS })}
+      >
+        Reset keybindings
+      </button>
     </Section>
   );
 }

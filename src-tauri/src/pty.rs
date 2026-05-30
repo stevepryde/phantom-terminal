@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -11,6 +11,8 @@ use serde::Deserialize;
 use tauri::ipc::Channel;
 
 use crate::error::{AppError, AppResult};
+
+const MAX_LIVE_PTY_SESSIONS: usize = 256;
 
 #[derive(Debug, Deserialize)]
 pub struct SpawnOpts {
@@ -47,10 +49,22 @@ struct AccountEnv {
     user: Option<String>,
 }
 
-#[derive(Default)]
 pub struct PtyManager {
     sessions: Arc<Mutex<HashMap<u32, PtySession>>>,
     next_id: AtomicU32,
+    live_sessions: Arc<AtomicUsize>,
+    max_sessions: usize,
+}
+
+impl Default for PtyManager {
+    fn default() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU32::new(0),
+            live_sessions: Arc::new(AtomicUsize::new(0)),
+            max_sessions: MAX_LIVE_PTY_SESSIONS,
+        }
+    }
 }
 
 impl PtyManager {
@@ -58,8 +72,17 @@ impl PtyManager {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn with_max_sessions(max_sessions: usize) -> Self {
+        Self {
+            max_sessions,
+            ..Self::default()
+        }
+    }
+
     /// Spawn a shell in a new PTY. Output bytes are streamed back over `on_data`.
     pub fn spawn(&self, opts: LaunchOpts, on_data: Channel<Vec<u8>>) -> AppResult<u32> {
+        let reservation = self.reserve_session()?;
         let size = PtySize {
             rows: opts.rows.max(1),
             cols: opts.cols.max(1),
@@ -126,24 +149,39 @@ impl PtyManager {
 
         // Reader pump: forward PTY output to the frontend until EOF/close.
         let sessions = Arc::clone(&self.sessions);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if on_data.send(buf[..n].to_vec()).is_err() {
-                            break;
+        let live_sessions = Arc::clone(&self.live_sessions);
+        std::thread::Builder::new()
+            .name(format!("pty-reader-{id}"))
+            .spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if on_data.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            // Shell exited or pipe closed: drop the session.
-            sessions
-                .lock()
-                .expect("pty sessions mutex poisoned")
-                .remove(&id);
-        });
+                let _ = on_data.send(Vec::new());
+                // Shell exited or pipe closed: drop the session.
+                let removed = sessions
+                    .lock()
+                    .expect("pty sessions mutex poisoned")
+                    .remove(&id)
+                    .is_some();
+                if removed {
+                    live_sessions.fetch_sub(1, Ordering::AcqRel);
+                }
+            })
+            .map_err(|e| {
+                if let Some(mut s) = self.lock().remove(&id) {
+                    let _ = s.child.kill();
+                }
+                AppError::Pty(format!("reader thread failed: {e}"))
+            })?;
+        reservation.disarm();
 
         Ok(id)
     }
@@ -176,6 +214,7 @@ impl PtyManager {
     pub fn kill(&self, id: u32) -> AppResult<()> {
         if let Some(mut s) = self.lock().remove(&id) {
             let _ = s.child.kill();
+            self.live_sessions.fetch_sub(1, Ordering::AcqRel);
         }
         Ok(())
     }
@@ -188,6 +227,44 @@ impl PtyManager {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, PtySession>> {
         self.sessions.lock().expect("pty sessions mutex poisoned")
+    }
+
+    fn reserve_session(&self) -> AppResult<SessionReservation> {
+        loop {
+            let current = self.live_sessions.load(Ordering::Acquire);
+            if current >= self.max_sessions {
+                return Err(AppError::Pty("too many terminals".to_string()));
+            }
+            if self
+                .live_sessions
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(SessionReservation {
+                    live_sessions: Arc::clone(&self.live_sessions),
+                    active: true,
+                });
+            }
+        }
+    }
+}
+
+struct SessionReservation {
+    live_sessions: Arc<AtomicUsize>,
+    active: bool,
+}
+
+impl SessionReservation {
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for SessionReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.live_sessions.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -411,5 +488,32 @@ mod tests {
         ]);
 
         assert_eq!(merged, "/usr/bin:/bin:/opt/homebrew/bin");
+    }
+
+    #[test]
+    fn pty_session_limit_refuses_new_reservations_at_cap() {
+        let manager = PtyManager::with_max_sessions(1);
+        let reservation = manager.reserve_session().unwrap();
+
+        let error = match manager.reserve_session() {
+            Ok(_) => panic!("expected session cap error"),
+            Err(error) => error.to_string(),
+        };
+
+        assert_eq!(error, "pty error: too many terminals");
+        drop(reservation);
+        assert!(manager.reserve_session().is_ok());
+    }
+
+    #[test]
+    fn pty_session_limit_can_be_zero_for_tests() {
+        let manager = PtyManager::with_max_sessions(0);
+
+        let error = match manager.reserve_session() {
+            Ok(_) => panic!("expected session cap error"),
+            Err(error) => error.to_string(),
+        };
+
+        assert_eq!(error, "pty error: too many terminals");
     }
 }

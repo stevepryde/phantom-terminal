@@ -2,7 +2,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::config::AppConfig;
-use crate::error::command_error;
+use crate::error::{command_error, AppError};
 use crate::pty::{LaunchOpts, SpawnOpts};
 use crate::session::TabRecord;
 use crate::AppState;
@@ -16,9 +16,13 @@ pub fn pty_spawn(
     on_data: Channel<Vec<u8>>,
 ) -> Result<u32, String> {
     let config = state.store.load_config().map_err(command_error)?;
+    // Trust model: the webview may choose a stored profile id, but it never
+    // sends ad hoc commands to execute. Profile command/args changes flow
+    // through config_set and Rust validation before this spawn boundary.
     let profile = config
         .profile(opts.shell_profile_id.as_deref())
-        .ok_or_else(|| "no shell profile available".to_string())?;
+        .ok_or_else(|| AppError::InvalidConfig("no shell profile available".to_string()))
+        .map_err(command_error)?;
     let cwd = opts
         .cwd
         .filter(|cwd| !cwd.trim().is_empty())
@@ -110,4 +114,36 @@ fn validate_spawn_cwd(cwd: Option<&str>) -> crate::error::AppResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_spawn_cwd_accepts_none_and_normal_paths() {
+        validate_spawn_cwd(None).unwrap();
+        validate_spawn_cwd(Some("/Users/steve/projects/phantom-terminal")).unwrap();
+    }
+
+    #[test]
+    fn validate_spawn_cwd_rejects_too_long_paths() {
+        let cwd = "a".repeat(MAX_SPAWN_CWD_LEN + 1);
+
+        let error = validate_spawn_cwd(Some(&cwd)).unwrap_err().to_string();
+
+        assert_eq!(error, "invalid config: working directory path is too long");
+    }
+
+    #[test]
+    fn validate_spawn_cwd_rejects_nul_bytes() {
+        let error = validate_spawn_cwd(Some("/tmp\0/phantom"))
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "invalid config: working directory cannot contain NUL bytes"
+        );
+    }
 }

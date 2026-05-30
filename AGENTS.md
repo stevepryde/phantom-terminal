@@ -41,6 +41,12 @@ This is the project's defining characteristic. Preserve every item here.
   executable to `exec` directly — `pty_spawn` resolves the command/args from a
   **stored, validated `ShellProfile`** by id (see `config.rs`). Keep it that
   way: do not add a command/args passthrough to `pty_spawn`.
+- **Shell profiles are the reviewed execution path.** A compromised webview that
+  can call `config_set` can change a profile and then ask `pty_spawn` to launch
+  it. That is inherent to a terminal app, so the security boundary is the
+  combination of strict CSP/no-network/minimal capabilities plus exhaustive Rust
+  validation before profiles are stored or used. Treat any change to profile
+  validation or spawn resolution as security-sensitive.
 - **All config is validated in Rust before use or storage.**
   `AppConfig::validate()` in `src-tauri/src/config.rs` bounds every field
   (lengths, ranges, enums, hex colors, NUL bytes, profile/keybinding counts).
