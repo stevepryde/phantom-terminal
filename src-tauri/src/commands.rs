@@ -1,4 +1,5 @@
-use tauri::ipc::Channel;
+use tauri::http::HeaderMap;
+use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request};
 use tauri::State;
 
 use crate::config::AppConfig;
@@ -8,12 +9,13 @@ use crate::session::TabRecord;
 use crate::AppState;
 
 const MAX_SPAWN_CWD_LEN: usize = 4096;
+const PTY_ID_HEADER: &str = "Phantom-Pty-Id";
 
 #[tauri::command]
 pub fn pty_spawn(
     state: State<AppState>,
     opts: SpawnOpts,
-    on_data: Channel<Vec<u8>>,
+    on_data: Channel<InvokeResponseBody>,
 ) -> Result<u32, String> {
     let config = state.store.load_config().map_err(command_error)?;
     // Trust model: the webview may choose a stored profile id, but it never
@@ -50,8 +52,17 @@ pub fn pty_spawn(
 }
 
 #[tauri::command]
-pub fn pty_write(state: State<AppState>, id: u32, data: Vec<u8>) -> Result<(), String> {
-    state.pty.write(id, &data).map_err(command_error)
+pub fn pty_write_raw(state: State<AppState>, request: Request<'_>) -> Result<(), String> {
+    let id = pty_id_from_headers(request.headers()).map_err(command_error)?;
+    let data = match request.body() {
+        InvokeBody::Raw(bytes) => bytes.as_slice(),
+        InvokeBody::Json(_) => {
+            return Err(command_error(AppError::InvalidConfig(
+                "pty_write_raw requires a raw byte payload".to_string(),
+            )));
+        }
+    };
+    state.pty.write(id, data).map_err(command_error)
 }
 
 #[tauri::command]
@@ -116,6 +127,17 @@ fn validate_spawn_cwd(cwd: Option<&str>) -> crate::error::AppResult<()> {
     Ok(())
 }
 
+fn pty_id_from_headers(headers: &HeaderMap) -> crate::error::AppResult<u32> {
+    let value = headers
+        .get(PTY_ID_HEADER)
+        .ok_or_else(|| AppError::InvalidConfig("missing pty id header".to_string()))?
+        .to_str()
+        .map_err(|_| AppError::InvalidConfig("invalid pty id header".to_string()))?;
+    value
+        .parse::<u32>()
+        .map_err(|_| AppError::InvalidConfig("invalid pty id header".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +167,23 @@ mod tests {
             error,
             "invalid config: working directory cannot contain NUL bytes"
         );
+    }
+
+    #[test]
+    fn pty_id_from_headers_accepts_valid_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(PTY_ID_HEADER, "42".parse().unwrap());
+
+        assert_eq!(pty_id_from_headers(&headers).unwrap(), 42);
+    }
+
+    #[test]
+    fn pty_id_from_headers_rejects_missing_or_invalid_header() {
+        let headers = HeaderMap::new();
+        assert!(pty_id_from_headers(&headers).is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(PTY_ID_HEADER, "nope".parse().unwrap());
+        assert!(pty_id_from_headers(&headers).is_err());
     }
 }

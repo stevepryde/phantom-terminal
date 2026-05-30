@@ -235,6 +235,11 @@ owner (the poller); and the session-store permission helpers are folded into one
 
 ## P3 — Performance
 
+Status 2026-05-30: PERF-1 through PERF-3 have been implemented. PTY output now
+uses Tauri raw channel payloads, PTY input uses a raw byte invoke body with the
+PTY id in an IPC header, shell/account PATH setup is cached for the process
+lifetime, and cwd polling has one owner with a non-overlapping 2.5s cadence.
+
 ### PERF-1 — PTY bytes cross IPC as JSON number arrays (highest-impact)
 - **Where:** `src/lib/ipc.ts`: `spawnPty` channel `Uint8Array.from(msg)` where
   `msg: number[]` (L127–129) and `ptyWrite` sends `Array.from(data)` (L133);

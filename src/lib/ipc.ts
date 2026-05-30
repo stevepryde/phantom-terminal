@@ -124,13 +124,13 @@ export async function spawnPty(
   opts: SpawnOpts,
   onBytes: (data: Uint8Array) => void,
 ): Promise<number> {
-  const channel = new Channel<number[]>();
-  channel.onmessage = (msg) => onBytes(Uint8Array.from(msg));
+  const channel = new Channel<ArrayBuffer>();
+  channel.onmessage = (msg) => onBytes(new Uint8Array(msg));
   return invoke<number>("pty_spawn", { opts, onData: channel });
 }
 
 export const ptyWrite = (id: number, data: Uint8Array): Promise<void> =>
-  invoke("pty_write", { id, data: Array.from(data) });
+  invoke("pty_write_raw", data, { headers: { "Phantom-Pty-Id": String(id) } });
 
 export const ptyResize = (id: number, rows: number, cols: number): Promise<void> =>
   invoke("pty_resize", { id, rows, cols });

@@ -4,11 +4,11 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Deserialize;
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, InvokeResponseBody};
 
 use crate::error::{AppError, AppResult};
 
@@ -49,6 +49,11 @@ struct AccountEnv {
     user: Option<String>,
 }
 
+struct ProcessEnv {
+    account: AccountEnv,
+    path: String,
+}
+
 pub struct PtyManager {
     sessions: Arc<Mutex<HashMap<u32, PtySession>>>,
     next_id: AtomicU32,
@@ -81,7 +86,7 @@ impl PtyManager {
     }
 
     /// Spawn a shell in a new PTY. Output bytes are streamed back over `on_data`.
-    pub fn spawn(&self, opts: LaunchOpts, on_data: Channel<Vec<u8>>) -> AppResult<u32> {
+    pub fn spawn(&self, opts: LaunchOpts, on_data: Channel<InvokeResponseBody>) -> AppResult<u32> {
         let reservation = self.reserve_session()?;
         let size = PtySize {
             rows: opts.rows.max(1),
@@ -94,7 +99,8 @@ impl PtyManager {
             .openpty(size)
             .map_err(|e| AppError::Pty(format!("openpty failed: {e}")))?;
 
-        let account = account_env();
+        let env = process_env();
+        let account = &env.account;
         let use_default_shell =
             opts.command.as_ref().is_none_or(|c| c.is_empty()) && opts.args.is_empty();
         let mut cmd = if use_default_shell {
@@ -103,7 +109,7 @@ impl PtyManager {
             let command = opts
                 .command
                 .filter(|c| !c.is_empty())
-                .unwrap_or_else(|| default_shell(&account));
+                .unwrap_or_else(|| default_shell(account));
             let mut cmd = CommandBuilder::new(command);
             for arg in &opts.args {
                 cmd.arg(arg);
@@ -117,8 +123,8 @@ impl PtyManager {
         // GUI apps launch with a sparse environment compared with login shells.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("PATH", shell_path(&account));
-        apply_account_env(&mut cmd, &account);
+        cmd.env("PATH", &env.path);
+        apply_account_env(&mut cmd, account);
 
         let child = pair
             .slave
@@ -158,13 +164,16 @@ impl PtyManager {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if on_data.send(buf[..n].to_vec()).is_err() {
+                            if on_data
+                                .send(InvokeResponseBody::Raw(buf[..n].to_vec()))
+                                .is_err()
+                            {
                                 break;
                             }
                         }
                     }
                 }
-                let _ = on_data.send(Vec::new());
+                let _ = on_data.send(InvokeResponseBody::Raw(Vec::new()));
                 // Shell exited or pipe closed: drop the session.
                 let removed = sessions
                     .lock()
@@ -287,6 +296,15 @@ fn apply_account_env(cmd: &mut CommandBuilder, account: &AccountEnv) {
         cmd.env("USER", user);
         cmd.env("LOGNAME", user);
     }
+}
+
+fn process_env() -> &'static ProcessEnv {
+    static PROCESS_ENV: OnceLock<ProcessEnv> = OnceLock::new();
+    PROCESS_ENV.get_or_init(|| {
+        let account = account_env();
+        let path = shell_path(&account);
+        ProcessEnv { account, path }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -575,6 +593,15 @@ mod tests {
         assert_eq!(cmd.get_env("SHELL"), None);
         assert_eq!(cmd.get_env("USER"), None);
         assert_eq!(cmd.get_env("LOGNAME"), None);
+    }
+
+    #[test]
+    fn process_env_is_cached_for_process_lifetime() {
+        let first = process_env() as *const ProcessEnv;
+        let second = process_env() as *const ProcessEnv;
+
+        assert_eq!(first, second);
+        assert!(!process_env().path.is_empty());
     }
 
     #[test]

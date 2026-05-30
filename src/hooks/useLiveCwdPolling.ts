@@ -9,13 +9,24 @@ import { setTabCwd, tabsStore } from "../store/tabs";
  * `tab.cwd` rather than resolving cwd again, so this is the only place that
  * queries `ptyCwd` for tracking (ROADMAP MAINT-4).
  */
-export function useLiveCwdPolling(intervalMs = 1500) {
+export function useLiveCwdPolling(intervalMs = 2500) {
   useEffect(() => {
+    let polling = false;
     const id = setInterval(async () => {
-      for (const tab of tabsStore.state.tabs) {
-        if (tab.ptyId == null) continue;
-        const live = await ptyCwd(tab.ptyId);
-        if (live) setTabCwd(tab.id, live);
+      if (polling) return;
+      polling = true;
+      try {
+        for (const tab of tabsStore.state.tabs) {
+          if (tab.ptyId == null) continue;
+          try {
+            const live = await ptyCwd(tab.ptyId);
+            if (live) setTabCwd(tab.id, live);
+          } catch {
+            // Exit/write handling owns dead-terminal UI; cwd polling is best-effort.
+          }
+        }
+      } finally {
+        polling = false;
       }
     }, intervalMs);
     return () => clearInterval(id);
