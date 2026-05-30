@@ -18,6 +18,10 @@ body {
   overflow: hidden;
 }
 
+:where(button:not(:disabled), a[href], [role="button"]:not([aria-disabled="true"])) {
+  cursor: pointer;
+}
+
 .app-window {
   --app-bg: #0b0b0e;
   --app-chrome-bg: #111116;
