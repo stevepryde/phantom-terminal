@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -326,6 +327,7 @@ fn macos_path_helper_path() -> Option<String> {
     None
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn unquote_shell_value(value: &str) -> &str {
     let value = value.trim();
     if value.len() >= 2 {
