@@ -11,6 +11,13 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss(), copyGhosttyWasm()],
 
+  build: {
+    target: "es2025",
+    // Local Tauri bundles load from disk, so the web-app-oriented 500 kB warning
+    // is noisy for the terminal runtime without being especially actionable.
+    chunkSizeWarningLimit: 1200,
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

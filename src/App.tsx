@@ -15,6 +15,7 @@ import {
 import { setHomeDir } from "./lib/paths";
 import { useStore } from "./lib/store";
 import { SettingsView } from "./settings/SettingsView";
+import { TabSessionSaver } from "./store/tabPersistence";
 import {
   activateIndex,
   activateRelative,
@@ -23,6 +24,7 @@ import {
   closeTab,
   openSettingsTab,
   renameTab,
+  replaceTabs,
   setTabCwd,
   setTabPty,
   type Tab,
@@ -41,7 +43,10 @@ export default function App() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [chromePaintRevision, setChromePaintRevision] = useState(0);
+  const [windowMaximized, setWindowMaximized] = useState(false);
   const readyRef = useRef(false);
+  const homePathRef = useRef<string | null>(null);
+  const sessionSaverRef = useRef<TabSessionSaver | null>(null);
   // Mirror config into a ref so the (deps-free) keyboard/command handlers can
   // read the current default profile without re-binding listeners.
   const configRef = useRef<AppConfig | null>(null);
@@ -49,7 +54,7 @@ export default function App() {
 
   // The live cwd of a tab: query the PTY (authoritative) and fall back to the
   // last-known stored cwd.
-  async function liveCwd(tab: Tab): Promise<string> {
+  async function liveCwd(tab: Tab): Promise<string | null> {
     if (tab.ptyId != null) {
       const live = await ptyCwd(tab.ptyId);
       if (live) return live;
@@ -57,11 +62,34 @@ export default function App() {
     return tab.cwd;
   }
 
+  sessionSaverRef.current ??= new TabSessionSaver({
+    getSnapshot: () => tabsStore.state,
+    resolveCwd: liveCwd,
+    saveTabs: tabsSave,
+    onCwdResolved: setTabCwd,
+    onError: (err) => {
+      console.error("phantom: failed to save session", err);
+    },
+  });
+
+  function requestSessionSave() {
+    if (!readyRef.current) return;
+    sessionSaverRef.current?.requestSave();
+  }
+
+  async function saveSessionNow() {
+    if (!readyRef.current) return;
+    await sessionSaverRef.current?.saveNow();
+  }
+
   // Open a new tab that inherits `fromId`'s cwd. When `afterId` is given the tab
   // is inserted just to its right; otherwise it is appended at the end.
   async function openTab(fromId: string | null, afterId?: string) {
     const source = tabsStore.state.tabs.find((t) => t.id === fromId);
-    const cwd = source ? await liveCwd(source) : "";
+    const cwd =
+      (source ? await liveCwd(source) : null) ??
+      source?.cwd ??
+      defaultLaunchCwd(configRef.current, homePathRef.current);
     addTab({
       cwd,
       afterId,
@@ -87,11 +115,20 @@ export default function App() {
   }
 
   // Load config + restore saved session on launch.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: launch bootstrap runs once; session saver reads live store refs.
   useEffect(() => {
     (async () => {
       const cfg = await configGet();
       setConfig(cfg);
-      setHomeDir(await homeDir().catch(() => null));
+      const home = await homeDir().catch(() => null);
+      homePathRef.current = home;
+      setHomeDir(home);
+
+      if (tabsStore.state.tabs.length) {
+        readyRef.current = true;
+        requestSessionSave();
+        return;
+      }
 
       let restored: TabRecord[] = [];
       if (cfg.restore_on_launch) {
@@ -102,70 +139,46 @@ export default function App() {
           restored = [];
         }
       }
+      sessionSaverRef.current?.remember(restored);
 
       if (restored.length) {
-        let activate: string | null = null;
-        for (const r of restored) {
-          const id = addTab({
+        replaceTabs(
+          restored.map((r) => ({
             id: r.id ?? null,
             cwd: r.cwd,
             customTitle: r.title || null,
             shellProfileId: r.shell_profile_id ?? null,
             createdAt: r.created_at ?? null,
             updatedAt: r.updated_at ?? null,
-          });
-          if (r.is_active) activate = id;
-        }
-        if (activate) activateTab(activate);
+            active: Boolean(r.is_active),
+          })),
+        );
       } else {
-        addTab({ shellProfileId: cfg.default_shell_profile_id });
+        replaceTabs([
+          {
+            cwd: defaultLaunchCwd(cfg, home),
+            shellProfileId: cfg.default_shell_profile_id,
+            active: true,
+          },
+        ]);
       }
       readyRef.current = true;
+      requestSessionSave();
     })();
   }, []);
 
-  // Persist session: gather live cwd per tab and save.
-  async function saveSession() {
-    if (!readyRef.current) return;
-    const { tabs, activeId } = tabsStore.state;
-    const records: TabRecord[] = [];
-    for (const t of tabs) {
-      if (t.kind === "settings") continue; // the settings tab is never persisted
-      let cwd = t.cwd;
-      if (t.ptyId != null) {
-        const live = await ptyCwd(t.ptyId);
-        if (live) {
-          cwd = live;
-          if (live !== t.cwd) setTabCwd(t.id, live);
-        }
-      }
-      records.push({
-        id: t.id,
-        title: t.customTitle ?? "",
-        cwd,
-        is_active: t.id === activeId,
-        shell_profile_id: t.shellProfileId,
-        created_at: t.createdAt,
-        updated_at: t.updatedAt,
-      });
-    }
-    try {
-      await tabsSave(records);
-    } catch (err) {
-      console.error("phantom: failed to save session", err);
-    }
-  }
-
   // Save on tab add/close/rename/activate (debounced) + periodically + on blur.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: subscribes once for the app's lifetime; saveSession reads live state from the store.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: subscribes once for the app's lifetime; the session saver reads live state from the store.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const sub = tabsStore.subscribe(() => {
       clearTimeout(timer);
-      timer = setTimeout(saveSession, 500);
+      timer = setTimeout(requestSessionSave, 500);
     });
-    const interval = setInterval(saveSession, 10_000);
-    const onBlur = () => saveSession();
+    const interval = setInterval(requestSessionSave, 10_000);
+    const onBlur = () => {
+      void saveSessionNow();
+    };
     window.addEventListener("blur", onBlur);
     return () => {
       sub();
@@ -298,12 +311,63 @@ export default function App() {
     };
   }, []);
 
+  // Rounded transparent windows should square off when maximized/fullscreen so
+  // the content still reaches the display edges.
+  useEffect(() => {
+    if (!isTauri()) return;
+
+    const win = getCurrentWindow();
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+
+    const updateWindowShape = () => {
+      void Promise.all([win.isMaximized(), win.isFullscreen()])
+        .then(([maximized, fullscreen]) => {
+          if (!disposed) setWindowMaximized(maximized || fullscreen);
+        })
+        .catch((err) => {
+          console.error("phantom: failed to read window shape state", err);
+        });
+    };
+
+    updateWindowShape();
+
+    void Promise.all([
+      win.onResized(updateWindowShape),
+      win.onMoved(updateWindowShape),
+      win.onFocusChanged(updateWindowShape),
+    ]).then((listeners) => {
+      if (disposed) {
+        for (const unlisten of listeners) unlisten();
+      } else {
+        unlisteners.push(...listeners);
+      }
+    });
+
+    return () => {
+      disposed = true;
+      for (const unlisten of unlisteners) unlisten();
+    };
+  }, []);
+
   if (!config) {
-    return <div className="grid h-full place-items-center text-white/40">Loading…</div>;
+    return (
+      <div
+        className={`app-window grid place-items-center text-white/40 ${
+          windowMaximized ? "app-window--maximized" : ""
+        }`}
+      >
+        Loading…
+      </div>
+    );
   }
 
   return (
-    <div className="relative flex h-full flex-col">
+    <div
+      className={`app-window relative flex flex-col ${
+        windowMaximized ? "app-window--maximized" : ""
+      }`}
+    >
       <TabBar
         paintRevision={chromePaintRevision}
         tabs={tabs}
@@ -330,8 +394,8 @@ export default function App() {
           // accepts pointer events; the rest let clicks fall through.
           <div
             key={tab.id}
-            // Terminal tabs get a small inset so the pane doesn't sit flush
-            // against the window edges; the settings tab manages its own layout.
+            // Terminal tabs keep a real pane inset on every side; the renderer
+            // handles trimming any fake first-row blank from the emulator.
             className={`absolute inset-0 ${tab.kind === "settings" ? "" : "p-2"}`}
             style={{
               pointerEvents: tab.id === activeId ? "auto" : "none",
@@ -370,4 +434,12 @@ export default function App() {
       )}
     </div>
   );
+}
+
+function defaultLaunchCwd(config: AppConfig | null, home: string | null): string | null {
+  if (!config) return home;
+  const profile =
+    config.shell_profiles.find((p) => p.id === config.default_shell_profile_id) ??
+    config.shell_profiles[0];
+  return profile?.cwd?.trim() || home;
 }

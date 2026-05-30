@@ -22,7 +22,8 @@ pub fn pty_spawn(
     let cwd = opts
         .cwd
         .filter(|cwd| !cwd.trim().is_empty())
-        .or_else(|| profile.cwd.clone());
+        .or_else(|| profile.cwd.clone())
+        .or_else(default_home_dir);
     validate_spawn_cwd(cwd.as_deref()).map_err(command_error)?;
 
     state
@@ -88,6 +89,10 @@ pub fn config_set(state: State<AppState>, config: AppConfig) -> Result<(), Strin
 /// names. Returns None if it cannot be determined.
 #[tauri::command]
 pub fn home_dir() -> Option<String> {
+    default_home_dir()
+}
+
+fn default_home_dir() -> Option<String> {
     directories::BaseDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
 }
 

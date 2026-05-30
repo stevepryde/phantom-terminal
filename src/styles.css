@@ -9,13 +9,24 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  background: transparent;
 }
 
 body {
-  background: #0b0b0e;
   color: #e6e6e6;
   font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
   overflow: hidden;
+}
+
+.app-window {
+  height: 100%;
+  overflow: hidden;
+  border-radius: 14px;
+  background: #0b0b0e;
+}
+
+.app-window--maximized {
+  border-radius: 0;
 }
 
 /* The tab bar is a custom-drag region on macOS; interactive controls opt out. */

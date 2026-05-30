@@ -20,9 +20,12 @@
         "minHeight": 320,
         "acceptFirstMouse": true,
         "decorations": false,
+        "transparent": true,
+        "shadow": true,
         "dragDropEnabled": false
       }
     ],
+    "macOSPrivateApi": true,
     "security": {
       "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' ipc: http://ipc.localhost; worker-src 'self' blob:; font-src 'self' data:; wasm-src 'self'"
     }

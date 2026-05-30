@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,8 +75,13 @@ impl SessionStore {
     }
 
     pub fn save_tabs(&self, tabs: &[TabRecord]) -> AppResult<()> {
+        if tabs.is_empty() {
+            return Ok(());
+        }
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let previous_cwds = previous_cwds_by_id(&tx)?;
+        let tabs = stable_tab_records(tabs, &previous_cwds);
         tx.execute("DELETE FROM tabs", [])?;
         for (i, t) in tabs.iter().enumerate() {
             tx.execute(
@@ -182,6 +188,69 @@ fn add_column_if_missing(
         )?;
     }
     Ok(())
+}
+
+fn previous_cwds_by_id(conn: &Connection) -> AppResult<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT tab_uid, cwd FROM tabs WHERE tab_uid IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut cwds = HashMap::new();
+    for row in rows {
+        let (id, cwd) = row?;
+        if !id.trim().is_empty() && !cwd.trim().is_empty() {
+            cwds.insert(id, cwd);
+        }
+    }
+    Ok(cwds)
+}
+
+fn stable_tab_records(
+    tabs: &[TabRecord],
+    previous_cwds: &HashMap<String, String>,
+) -> Vec<TabRecord> {
+    let mut seen_ids = HashSet::new();
+    let mut active_assigned = false;
+    let mut stable = Vec::with_capacity(tabs.len());
+
+    for tab in tabs {
+        let id = tab.id.as_ref().and_then(|id| {
+            let clean = id.trim();
+            if clean.is_empty() || !seen_ids.insert(clean.to_string()) {
+                None
+            } else {
+                Some(clean.to_string())
+            }
+        });
+        let cwd = if tab.cwd.trim().is_empty() {
+            id.as_ref()
+                .and_then(|id| previous_cwds.get(id))
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            tab.cwd.clone()
+        };
+        let is_active = tab.is_active && !active_assigned;
+        active_assigned |= is_active;
+
+        stable.push(TabRecord {
+            id,
+            title: tab.title.clone(),
+            cwd,
+            sort_order: 0,
+            is_active,
+            shell_profile_id: tab.shell_profile_id.clone(),
+            created_at: tab.created_at.clone(),
+            updated_at: tab.updated_at.clone(),
+        });
+    }
+
+    if !active_assigned && !stable.is_empty() {
+        stable[0].is_active = true;
+    }
+
+    stable
 }
 
 fn save_config_conn(conn: &Connection, config: &AppConfig) -> AppResult<()> {
@@ -308,6 +377,57 @@ mod tests {
         let loaded = store.load_tabs().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].title, "new");
+    }
+
+    #[test]
+    fn save_tabs_preserves_existing_cwd_when_incoming_cwd_is_unknown() {
+        let store = in_memory();
+        let mut existing = tab("old", "/known", true);
+        existing.id = Some("stable".into());
+        store.save_tabs(&[existing]).unwrap();
+
+        let mut incoming = tab("new", "", true);
+        incoming.id = Some("stable".into());
+        store.save_tabs(&[incoming]).unwrap();
+
+        let loaded = store.load_tabs().unwrap();
+        assert_eq!(loaded[0].cwd, "/known");
+        assert_eq!(loaded[0].title, "new");
+    }
+
+    #[test]
+    fn save_tabs_ignores_empty_save_requests() {
+        let store = in_memory();
+        store.save_tabs(&[tab("old", "/known", true)]).unwrap();
+        store.save_tabs(&[]).unwrap();
+
+        let loaded = store.load_tabs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].cwd, "/known");
+    }
+
+    #[test]
+    fn save_tabs_normalizes_active_tab_state() {
+        let store = in_memory();
+        store
+            .save_tabs(&[
+                tab("one", "/a", true),
+                tab("two", "/b", true),
+                tab("three", "/c", false),
+            ])
+            .unwrap();
+
+        let loaded = store.load_tabs().unwrap();
+        assert!(loaded[0].is_active);
+        assert!(!loaded[1].is_active);
+        assert!(!loaded[2].is_active);
+
+        store
+            .save_tabs(&[tab("one", "/a", false), tab("two", "/b", false)])
+            .unwrap();
+        let loaded = store.load_tabs().unwrap();
+        assert!(loaded[0].is_active);
+        assert!(!loaded[1].is_active);
     }
 
     #[test]

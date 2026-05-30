@@ -10,7 +10,8 @@ export interface Tab {
   kind: TabKind;
   /** Explicit user-given name. When null, the tab is named after its cwd. */
   customTitle: string | null;
-  cwd: string;
+  /** Last known live cwd. Null means the cwd has not been resolved yet. */
+  cwd: string | null;
   ptyId: number | null;
   shellProfileId: string | null;
   createdAt: string;
@@ -23,7 +24,7 @@ export interface Tab {
  */
 export function tabTitle(tab: Tab): string {
   if (tab.kind === "settings") return "Settings";
-  return tab.customTitle?.trim() || formatCwdName(tab.cwd) || "shell";
+  return tab.customTitle?.trim() || formatCwdName(tab.cwd ?? "") || "shell";
 }
 
 interface TabsState {
@@ -40,10 +41,22 @@ const newId = () =>
     ? `tab_${crypto.randomUUID()}`
     : `tab_${Date.now().toString(36)}_${(counter++).toString(36)}`;
 
+export function normalizeCwd(cwd: string | null | undefined): string | null {
+  const clean = cwd?.trim();
+  return clean ? clean : null;
+}
+
+function uniqueTabId(preferred: string | null | undefined, tabs: Tab[]): string {
+  if (preferred && !tabs.some((tab) => tab.id === preferred)) return preferred;
+  let id = newId();
+  while (tabs.some((tab) => tab.id === id)) id = newId();
+  return id;
+}
+
 export function addTab(
   opts: {
     kind?: TabKind;
-    cwd?: string;
+    cwd?: string | null;
     customTitle?: string | null;
     shellProfileId?: string | null;
     id?: string | null;
@@ -53,19 +66,20 @@ export function addTab(
     afterId?: string;
   } = {},
 ): string {
-  const id = opts.id || newId();
-  const createdAt = opts.createdAt || nowIso();
-  const tab: Tab = {
-    id,
-    kind: opts.kind ?? "terminal",
-    customTitle: opts.customTitle ?? null,
-    cwd: opts.cwd ?? "",
-    ptyId: null,
-    shellProfileId: opts.shellProfileId ?? null,
-    createdAt,
-    updatedAt: opts.updatedAt || createdAt,
-  };
+  let id = opts.id || newId();
   tabsStore.setState((s) => {
+    id = uniqueTabId(id, s.tabs);
+    const createdAt = opts.createdAt || nowIso();
+    const tab: Tab = {
+      id,
+      kind: opts.kind ?? "terminal",
+      customTitle: opts.customTitle ?? null,
+      cwd: normalizeCwd(opts.cwd),
+      ptyId: null,
+      shellProfileId: opts.shellProfileId ?? null,
+      createdAt,
+      updatedAt: opts.updatedAt || createdAt,
+    };
     const idx = opts.afterId ? s.tabs.findIndex((t) => t.id === opts.afterId) : -1;
     if (idx >= 0) {
       const tabs = [...s.tabs.slice(0, idx + 1), tab, ...s.tabs.slice(idx + 1)];
@@ -74,6 +88,46 @@ export function addTab(
     return { tabs: [...s.tabs, tab], activeId: id };
   });
   return id;
+}
+
+export function replaceTabs(
+  opts: Array<{
+    kind?: TabKind;
+    cwd?: string | null;
+    customTitle?: string | null;
+    shellProfileId?: string | null;
+    id?: string | null;
+    createdAt?: string | null;
+    updatedAt?: string | null;
+    active?: boolean;
+  }>,
+): string[] {
+  const ids: string[] = [];
+  const tabs: Tab[] = [];
+  let activeId: string | null = null;
+
+  for (const opt of opts) {
+    const id = uniqueTabId(opt.id, tabs);
+    const createdAt = opt.createdAt || nowIso();
+    tabs.push({
+      id,
+      kind: opt.kind ?? "terminal",
+      customTitle: opt.customTitle ?? null,
+      cwd: normalizeCwd(opt.cwd),
+      ptyId: null,
+      shellProfileId: opt.shellProfileId ?? null,
+      createdAt,
+      updatedAt: opt.updatedAt || createdAt,
+    });
+    ids.push(id);
+    if (opt.active) activeId = id;
+  }
+
+  tabsStore.setState({
+    tabs,
+    activeId: activeId ?? (ids.length ? ids[ids.length - 1] : null),
+  });
+  return ids;
 }
 
 export function closeTab(id: string) {
@@ -174,13 +228,15 @@ export function toggleSettingsTab() {
   }
 }
 
-export function setTabCwd(id: string, cwd: string) {
+export function setTabCwd(id: string, cwd: string | null | undefined) {
+  const clean = normalizeCwd(cwd);
+  if (!clean) return;
   tabsStore.setState((s) => {
     const tab = s.tabs.find((t) => t.id === id);
-    if (!tab || tab.cwd === cwd) return s; // no-op when unchanged (avoids churn)
+    if (!tab || tab.cwd === clean) return s; // no-op when unchanged (avoids churn)
     return {
       ...s,
-      tabs: s.tabs.map((t) => (t.id === id ? { ...t, cwd, updatedAt: nowIso() } : t)),
+      tabs: s.tabs.map((t) => (t.id === id ? { ...t, cwd: clean, updatedAt: nowIso() } : t)),
     };
   });
 }

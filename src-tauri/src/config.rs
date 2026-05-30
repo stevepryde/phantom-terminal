@@ -18,6 +18,8 @@ const MAX_ARGS_PER_PROFILE: usize = 128;
 const MAX_CWD_LEN: usize = 4096;
 const MAX_KEYBINDINGS: usize = 128;
 const MAX_KEYBINDING_FIELD_LEN: usize = 128;
+const OLD_DEFAULT_SELECTION: &str = "#33415580";
+const DEFAULT_SELECTION: &str = "#ffffff24";
 
 /// Full 16-color ANSI palette plus the special UI colors. Keys are snake_case on
 /// the wire; the frontend maps them onto ghostty-web's camelCase Terminal theme.
@@ -78,7 +80,7 @@ impl Default for Theme {
             background: "#0b0b0e".to_string(),
             foreground: "#e6e6e6".to_string(),
             cursor: "#e6e6e6".to_string(),
-            selection: "#33415580".to_string(),
+            selection: DEFAULT_SELECTION.to_string(),
             black: "#1c1c22".to_string(),
             red: "#ff5c57".to_string(),
             green: "#5af78e".to_string(),
@@ -138,7 +140,6 @@ impl Keybinding {
 impl ShellProfile {
     fn validate(&self) -> AppResult<()> {
         validate_nonempty("shell profile id", &self.id)?;
-        validate_nonempty("shell profile name", &self.name)?;
         validate_len("shell profile id", &self.id, MAX_ID_LEN)?;
         validate_len("shell profile name", &self.name, MAX_NAME_LEN)?;
         validate_len("shell profile command", &self.command, MAX_COMMAND_LEN)?;
@@ -243,7 +244,14 @@ impl AppConfig {
 
     /// Return a validated config. This method exists to keep call sites concise
     /// and to make later normalization rules a single-code-path change.
-    pub fn validated(self) -> AppResult<Self> {
+    pub fn validated(mut self) -> AppResult<Self> {
+        if self
+            .theme
+            .selection
+            .eq_ignore_ascii_case(OLD_DEFAULT_SELECTION)
+        {
+            self.theme.selection = DEFAULT_SELECTION.to_string();
+        }
         self.validate()?;
         Ok(self)
     }
@@ -414,6 +422,16 @@ mod tests {
         let mut config = AppConfig::default();
         config.theme.background = "black".to_string();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validated_migrates_old_default_selection_color() {
+        let mut config = AppConfig::default();
+        config.theme.selection = OLD_DEFAULT_SELECTION.to_string();
+
+        let validated = config.validated().unwrap();
+
+        assert_eq!(validated.theme.selection, DEFAULT_SELECTION);
     }
 
     #[test]

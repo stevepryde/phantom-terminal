@@ -56,7 +56,7 @@ export function CommandPalette({
       kind: "tab",
       id: t.id,
       label: tabTitle(t),
-      hint: t.cwd || "",
+      hint: t.cwd ?? "",
     }));
     const actions: Item[] = [
       { kind: "action", id: "new", label: "New tab", hint: "⌘T", run: onNewTab },

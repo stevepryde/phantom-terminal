@@ -1,6 +1,18 @@
-import { History, Palette, Plus, SlidersHorizontal, Terminal, Trash2, X } from "lucide-react";
+import {
+  ArrowLeft,
+  History,
+  Palette,
+  Pencil,
+  Plus,
+  SlidersHorizontal,
+  Star,
+  Terminal,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CustomDropdown } from "../components/CustomDropdown";
+import { terminalFontDropdownValue, terminalFontOptions } from "../lib/fonts";
 import type { AppConfig, ShellProfile, Theme } from "../lib/ipc";
 
 interface Props {
@@ -156,12 +168,10 @@ function AppearanceSection({ config, onChange }: Props) {
   return (
     <Section title="Appearance" hint="Font & theme changes apply live across all tabs.">
       <Field label="Font family">
-        <input
-          type="text"
-          value={config.font_family}
-          spellCheck={false}
-          className="w-full rounded border border-white/10 bg-black/30 px-2 py-1 outline-none focus:border-white/30"
-          onChange={(e) => onChange({ font_family: e.target.value })}
+        <CustomDropdown
+          value={terminalFontDropdownValue(config.font_family)}
+          options={terminalFontOptions(config.font_family)}
+          onChange={(value) => onChange({ font_family: value })}
         />
       </Field>
 
@@ -256,90 +266,200 @@ function ThemeSection({ config, onChange }: Props) {
 }
 
 function ProfilesSection({ config, onChange }: Props) {
+  const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const editingProfile =
+    editingProfileId == null
+      ? null
+      : (config.shell_profiles.find((p) => p.id === editingProfileId) ?? null);
+
+  useEffect(() => {
+    if (editingProfileId && !editingProfile) setEditingProfileId(null);
+  }, [editingProfileId, editingProfile]);
+
   const updateProfile = (id: string, patch: Partial<ShellProfile>) =>
     onChange({
       shell_profiles: config.shell_profiles.map((p) => (p.id === id ? { ...p, ...patch } : p)),
     });
 
-  const addProfile = () =>
+  const editProfile = (id: string | null) => {
+    setConfirmingDelete(false);
+    setEditingProfileId(id);
+  };
+
+  const addProfile = () => {
+    const profile: ShellProfile = {
+      id: newProfileId(),
+      name: "New Profile",
+      command: "",
+      args: [],
+      cwd: null,
+    };
     onChange({
-      shell_profiles: [
-        ...config.shell_profiles,
-        { id: newProfileId(), name: "New Profile", command: "", args: [], cwd: null },
-      ],
+      shell_profiles: [...config.shell_profiles, profile],
     });
+    editProfile(profile.id);
+  };
 
   const removeProfile = (id: string) => {
+    if (config.shell_profiles.length <= 1) return;
     const remaining = config.shell_profiles.filter((p) => p.id !== id);
     const patch: Partial<AppConfig> = { shell_profiles: remaining };
     if (config.default_shell_profile_id === id && remaining[0]) {
       patch.default_shell_profile_id = remaining[0].id;
     }
     onChange(patch);
+    editProfile(null);
   };
+
+  if (editingProfile) {
+    return (
+      <Section title="Edit Shell Profile" hint="Profile changes affect new tabs only.">
+        <button
+          type="button"
+          className="flex min-h-8 items-center gap-2 rounded px-2 py-1 text-white/60 hover:bg-white/8 hover:text-white"
+          onClick={() => editProfile(null)}
+        >
+          <ArrowLeft size={14} />
+          Back to profiles
+        </button>
+
+        <div className="space-y-3 border-white/10 border-t pt-3">
+          <Field label="Profile name">
+            <input
+              type="text"
+              value={editingProfile.name}
+              placeholder="Untitled Profile"
+              spellCheck={false}
+              className="w-full rounded border border-white/10 bg-black/30 px-2 py-1 font-medium outline-none placeholder:text-white/30 focus:border-white/30"
+              onChange={(e) => updateProfile(editingProfile.id, { name: e.target.value })}
+            />
+          </Field>
+
+          <Field label="Command">
+            <input
+              type="text"
+              value={editingProfile.command}
+              placeholder="default ($SHELL)"
+              spellCheck={false}
+              className="w-full rounded border border-white/10 bg-black/30 px-2 py-1 font-mono text-xs outline-none placeholder:text-white/30 focus:border-white/30"
+              onChange={(e) => updateProfile(editingProfile.id, { command: e.target.value })}
+            />
+          </Field>
+
+          <Field label="Arguments">
+            <ArgsList
+              args={editingProfile.args}
+              onChange={(args) => updateProfile(editingProfile.id, { args })}
+            />
+          </Field>
+
+          <Field label="Working directory (optional)">
+            <input
+              type="text"
+              value={editingProfile.cwd ?? ""}
+              placeholder="inherit / last cwd"
+              spellCheck={false}
+              className="w-full rounded border border-white/10 bg-black/30 px-2 py-1 font-mono text-xs outline-none placeholder:text-white/30 focus:border-white/30"
+              onChange={(e) =>
+                updateProfile(editingProfile.id, { cwd: e.target.value.trim() || null })
+              }
+            />
+          </Field>
+        </div>
+
+        <div className="space-y-2 border-white/10 border-t pt-3">
+          {confirmingDelete ? (
+            <div className="rounded border border-red-400/20 bg-red-950/20 p-3">
+              <div className="text-red-50/80 text-sm">
+                Delete {profileName(editingProfile)}? This cannot be undone.
+              </div>
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  className="flex min-h-8 items-center gap-2 rounded border border-red-400/25 bg-red-500/20 px-3 py-1.5 text-red-50 hover:bg-red-500/35"
+                  onClick={() => removeProfile(editingProfile.id)}
+                >
+                  <Trash2 size={14} />
+                  Delete
+                </button>
+                <button
+                  type="button"
+                  className="min-h-8 rounded border border-white/15 px-3 py-1.5 text-white/60 hover:border-white/30 hover:text-white"
+                  onClick={() => setConfirmingDelete(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="button"
+              disabled={config.shell_profiles.length <= 1}
+              className="flex min-h-8 items-center gap-2 rounded border border-red-400/20 px-3 py-1.5 text-red-100/70 hover:bg-red-500/30 hover:text-white disabled:cursor-not-allowed disabled:opacity-30"
+              onClick={() => setConfirmingDelete(true)}
+            >
+              <Trash2 size={14} />
+              Delete profile
+            </button>
+          )}
+        </div>
+      </Section>
+    );
+  }
 
   return (
     <Section title="Shell Profiles" hint="Profile changes affect new tabs only.">
-      <Field label="Default profile (used for new tabs)">
-        <CustomDropdown
-          value={config.default_shell_profile_id}
-          options={config.shell_profiles.map((p) => ({ value: p.id, label: p.name }))}
-          onChange={(v) => onChange({ default_shell_profile_id: v })}
-        />
-      </Field>
-
-      <div className="space-y-3">
-        {config.shell_profiles.map((p) => (
-          <div key={p.id} className="rounded border border-white/10 bg-black/20 p-3">
-            <div className="mb-2 flex items-center gap-2">
-              <input
-                type="text"
-                value={p.name}
-                spellCheck={false}
-                className="flex-1 rounded border border-white/10 bg-black/30 px-2 py-1 font-medium outline-none focus:border-white/30"
-                onChange={(e) => updateProfile(p.id, { name: e.target.value })}
-              />
+      <div className="space-y-2">
+        {config.shell_profiles.map((p) => {
+          const isDefault = p.id === config.default_shell_profile_id;
+          return (
+            <div
+              key={p.id}
+              className="flex min-h-12 w-full items-center gap-1 rounded border border-white/10 bg-black/20 px-1 py-1 hover:border-white/20 hover:bg-white/8"
+            >
               <button
                 type="button"
-                aria-label="Delete profile"
-                title="Delete profile"
-                disabled={config.shell_profiles.length <= 1}
-                className="flex h-7 w-7 items-center justify-center rounded text-white/50 hover:bg-red-500/30 hover:text-white disabled:cursor-not-allowed disabled:opacity-30"
-                onClick={() => removeProfile(p.id)}
+                className="min-w-0 flex-1 rounded px-2 py-1 text-left focus:outline-none focus:ring-1 focus:ring-sky-400/60"
+                onClick={() => editProfile(p.id)}
               >
-                <Trash2 size={14} />
+                <div className="truncate font-medium text-white">{profileName(p)}</div>
+                <div className="mt-0.5 truncate text-white/35 text-xs">
+                  {profileCommandSummary(p)}
+                </div>
+              </button>
+              <button
+                type="button"
+                aria-label={isDefault ? "Default profile" : `Make ${profileName(p)} default`}
+                aria-pressed={isDefault}
+                title={isDefault ? "Default profile" : "Make default"}
+                className={[
+                  "flex h-8 w-8 shrink-0 items-center justify-center rounded focus:outline-none focus:ring-1 focus:ring-sky-400/60",
+                  isDefault
+                    ? "text-yellow-200/90"
+                    : "text-white/35 hover:bg-white/10 hover:text-white/80",
+                ].join(" ")}
+                onClick={() => {
+                  if (!isDefault) onChange({ default_shell_profile_id: p.id });
+                }}
+              >
+                <Star size={14} fill={isDefault ? "currentColor" : "none"} />
+              </button>
+              <button
+                type="button"
+                aria-label={`Edit ${profileName(p)}`}
+                title="Edit profile"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-white/35 hover:bg-white/10 hover:text-white/80 focus:outline-none focus:ring-1 focus:ring-sky-400/60"
+                onClick={() => editProfile(p.id)}
+              >
+                <Pencil size={14} />
               </button>
             </div>
-            <div className="grid grid-cols-2 gap-2">
-              <Field label="Command">
-                <input
-                  type="text"
-                  value={p.command}
-                  placeholder="default ($SHELL)"
-                  spellCheck={false}
-                  className="w-full rounded border border-white/10 bg-black/30 px-2 py-1 font-mono text-xs outline-none placeholder:text-white/30 focus:border-white/30"
-                  onChange={(e) => updateProfile(p.id, { command: e.target.value })}
-                />
-              </Field>
-              <Field label="Arguments">
-                <ArgsList args={p.args} onChange={(args) => updateProfile(p.id, { args })} />
-              </Field>
-              <Field label="Working directory (optional)">
-                <input
-                  type="text"
-                  value={p.cwd ?? ""}
-                  placeholder="inherit / last cwd"
-                  spellCheck={false}
-                  className="col-span-2 w-full rounded border border-white/10 bg-black/30 px-2 py-1 font-mono text-xs outline-none placeholder:text-white/30 focus:border-white/30"
-                  onChange={(e) => updateProfile(p.id, { cwd: e.target.value.trim() || null })}
-                />
-              </Field>
-            </div>
-          </div>
-        ))}
+          );
+        })}
         <button
           type="button"
-          className="flex items-center gap-2 rounded border border-white/15 border-dashed px-3 py-1.5 text-white/60 hover:border-white/30 hover:text-white"
+          className="flex min-h-8 items-center gap-2 rounded border border-white/15 border-dashed px-3 py-1.5 text-white/60 hover:border-white/30 hover:text-white"
           onClick={addProfile}
         >
           <Plus size={14} /> Add profile
@@ -347,6 +467,15 @@ function ProfilesSection({ config, onChange }: Props) {
       </div>
     </Section>
   );
+}
+
+function profileName(profile: ShellProfile): string {
+  return profile.name.trim() || "Untitled Profile";
+}
+
+function profileCommandSummary(profile: ShellProfile): string {
+  const command = profile.command.trim() || "Default shell";
+  return profile.args.length === 0 ? command : `${command} + ${profile.args.length} args`;
 }
 
 function ArgsList({ args, onChange }: { args: string[]; onChange: (args: string[]) => void }) {

@@ -1,6 +1,8 @@
 import { FitAddon, type FontMetrics, Ghostty, Terminal } from "ghostty-web";
 import { useEffect, useLayoutEffect, useRef } from "react";
+import { terminalFontFamilyForRendering } from "../lib/fonts";
 import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
+import { enableTerminalLigatures } from "./ligatures";
 
 // ghostty-web's WASM is initialised once for the whole app.
 let ghosttyPromise: Promise<Ghostty> | null = null;
@@ -34,7 +36,7 @@ interface TerminalInternals {
 
 interface Props {
   tabId: string;
-  cwd: string;
+  cwd: string | null;
   active: boolean;
   config: AppConfig;
   shellProfileId: string | null;
@@ -46,6 +48,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const ptyIdRef = useRef<number | null>(null);
+  const terminalFontFamily = terminalFontFamilyForRendering(config.font_family);
   // Mirror `active` so the async mount can focus the terminal once it's ready
   // if this tab is still the active one (the focus effect below runs before the
   // terminal exists, so a freshly-created active tab needs this).
@@ -64,7 +67,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
 
       const term = new Terminal({
         ghostty,
-        fontFamily: config.font_family,
+        fontFamily: terminalFontFamily,
         fontSize: config.font_size,
         theme: ghosttyTheme(config.theme),
         cursorBlink: config.cursor_blink,
@@ -74,6 +77,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(containerRef.current);
+      enableTerminalLigatures(term);
       termRef.current = term;
       fitRef.current = fit;
       fit.observeResize();
@@ -83,11 +87,18 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       refreshTerminalDisplay(term, config.line_height);
       fit.fit();
       forceTerminalRender(term);
+      scheduleFontSettledRefresh(
+        term,
+        terminalFontFamily,
+        config.font_size,
+        config.line_height,
+        fit,
+      );
 
       const ptyId = await spawnPty(
         {
           shell_profile_id: shellProfileId,
-          cwd: cwd || null,
+          cwd,
           rows: Math.max(24, term.rows),
           cols: Math.max(80, term.cols),
         },
@@ -180,7 +191,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
     const term = termRef.current;
     if (term) {
       term.options.fontSize = config.font_size;
-      term.options.fontFamily = config.font_family;
+      term.options.fontFamily = terminalFontFamily;
       term.options.theme = ghosttyTheme(config.theme);
       term.options.cursorBlink = config.cursor_blink;
       term.options.cursorStyle = config.cursor_style;
@@ -188,9 +199,16 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       refreshTerminalDisplay(term, config.line_height);
       fitRef.current?.fit();
       forceTerminalRender(term);
+      scheduleFontSettledRefresh(
+        term,
+        terminalFontFamily,
+        config.font_size,
+        config.line_height,
+        fitRef.current,
+      );
     }
   }, [
-    config.font_family,
+    terminalFontFamily,
     config.font_size,
     config.line_height,
     config.theme,
@@ -230,6 +248,29 @@ function refreshTerminalDisplay(term: Terminal, lineHeight: number) {
   };
   renderer.resize(term.cols, term.rows);
   forceTerminalRender(term);
+}
+
+function scheduleFontSettledRefresh(
+  term: Terminal,
+  fontFamily: string,
+  fontSize: number,
+  lineHeight: number,
+  fit: FitAddon | null,
+) {
+  const fonts = document.fonts;
+  if (!fonts) return;
+
+  void Promise.race([
+    fonts.load(`${fontSize}px ${fontFamily}`),
+    fonts.ready,
+    new Promise((resolve) => setTimeout(resolve, 250)),
+  ])
+    .catch(() => undefined)
+    .then(() => {
+      refreshTerminalDisplay(term, lineHeight);
+      fit?.fit();
+      forceTerminalRender(term);
+    });
 }
 
 function forceTerminalRender(term: Terminal) {

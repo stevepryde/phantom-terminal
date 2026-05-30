@@ -35,6 +35,7 @@ export function TabBar({
   onOpenSettings,
 }: Props) {
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const activeIndex = tabs.findIndex((tab) => tab.id === activeId);
   // Drag-to-reorder state. `dragId` is the tab being dragged; `dropGap` is the
   // gap (0..tabs.length) where it would be inserted, used to draw the marker.
   const [dragId, setDragId] = useState<string | null>(null);
@@ -122,7 +123,7 @@ export function TabBar({
             role="tablist"
             aria-label="Terminal tabs"
             onScroll={updateOverflow}
-            className="tab-scrollbar flex items-stretch gap-1 overflow-x-auto px-1"
+            className="tab-scrollbar flex items-stretch overflow-x-auto px-1"
             onDragOver={(e) => {
               // Allow dropping past the last tab (in the trailing empty space).
               if (dragId == null) return;
@@ -132,12 +133,18 @@ export function TabBar({
             onDrop={onDrop}
           >
             {tabs.map((tab, i) => (
-              <div key={tab.id} data-tab-id={tab.id} className="no-drag flex items-stretch">
+              <div
+                // biome-ignore lint/suspicious/noArrayIndexKey: duplicated restored ids are repaired by addTab, but index keeps this render stable during repair.
+                key={`${tab.id}-${i}`}
+                data-tab-id={tab.id}
+                className="no-drag flex items-stretch"
+              >
                 {marker(i)}
+                {i > 0 && <div aria-hidden className="my-2 w-px shrink-0 bg-white/18" />}
                 <TabItem
                   tab={tab}
                   index={i}
-                  active={tab.id === activeId}
+                  active={i === activeIndex}
                   editing={tab.id === editingId}
                   dragging={tab.id === dragId}
                   onActivate={onActivate}
@@ -300,12 +307,18 @@ function TabItem({
       aria-selected={active}
       tabIndex={0}
       className={[
-        "no-drag group my-1.5 flex min-w-[7rem] max-w-[14rem] cursor-pointer items-center gap-1 rounded py-0 pr-1.5 pl-3 text-sm",
-        active ? "bg-white/15 text-white" : "text-white/55 hover:bg-white/8 hover:text-white/85",
+        "no-drag group relative flex h-full min-w-[7rem] max-w-[14rem] cursor-pointer items-center gap-1 bg-transparent pr-1.5 pl-3 text-sm transition-colors",
+        active ? "text-white" : "text-white/55 hover:bg-white/[0.07] hover:text-white/85",
         dragging ? "opacity-40" : "",
       ].join(" ")}
-      title={tab.cwd || tabTitle(tab)}
+      title={tab.cwd ?? tabTitle(tab)}
     >
+      {active && (
+        <span
+          aria-hidden
+          className="absolute right-2 bottom-0 left-2 h-0.5 rounded-full bg-sky-300/90"
+        />
+      )}
       {editing ? (
         <input
           ref={inputRef}
