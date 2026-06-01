@@ -143,8 +143,12 @@ fn resolve_launch_cwd(arg: &OsStr, current_dir: &Path) -> Option<String> {
 }
 
 fn implicit_launch_cwd(current_dir: &Path, home_dir: Option<&Path>) -> Option<String> {
-    let cwd =
-        normalize_cwd_path(&fs::canonicalize(current_dir).unwrap_or(current_dir.to_path_buf()))?;
+    let current_dir = fs::canonicalize(current_dir).unwrap_or(current_dir.to_path_buf());
+    if is_appimage_runtime_cwd(&current_dir) {
+        return None;
+    }
+
+    let cwd = normalize_cwd_path(&current_dir)?;
     let home = home_dir.and_then(|home| {
         normalize_cwd_path(&fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()))
     });
@@ -154,6 +158,20 @@ fn implicit_launch_cwd(current_dir: &Path, home_dir: Option<&Path>) -> Option<St
     } else {
         Some(cwd)
     }
+}
+
+fn is_appimage_runtime_cwd(path: &Path) -> bool {
+    is_temp_path(path)
+        && path.ancestors().any(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".mount_"))
+        })
+}
+
+fn is_temp_path(path: &Path) -> bool {
+    path.starts_with(env::temp_dir()) || path.starts_with("/tmp") || path.starts_with("/var/tmp")
 }
 
 fn normalize_cwd_path(path: &Path) -> Option<String> {
@@ -284,6 +302,18 @@ mod tests {
         let state = parsed_args_to_state(parsed);
 
         assert!(!state.context().remember_tabs);
+        assert_eq!(state.context().cwd, None);
+    }
+
+    #[test]
+    fn no_args_in_appimage_mount_directory_keeps_remembered_tabs_enabled() {
+        let cwd = env::temp_dir()
+            .join(".mount_PhantomTerminal123")
+            .join("usr")
+            .join("bin");
+        let state = parsed_args_to_state(parse(&[], &cwd, Some(Path::new("/home/steve"))));
+
+        assert!(state.context().remember_tabs);
         assert_eq!(state.context().cwd, None);
     }
 
