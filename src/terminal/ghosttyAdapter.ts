@@ -31,8 +31,39 @@ interface TerminalInternals {
   viewportY?: number;
 }
 
+interface RenderLoopTerminalInternals extends TerminalInternals {
+  animationFrameId?: number;
+  cancelRenderLoop?: () => void;
+  startRenderLoop?: () => void;
+  options?: Terminal["options"];
+  scrollbarOpacity?: number;
+  write: Terminal["write"];
+  writeln: Terminal["writeln"];
+  input: Terminal["input"];
+  clear: Terminal["clear"];
+  reset: Terminal["reset"];
+  scrollLines: Terminal["scrollLines"];
+  scrollPages: Terminal["scrollPages"];
+  scrollToTop: Terminal["scrollToTop"];
+  scrollToBottom: Terminal["scrollToBottom"];
+  scrollToLine: Terminal["scrollToLine"];
+}
+
+export interface TerminalRenderScheduler {
+  schedule: (forceAll?: boolean) => void;
+  setActive: (active: boolean) => void;
+  syncCursorBlink: () => void;
+  dispose: () => void;
+}
+
+const adaptiveRenderSchedulers = new WeakMap<Terminal, TerminalRenderScheduler>();
+
 function internals(term: Terminal): TerminalInternals {
   return term as unknown as TerminalInternals;
+}
+
+function renderLoopInternals(term: Terminal): RenderLoopTerminalInternals {
+  return term as unknown as RenderLoopTerminalInternals;
 }
 
 /**
@@ -71,6 +102,162 @@ export function assertGhosttyContract(term: Terminal): void {
     "for this version of ghostty-web.";
   if (import.meta.env.DEV) throw new Error(message);
   console.error(`phantom: ${message}`);
+}
+
+/**
+ * ghostty-web 0.4 starts a permanent requestAnimationFrame loop for every
+ * opened terminal. With cursor blinking enabled, that loop repaints a canvas row
+ * every display frame even when the PTY is idle. On Linux/WebKitGTK this can
+ * become compositor/GPU pressure that makes other browser-based apps stutter
+ * while Phantom's own CPU usage still looks low.
+ *
+ * Replace that loop with an on-demand scheduler: output, resize, scroll, config
+ * changes, and activation render promptly, while an idle blinking cursor renders
+ * only at blink cadence.
+ */
+export function installAdaptiveRenderLoop(
+  term: Terminal,
+  initialActive: boolean,
+): TerminalRenderScheduler {
+  const existing = adaptiveRenderSchedulers.get(term);
+  if (existing) {
+    existing.setActive(initialActive);
+    return existing;
+  }
+
+  const terminal = renderLoopInternals(term);
+  let active = initialActive;
+  let disposed = false;
+  let scheduledFrame: number | null = null;
+  let scheduledForceAll = false;
+  let blinkTimer: ReturnType<typeof setInterval> | null = null;
+
+  const original = {
+    write: terminal.write.bind(term),
+    writeln: terminal.writeln.bind(term),
+    input: terminal.input.bind(term),
+    clear: terminal.clear.bind(term),
+    reset: terminal.reset.bind(term),
+    scrollLines: terminal.scrollLines.bind(term),
+    scrollPages: terminal.scrollPages.bind(term),
+    scrollToTop: terminal.scrollToTop.bind(term),
+    scrollToBottom: terminal.scrollToBottom.bind(term),
+    scrollToLine: terminal.scrollToLine.bind(term),
+  };
+
+  const clearScheduledFrame = () => {
+    if (scheduledFrame == null) return;
+    cancelAnimationFrame(scheduledFrame);
+    scheduledFrame = null;
+  };
+
+  const renderNow = (forceAll = false) => {
+    if (disposed || !active) return;
+    const { renderer, wasmTerm, viewportY, scrollbarOpacity } = renderLoopInternals(term);
+    if (!renderer || !wasmTerm) return;
+    renderer.render(wasmTerm, forceAll, viewportY, term, scrollbarOpacity);
+  };
+
+  const schedule = (forceAll = false) => {
+    scheduledForceAll ||= forceAll;
+    if (disposed || !active || scheduledFrame != null) return;
+    scheduledFrame = requestAnimationFrame(() => {
+      scheduledFrame = null;
+      const shouldForceAll = scheduledForceAll;
+      scheduledForceAll = false;
+      renderNow(shouldForceAll);
+    });
+  };
+
+  const syncCursorBlink = () => {
+    if (blinkTimer != null) {
+      clearInterval(blinkTimer);
+      blinkTimer = null;
+    }
+    if (disposed || !active || !renderLoopInternals(term).options?.cursorBlink) return;
+    blinkTimer = setInterval(() => renderNow(false), 530);
+  };
+
+  terminal.cancelRenderLoop = () => {
+    const frame = renderLoopInternals(term).animationFrameId;
+    if (frame != null) {
+      cancelAnimationFrame(frame);
+      renderLoopInternals(term).animationFrameId = undefined;
+    }
+    clearScheduledFrame();
+  };
+  terminal.startRenderLoop = () => {
+    schedule(false);
+    syncCursorBlink();
+  };
+
+  terminal.write = ((data, callback) => {
+    original.write(data, callback);
+    schedule(false);
+  }) as Terminal["write"];
+  terminal.writeln = ((data, callback) => {
+    original.writeln(data, callback);
+    schedule(false);
+  }) as Terminal["writeln"];
+  terminal.input = ((data, wasUserInput) => {
+    original.input(data, wasUserInput);
+    schedule(false);
+  }) as Terminal["input"];
+  terminal.clear = (() => {
+    original.clear();
+    schedule(true);
+  }) as Terminal["clear"];
+  terminal.reset = (() => {
+    original.reset();
+    schedule(true);
+  }) as Terminal["reset"];
+  terminal.scrollLines = ((amount) => {
+    original.scrollLines(amount);
+    schedule(false);
+  }) as Terminal["scrollLines"];
+  terminal.scrollPages = ((amount) => {
+    original.scrollPages(amount);
+    schedule(false);
+  }) as Terminal["scrollPages"];
+  terminal.scrollToTop = (() => {
+    original.scrollToTop();
+    schedule(false);
+  }) as Terminal["scrollToTop"];
+  terminal.scrollToBottom = (() => {
+    original.scrollToBottom();
+    schedule(false);
+  }) as Terminal["scrollToBottom"];
+  terminal.scrollToLine = ((line) => {
+    original.scrollToLine(line);
+    schedule(false);
+  }) as Terminal["scrollToLine"];
+
+  const scheduler: TerminalRenderScheduler = {
+    schedule,
+    setActive(nextActive) {
+      if (active === nextActive) return;
+      active = nextActive;
+      if (active) {
+        schedule(true);
+      } else {
+        clearScheduledFrame();
+      }
+      syncCursorBlink();
+    },
+    syncCursorBlink,
+    dispose() {
+      disposed = true;
+      clearScheduledFrame();
+      if (blinkTimer != null) {
+        clearInterval(blinkTimer);
+        blinkTimer = null;
+      }
+      adaptiveRenderSchedulers.delete(term);
+    },
+  };
+
+  adaptiveRenderSchedulers.set(term, scheduler);
+  return scheduler;
 }
 
 /**

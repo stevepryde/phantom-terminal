@@ -1,11 +1,14 @@
 import { FitAddon, Ghostty, Terminal } from "ghostty-web";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { requestLiveCwdRefresh } from "../hooks/useLiveCwdPolling";
 import { terminalFontFamilyForRendering } from "../lib/fonts";
 import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
 import {
   assertGhosttyContract,
   forceTerminalRender,
+  installAdaptiveRenderLoop,
   refreshTerminalDisplay,
+  type TerminalRenderScheduler,
 } from "./ghosttyAdapter";
 import { enableTerminalLigatures } from "./ligatures";
 
@@ -33,6 +36,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const renderSchedulerRef = useRef<TerminalRenderScheduler | null>(null);
   const ptyIdRef = useRef<number | null>(null);
   const deadRef = useRef(false);
   const [terminalNotice, setTerminalNotice] = useState<string | null>(null);
@@ -71,6 +75,8 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         scrollback: config.scrollback_lines,
       });
       const fit = new FitAddon();
+      const renderScheduler = installAdaptiveRenderLoop(term, activeRef.current);
+      renderSchedulerRef.current = renderScheduler;
       term.loadAddon(fit);
       term.open(containerRef.current);
       // Fail fast (in dev) if a ghostty-web bump changed the internals the
@@ -89,6 +95,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       refreshTerminalDisplay(term, config.line_height);
       fit.fit();
       forceTerminalRender(term);
+      renderScheduler.syncCursorBlink();
       scheduleFontSettledRefresh(
         term,
         terminalFontFamily,
@@ -112,6 +119,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
             return;
           }
           term.write(bytes);
+          requestLiveCwdRefresh(tabId);
         },
       ).catch((err) => {
         markDead(`Process failed to start: ${String(err)}`);
@@ -120,12 +128,14 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       if (ptyId == null) return;
       if (disposed) {
         void ptyKill(ptyId);
+        renderScheduler.dispose();
         term.dispose();
         return;
       }
       ptyIdRef.current = ptyId;
       if (!deadRef.current) setTerminalNotice(null);
       onSpawn(tabId, ptyId);
+      requestLiveCwdRefresh(tabId);
 
       // If this tab is the active one, grab keyboard focus now that the terminal
       // exists. The focus effect below already ran (on mount, before this async
@@ -139,6 +149,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         void ptyWrite(ptyId, enc.encode(s)).catch((err) => {
           markDead(`Process is no longer accepting input: ${String(err)}`);
         });
+        if (submitsCommandLine(s)) requestLiveCwdRefresh(tabId);
       });
       const dResize = term.onResize(({ cols, rows }) => {
         if (deadRef.current) return;
@@ -157,6 +168,8 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       disposed = true;
       for (const d of disposers) d();
       if (ptyIdRef.current != null) void ptyKill(ptyIdRef.current);
+      renderSchedulerRef.current?.dispose();
+      renderSchedulerRef.current = null;
       termRef.current?.dispose();
       termRef.current = null;
     };
@@ -174,6 +187,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   // Only the layout-dependent fit() is left in rAF.
   useLayoutEffect(() => {
     if (!active) return;
+    renderSchedulerRef.current?.setActive(true);
     termRef.current?.focus();
     const id = requestAnimationFrame(() => {
       const term = termRef.current;
@@ -184,6 +198,10 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
     });
     return () => cancelAnimationFrame(id);
   }, [active, config.line_height]);
+
+  useEffect(() => {
+    renderSchedulerRef.current?.setActive(active);
+  }, [active]);
 
   useEffect(() => {
     const onFocusActiveTerminal = () => {
@@ -225,6 +243,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       term.options.cursorBlink = config.cursor_blink;
       term.options.cursorStyle = config.cursor_style;
       term.options.scrollback = config.scrollback_lines;
+      renderSchedulerRef.current?.syncCursorBlink();
       refreshTerminalDisplay(term, config.line_height);
       fitRef.current?.fit();
       forceTerminalRender(term);
@@ -273,6 +292,10 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   );
 }
 export type { Props as TerminalViewProps };
+
+function submitsCommandLine(input: string): boolean {
+  return input.includes("\r") || input.includes("\n");
+}
 
 function scheduleFontSettledRefresh(
   term: Terminal,
