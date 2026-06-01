@@ -1,5 +1,6 @@
 import { FitAddon, Ghostty, Terminal } from "ghostty-web";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { requestLiveCwdRefresh } from "../hooks/useLiveCwdPolling";
 import { terminalFontFamilyForRendering } from "../lib/fonts";
 import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
 import {
@@ -115,6 +116,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
             return;
           }
           term.write(bytes);
+          requestLiveCwdRefresh(tabId);
         },
       ).catch((err) => {
         markDead(`Process failed to start: ${String(err)}`);
@@ -130,6 +132,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       ptyIdRef.current = ptyId;
       if (!deadRef.current) setTerminalNotice(null);
       onSpawn(tabId, ptyId);
+      requestLiveCwdRefresh(tabId);
 
       // If this tab is the active one, grab keyboard focus now that the terminal
       // exists. The focus effect below already ran (on mount, before this async
@@ -143,6 +146,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         void ptyWrite(ptyId, enc.encode(s)).catch((err) => {
           markDead(`Process is no longer accepting input: ${String(err)}`);
         });
+        if (submitsCommandLine(s)) requestLiveCwdRefresh(tabId);
       });
       const dResize = term.onResize(({ cols, rows }) => {
         if (deadRef.current) return;
@@ -285,6 +289,10 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
   );
 }
 export type { Props as TerminalViewProps };
+
+function submitsCommandLine(input: string): boolean {
+  return input.includes("\r") || input.includes("\n");
+}
 
 function scheduleFontSettledRefresh(
   term: Terminal,
