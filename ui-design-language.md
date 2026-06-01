@@ -123,6 +123,7 @@ Inputs, dropdowns, and adjacent buttons should share heights within a row.
 | Element | Radius | Guidance |
 | --- | --- | --- |
 | Window | `14px`, `0` maximized | Matches transparent macOS shell |
+| Linux window edge | `14px`, `0` maximized | Use a 1px Breeze-like inset outline on undecorated Linux windows so dark desktops still show a clear app edge |
 | Buttons and inputs | `4px` | Compact and utilitarian |
 | Menus and panels | `4px` | Use borders and background contrast |
 | Cards | `4px` | Use sparingly for repeated items only |

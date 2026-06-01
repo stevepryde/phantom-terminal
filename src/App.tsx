@@ -10,6 +10,7 @@ import {
   type AppConfig,
   configGet,
   homeDir,
+  launchContext,
   ptyCwd,
   type TabRecord,
   tabsLoad,
@@ -36,12 +37,15 @@ import {
 import { TabBar, TitleBarChrome } from "./tabs/TabBar";
 import { TerminalView } from "./terminal/TerminalView";
 
+const isLinuxWindow = typeof navigator !== "undefined" && /\bLinux\b/i.test(navigator.userAgent);
+
 export default function App() {
   const tabs = useStore(tabsStore, (s) => s.tabs);
   const activeId = useStore(tabsStore, (s) => s.activeId);
   const { config, configError, configRef, initConfig, updateConfig } = useAppConfig();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [launchCommandTabId, setLaunchCommandTabId] = useState<string | null>(null);
   const homePathRef = useRef<string | null>(null);
 
   const chromePaintRevision = useDisplayLayoutRefresh();
@@ -119,19 +123,22 @@ export default function App() {
   useEffect(() => {
     (async () => {
       const cfg = await configGet();
+      const launch = await launchContext();
       initConfig(cfg);
       const home = await homeDir().catch(() => null);
       homePathRef.current = home;
       setHomeDir(home);
 
       if (tabsStore.state.tabs.length) {
-        persistence.markReady();
-        persistence.requestSave();
+        if (launch.remember_tabs) {
+          persistence.markReady();
+          persistence.requestSave();
+        }
         return;
       }
 
       let restored: TabRecord[] = [];
-      if (cfg.restore_on_launch) {
+      if (launch.remember_tabs && cfg.restore_on_launch) {
         try {
           restored = await tabsLoad();
         } catch (err) {
@@ -142,6 +149,7 @@ export default function App() {
       persistence.remember(restored);
 
       if (restored.length) {
+        setLaunchCommandTabId(null);
         replaceTabs(
           restored.map((r) => ({
             id: r.id ?? null,
@@ -154,16 +162,23 @@ export default function App() {
           })),
         );
       } else {
-        replaceTabs([
+        const launchTabId = launch.command_available ? "launch-command" : null;
+        setLaunchCommandTabId(launchTabId);
+        const [id] = replaceTabs([
           {
-            cwd: defaultLaunchCwd(cfg, home),
+            id: launchTabId,
+            cwd: launch.cwd?.trim() || defaultLaunchCwd(cfg, home),
             shellProfileId: cfg.default_shell_profile_id,
             active: true,
           },
         ]);
+        if (launch.command_available && id !== launchTabId) setLaunchCommandTabId(id);
       }
-      persistence.markReady();
-      persistence.requestSave();
+
+      if (launch.remember_tabs) {
+        persistence.markReady();
+        persistence.requestSave();
+      }
     })();
   }, []);
 
@@ -174,6 +189,7 @@ export default function App() {
           windowMaximized ? "app-window--maximized" : ""
         }`}
         data-ui-theme="phantom"
+        data-platform={isLinuxWindow ? "linux" : undefined}
         data-terminal-background="phantom"
         style={terminalBackgroundOpacityStyle(24)}
       >
@@ -231,6 +247,7 @@ export default function App() {
               active={tab.id === activeId}
               config={config}
               shellProfileId={tab.shellProfileId}
+              useLaunchCommand={tab.id === launchCommandTabId}
               onSpawn={setTabPty}
             />
           )}
@@ -245,6 +262,7 @@ export default function App() {
         windowMaximized ? "app-window--maximized" : ""
       }`}
       data-ui-theme={config.ui_theme}
+      data-platform={isLinuxWindow ? "linux" : undefined}
       data-terminal-background={config.terminal_background}
       style={terminalBackgroundOpacityStyle(config.terminal_background_opacity)}
     >

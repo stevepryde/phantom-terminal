@@ -22,6 +22,11 @@ set -euo pipefail
 note() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+desktop_quote() {
+  local value="${1//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
 
 # Resolve repo root (this script lives in <root>/scripts).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -93,7 +98,30 @@ case "$OS" in
       dst="$INSTALL_DIR/phantom-terminal.AppImage"
       note "Installing AppImage to ${dst}..."
       install -m 0755 "$appimage" "$dst"
+      applications_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+      icons_dir="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/128x128/apps"
+      desktop_file="$applications_dir/com.phantom.terminal.desktop"
+      mkdir -p "$applications_dir" "$icons_dir"
+      install -m 0644 src-tauri/icons/128x128.png "$icons_dir/phantom-terminal.png"
+      {
+        printf '%s\n' '[Desktop Entry]'
+        printf '%s\n' 'Type=Application'
+        printf '%s\n' 'Name=Phantom Terminal'
+        printf '%s\n' 'Comment=A terminal that remembers your tabs and sessions'
+        printf 'Exec=%s %%F\n' "$(desktop_quote "$dst")"
+        printf '%s\n' 'Icon=phantom-terminal'
+        printf '%s\n' 'Terminal=false'
+        printf '%s\n' 'Categories=System;TerminalEmulator;Utility;'
+        printf '%s\n' 'Keywords=terminal;shell;command;prompt;'
+        printf '%s\n' 'MimeType=inode/directory;'
+        printf '%s\n' 'StartupNotify=true'
+        printf '%s\n' 'X-TerminalArgExec=--execute'
+      } > "$desktop_file"
+      if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$applications_dir" >/dev/null 2>&1 || true
+      fi
       note "Done. Launch with: $dst"
+      note "Desktop entry installed: $desktop_file"
       case ":$PATH:" in *":$INSTALL_DIR:"*) ;; *) warn "$INSTALL_DIR is not on your PATH.";; esac
     else
       deb="$(ls -t "$BUNDLE_DIR"/deb/*.deb 2>/dev/null | head -n1 || true)"

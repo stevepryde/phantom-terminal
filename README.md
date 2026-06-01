@@ -38,6 +38,16 @@ Run the hot-reloading desktop app:
 bun run tauri dev
 ```
 
+Launch a fresh, non-remembering window in a specific directory:
+
+```sh
+bun run tauri dev -- -- /path/to/project
+```
+
+Installed builds also accept `/path/to/project`, `--cwd /path/to/project`, and
+`--working-directory /path/to/project`. Those launches use your normal settings,
+but they do not restore remembered tabs and do not update remembered tab state.
+
 Build the frontend:
 
 ```sh
@@ -63,6 +73,11 @@ INSTALL_DIR="$HOME/Applications" bun run update
 
 On macOS, the local install script ad-hoc signs the app and removes the
 quarantine flag for the rebuilt bundle.
+
+On Linux, the local install script also writes
+`~/.local/share/applications/com.phantom.terminal.desktop` with terminal-emulator
+metadata. Desktop environments that use `xdg-terminal-exec` can select it with
+the desktop id `com.phantom.terminal.desktop`.
 
 ## License
 

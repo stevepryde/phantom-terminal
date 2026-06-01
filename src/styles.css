@@ -43,8 +43,18 @@ body {
   background: var(--app-bg);
 }
 
+.app-window[data-platform="linux"] {
+  box-shadow:
+    inset 0 0 0 1px rgba(113, 118, 128, 0.95),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
 .app-window--maximized {
   border-radius: 0;
+}
+
+.app-window--maximized[data-platform="linux"] {
+  box-shadow: none;
 }
 
 .app-window[data-terminal-background="phantom"] {

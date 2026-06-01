@@ -11,6 +11,12 @@ export interface SpawnOpts {
   cols: number;
 }
 
+export interface LaunchContext {
+  cwd?: string | null;
+  remember_tabs: boolean;
+  command_available: boolean;
+}
+
 export interface TabRecord {
   id?: string | null;
   title: string;
@@ -148,6 +154,15 @@ export async function spawnPty(
   return invoke<number>("pty_spawn", { opts, onData: channel });
 }
 
+export async function spawnLaunchPty(
+  opts: Pick<SpawnOpts, "rows" | "cols">,
+  onBytes: (data: Uint8Array) => void,
+): Promise<number> {
+  const channel = new Channel<ArrayBuffer>();
+  channel.onmessage = (msg) => onBytes(new Uint8Array(msg));
+  return invoke<number>("pty_spawn_launch", { opts, onData: channel });
+}
+
 export const ptyWrite = (id: number, data: Uint8Array): Promise<void> =>
   invoke("pty_write_raw", data, { headers: { "Phantom-Pty-Id": String(id) } });
 
@@ -167,3 +182,5 @@ export const configGet = (): Promise<AppConfig> => invoke("config_get");
 export const configSet = (config: AppConfig): Promise<void> => invoke("config_set", { config });
 
 export const homeDir = (): Promise<string | null> => invoke("home_dir");
+
+export const launchContext = (): Promise<LaunchContext> => invoke("launch_context");

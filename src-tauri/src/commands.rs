@@ -4,12 +4,26 @@ use tauri::State;
 
 use crate::config::AppConfig;
 use crate::error::{command_error, AppError};
+use crate::launch::LaunchContext;
 use crate::pty::{LaunchOpts, SpawnOpts};
 use crate::session::TabRecord;
 use crate::AppState;
 
 const MAX_SPAWN_CWD_LEN: usize = 4096;
+const MAX_LAUNCH_COMMAND_LEN: usize = 4096;
+const MAX_LAUNCH_COMMAND_ARGS: usize = 256;
 const PTY_ID_HEADER: &str = "Phantom-Pty-Id";
+
+#[derive(serde::Deserialize)]
+pub struct LaunchSpawnOpts {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[tauri::command]
+pub fn launch_context(state: State<AppState>) -> LaunchContext {
+    state.launch.context()
+}
 
 #[tauri::command]
 pub fn pty_spawn(
@@ -42,6 +56,36 @@ pub fn pty_spawn(
                     Some(profile.command.clone())
                 },
                 args: profile.args.clone(),
+                cwd,
+                rows: opts.rows,
+                cols: opts.cols,
+            },
+            on_data,
+        )
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub fn pty_spawn_launch(
+    state: State<AppState>,
+    opts: LaunchSpawnOpts,
+    on_data: Channel<InvokeResponseBody>,
+) -> Result<u32, String> {
+    let command = state
+        .launch
+        .take_command()
+        .ok_or_else(|| AppError::InvalidConfig("no launch command available".to_string()))
+        .map_err(command_error)?;
+    validate_launch_command(&command.command, &command.args).map_err(command_error)?;
+    let cwd = state.launch.context().cwd.or_else(default_home_dir);
+    validate_spawn_cwd(cwd.as_deref()).map_err(command_error)?;
+
+    state
+        .pty
+        .spawn(
+            LaunchOpts {
+                command: Some(command.command),
+                args: command.args,
                 cwd,
                 rows: opts.rows,
                 cols: opts.cols,
@@ -127,6 +171,34 @@ fn validate_spawn_cwd(cwd: Option<&str>) -> crate::error::AppResult<()> {
     Ok(())
 }
 
+fn validate_launch_command(command: &str, args: &[String]) -> crate::error::AppResult<()> {
+    validate_launch_command_part("launch command", command)?;
+    if args.len() > MAX_LAUNCH_COMMAND_ARGS {
+        return Err(AppError::InvalidConfig(
+            "launch command has too many args".to_string(),
+        ));
+    }
+    for arg in args {
+        validate_launch_command_part("launch command arg", arg)?;
+    }
+    Ok(())
+}
+
+fn validate_launch_command_part(label: &str, value: &str) -> crate::error::AppResult<()> {
+    if value.trim().is_empty() {
+        return Err(AppError::InvalidConfig(format!("{label} cannot be empty")));
+    }
+    if value.len() > MAX_LAUNCH_COMMAND_LEN {
+        return Err(AppError::InvalidConfig(format!("{label} is too long")));
+    }
+    if value.contains('\0') {
+        return Err(AppError::InvalidConfig(format!(
+            "{label} cannot contain NUL bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn pty_id_from_headers(headers: &HeaderMap) -> crate::error::AppResult<u32> {
     let value = headers
         .get(PTY_ID_HEADER)
@@ -166,6 +238,20 @@ mod tests {
         assert_eq!(
             error,
             "invalid config: working directory cannot contain NUL bytes"
+        );
+    }
+
+    #[test]
+    fn validate_launch_command_rejects_empty_or_nul_command_parts() {
+        let error = validate_launch_command("", &[]).unwrap_err().to_string();
+        assert_eq!(error, "invalid config: launch command cannot be empty");
+
+        let error = validate_launch_command("echo", &["hello\0".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid config: launch command arg cannot contain NUL bytes"
         );
     }
 

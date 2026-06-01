@@ -1,7 +1,15 @@
 import { FitAddon, Ghostty, Terminal } from "ghostty-web";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { terminalFontFamilyForRendering } from "../lib/fonts";
-import { type AppConfig, ghosttyTheme, ptyKill, ptyResize, ptyWrite, spawnPty } from "../lib/ipc";
+import {
+  type AppConfig,
+  ghosttyTheme,
+  ptyKill,
+  ptyResize,
+  ptyWrite,
+  spawnLaunchPty,
+  spawnPty,
+} from "../lib/ipc";
 import {
   assertGhosttyContract,
   forceTerminalRender,
@@ -26,10 +34,19 @@ interface Props {
   active: boolean;
   config: AppConfig;
   shellProfileId: string | null;
+  useLaunchCommand?: boolean;
   onSpawn: (tabId: string, ptyId: number) => void;
 }
 
-export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpawn }: Props) {
+export function TerminalView({
+  tabId,
+  cwd,
+  active,
+  config,
+  shellProfileId,
+  useLaunchCommand = false,
+  onSpawn,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -94,20 +111,26 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         fit,
       );
 
-      const ptyId = await spawnPty(
-        {
-          shell_profile_id: shellProfileId,
-          cwd,
-          rows: Math.max(24, term.rows),
-          cols: Math.max(80, term.cols),
-        },
-        (bytes) => {
-          if (bytes.length === 0) {
-            markDead("Process exited");
-            return;
-          }
-          term.write(bytes);
-        },
+      const rows = Math.max(24, term.rows);
+      const cols = Math.max(80, term.cols);
+      const handleBytes = (bytes: Uint8Array) => {
+        if (bytes.length === 0) {
+          markDead("Process exited");
+          return;
+        }
+        term.write(bytes);
+      };
+      const ptyId = await (useLaunchCommand
+        ? spawnLaunchPty({ rows, cols }, handleBytes)
+        : spawnPty(
+            {
+              shell_profile_id: shellProfileId,
+              cwd,
+              rows,
+              cols,
+            },
+            handleBytes,
+          )
       ).catch((err) => {
         markDead(`Process failed to start: ${String(err)}`);
         return null;
