@@ -31,12 +31,17 @@ interface TerminalInternals {
   viewportY?: number;
 }
 
+interface SelectionRenderManager {
+  requestRender?: () => void;
+}
+
 interface RenderLoopTerminalInternals extends TerminalInternals {
   animationFrameId?: number;
   cancelRenderLoop?: () => void;
   startRenderLoop?: () => void;
   options?: Terminal["options"];
   scrollbarOpacity?: number;
+  selectionManager?: SelectionRenderManager;
   write: Terminal["write"];
   writeln: Terminal["writeln"];
   input: Terminal["input"];
@@ -57,6 +62,7 @@ export interface TerminalRenderScheduler {
 }
 
 const adaptiveRenderSchedulers = new WeakMap<Terminal, TerminalRenderScheduler>();
+const selectionRenderManagers = new WeakSet<SelectionRenderManager>();
 
 function internals(term: Terminal): TerminalInternals {
   return term as unknown as TerminalInternals;
@@ -187,6 +193,7 @@ export function installAdaptiveRenderLoop(
     clearScheduledFrame();
   };
   terminal.startRenderLoop = () => {
+    installSelectionRenderHook(term, schedule);
     schedule(false);
     syncCursorBlink();
   };
@@ -258,6 +265,21 @@ export function installAdaptiveRenderLoop(
 
   adaptiveRenderSchedulers.set(term, scheduler);
   return scheduler;
+}
+
+function installSelectionRenderHook(
+  term: Terminal,
+  schedule: TerminalRenderScheduler["schedule"],
+): void {
+  const selectionManager = renderLoopInternals(term).selectionManager;
+  if (!selectionManager || selectionRenderManagers.has(selectionManager)) return;
+
+  const requestRender = selectionManager.requestRender?.bind(selectionManager);
+  selectionManager.requestRender = () => {
+    requestRender?.();
+    schedule(false);
+  };
+  selectionRenderManagers.add(selectionManager);
 }
 
 /**
