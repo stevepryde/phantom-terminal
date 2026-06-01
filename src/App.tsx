@@ -1,5 +1,6 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { CommandPalette } from "./command-palette/CommandPalette";
+import { WindowResizeHandles } from "./components/WindowResizeHandles";
 import { useAppConfig } from "./hooks/useAppConfig";
 import { useDisplayLayoutRefresh } from "./hooks/useDisplayLayoutRefresh";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -37,7 +38,9 @@ import {
 import { TabBar, TitleBarChrome } from "./tabs/TabBar";
 import { TerminalView } from "./terminal/TerminalView";
 
-const isLinuxWindow = typeof navigator !== "undefined" && /\bLinux\b/i.test(navigator.userAgent);
+const isLinuxWindow =
+  typeof navigator !== "undefined" &&
+  (/\bLinux\b/i.test(navigator.userAgent) || /\bLinux\b/i.test(navigator.platform));
 
 export default function App() {
   const tabs = useStore(tabsStore, (s) => s.tabs);
@@ -190,6 +193,7 @@ export default function App() {
         style={terminalBackgroundOpacityStyle(24)}
       >
         Loading…
+        {isLinuxWindow && <WindowResizeHandles disabled={windowMaximized} />}
       </div>
     );
   }
@@ -292,6 +296,7 @@ export default function App() {
           onOpenSettings={openSettingsTab}
         />
       )}
+      {isLinuxWindow && <WindowResizeHandles disabled={windowMaximized} />}
     </div>
   );
 }

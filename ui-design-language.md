@@ -172,3 +172,4 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Settings `Field` | Provides consistent label placement |
 | Profile rows | Clickable list items with aligned metadata, an edit icon, and a star action for default selection |
 | Ephemeral indicator | A small status icon in the titlebar near Settings when launch mode will not restore or save tabs |
+| `WindowResizeHandles` | Linux-only invisible edge handles for the decorationless Tauri window; keep them thin enough to avoid terminal scrollbar conflicts |
