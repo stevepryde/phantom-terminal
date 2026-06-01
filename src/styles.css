@@ -37,16 +37,24 @@ body {
     transparent 32%
   );
   --terminal-ui-wash-opacity: 0.12;
+  position: relative;
   height: 100%;
   overflow: hidden;
   border-radius: 14px;
   background: var(--app-bg);
 }
 
-.app-window[data-platform="linux"] {
+.app-window[data-platform="linux"]::after {
+  position: absolute;
+  inset: 0;
+  z-index: 70;
+  pointer-events: none;
+  border: 1px solid rgba(113, 118, 128, 0.95);
+  border-radius: inherit;
   box-shadow:
-    inset 0 0 0 1px rgba(113, 118, 128, 0.95),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.025);
+  content: "";
 }
 
 .app-window--maximized {
@@ -55,6 +63,10 @@ body {
 
 .app-window--maximized[data-platform="linux"] {
   box-shadow: none;
+}
+
+.app-window--maximized[data-platform="linux"]::after {
+  display: none;
 }
 
 .app-window[data-terminal-background="phantom"] {
@@ -237,6 +249,24 @@ body {
   background: var(--app-bg);
 }
 
+.terminal-emulator {
+  position: absolute;
+  inset: 8px;
+  overflow: hidden;
+}
+
+.terminal-emulator canvas {
+  max-width: none;
+}
+
+/* ghostty-web's FitAddon reserves 15px for its canvas scrollbar when sizing
+   cols, but the canvas itself is only as wide as the text grid. Extending the
+   Linux terminal element by that reserved gutter removes the visible blank
+   strip while preserving the documented 8px text inset. */
+.app-window[data-platform="linux"] .terminal-emulator {
+  right: -7px;
+}
+
 .terminal-ui-background {
   position: absolute;
   inset: 0;
@@ -290,6 +320,86 @@ body {
 }
 .no-drag {
   -webkit-app-region: no-drag;
+}
+
+.window-resize-handles {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+}
+
+.window-resize-handle {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  pointer-events: auto;
+}
+
+.window-resize-handle--north,
+.window-resize-handle--south {
+  right: 12px;
+  left: 12px;
+  height: 5px;
+  cursor: ns-resize;
+}
+
+.window-resize-handle--east,
+.window-resize-handle--west {
+  top: 12px;
+  bottom: 12px;
+  width: 5px;
+  cursor: ew-resize;
+}
+
+.window-resize-handle--north {
+  top: 0;
+}
+
+.window-resize-handle--east {
+  right: 0;
+}
+
+.window-resize-handle--south {
+  bottom: 0;
+}
+
+.window-resize-handle--west {
+  left: 0;
+}
+
+.window-resize-handle--north-east,
+.window-resize-handle--north-west,
+.window-resize-handle--south-east,
+.window-resize-handle--south-west {
+  width: 12px;
+  height: 12px;
+}
+
+.window-resize-handle--north-east {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+
+.window-resize-handle--north-west {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+
+.window-resize-handle--south-east {
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
+}
+
+.window-resize-handle--south-west {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
 }
 
 /* A slim, unobtrusive scrollbar so the horizontal tab strip isn't squashed by

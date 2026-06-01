@@ -77,6 +77,9 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
       // adapter depends on, rather than silently rendering with wrong metrics.
       assertGhosttyContract(term);
       enableTerminalLigatures(term);
+      term.attachCustomWheelEventHandler((event) =>
+        handleMouseTrackingWheel(term, event, containerRef.current),
+      );
       termRef.current = term;
       fitRef.current = fit;
       fit.observeResize();
@@ -252,7 +255,7 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         ref={containerRef}
         role="application"
         aria-label="Terminal"
-        className="absolute inset-2 z-10"
+        className="terminal-emulator z-10"
         onMouseDown={() => termRef.current?.focus()}
       />
       <div aria-hidden className="terminal-ui-background" />
@@ -292,4 +295,82 @@ function scheduleFontSettledRefresh(
       fit?.fit();
       forceTerminalRender(term);
     });
+}
+
+function handleMouseTrackingWheel(
+  term: Terminal,
+  event: WheelEvent,
+  container: HTMLElement | null,
+): boolean {
+  if (event.deltaY === 0 || !container || !terminalHasMouseTracking(term)) return false;
+
+  const cell = wheelEventCell(term, event, container);
+  if (!cell) return false;
+
+  const button = event.deltaY < 0 ? 64 : 65;
+  const sequence = encodeMouseWheel(term, button, cell.col, cell.row, mouseModifiers(event));
+  term.input(sequence, true);
+  return true;
+}
+
+function terminalHasMouseTracking(term: Terminal): boolean {
+  try {
+    return term.hasMouseTracking();
+  } catch {
+    return false;
+  }
+}
+
+function wheelEventCell(
+  term: Terminal,
+  event: WheelEvent,
+  container: HTMLElement,
+): { col: number; row: number } | null {
+  const canvas = container.querySelector("canvas");
+  const rect = (canvas ?? container).getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0 || term.cols <= 0 || term.rows <= 0) return null;
+
+  const cellWidth = rect.width / term.cols;
+  const cellHeight = rect.height / term.rows;
+  return {
+    col: clampCell(Math.floor((event.clientX - rect.left) / cellWidth) + 1, term.cols),
+    row: clampCell(Math.floor((event.clientY - rect.top) / cellHeight) + 1, term.rows),
+  };
+}
+
+function clampCell(value: number, max: number): number {
+  return Math.min(max, Math.max(1, value));
+}
+
+function mouseModifiers(event: WheelEvent): number {
+  let modifiers = 0;
+  if (event.shiftKey) modifiers += 4;
+  if (event.metaKey) modifiers += 8;
+  if (event.ctrlKey) modifiers += 16;
+  return modifiers;
+}
+
+function encodeMouseWheel(
+  term: Terminal,
+  button: 64 | 65,
+  col: number,
+  row: number,
+  modifiers: number,
+): string {
+  if (terminalHasSgrMouseMode(term)) {
+    return `\x1B[<${button + modifiers};${col};${row}M`;
+  }
+
+  const encodedButton = String.fromCharCode(Math.min(button + modifiers + 32, 255));
+  const encodedCol = String.fromCharCode(Math.min(col + 32, 255));
+  const encodedRow = String.fromCharCode(Math.min(row + 32, 255));
+  return `\x1B[M${encodedButton}${encodedCol}${encodedRow}`;
+}
+
+function terminalHasSgrMouseMode(term: Terminal): boolean {
+  try {
+    return term.getMode(1006, false);
+  } catch {
+    return true;
+  }
 }

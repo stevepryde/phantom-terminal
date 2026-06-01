@@ -1,13 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal capability for the main window. Core defaults, our custom PTY/session commands (custom commands need no extra permission), plus the window-control permissions required by the custom (decorationless) title bar. No fs/shell/http/dialog access is granted.",
+  "description": "Minimal capability for the main window. Core defaults, our custom PTY/session commands (custom commands need no extra permission), plus the window-control permissions required by the custom (decorationless) title bar and Linux resize edges. No fs/shell/http/dialog access is granted.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-close",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging"
   ]
 }
