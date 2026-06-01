@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name={{name}}
+Comment={{comment}}
+Exec={{exec}} --cwd %F
+Icon={{icon}}
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=terminal;shell;command;prompt;
+MimeType=inode/directory;
+StartupNotify=true

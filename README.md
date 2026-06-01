@@ -38,6 +38,27 @@ Run the hot-reloading desktop app:
 bun run tauri dev
 ```
 
+Launch a fresh, non-remembering window in a specific directory:
+
+```sh
+bun run tauri dev -- --cwd /path/to/project
+```
+
+Installed builds accept the same `--cwd` launch mode:
+
+```sh
+phantom-terminal --cwd /path/to/project
+```
+
+`--cwd` launches use your normal settings, but they do not restore remembered
+tabs and do not update remembered tab state. Without `--cwd`, Phantom also
+starts in non-remembering mode when it is launched from a non-home, non-root
+working directory. Use `--normal` to force the usual remembered-tabs launch:
+
+```sh
+phantom-terminal --normal
+```
+
 Build the frontend:
 
 ```sh
@@ -63,6 +84,11 @@ INSTALL_DIR="$HOME/Applications" bun run update
 
 On macOS, the local install script ad-hoc signs the app and removes the
 quarantine flag for the rebuilt bundle.
+
+On Linux, the local install script also writes
+`~/.local/share/applications/com.phantom.terminal.desktop` with terminal-emulator
+metadata. Desktop environments that use `xdg-terminal-exec` can select it with
+the desktop id `com.phantom.terminal.desktop`.
 
 ## License
 

@@ -4,12 +4,18 @@ use tauri::State;
 
 use crate::config::AppConfig;
 use crate::error::{command_error, AppError};
+use crate::launch::LaunchContext;
 use crate::pty::{LaunchOpts, SpawnOpts};
 use crate::session::TabRecord;
 use crate::AppState;
 
 const MAX_SPAWN_CWD_LEN: usize = 4096;
 const PTY_ID_HEADER: &str = "Phantom-Pty-Id";
+
+#[tauri::command]
+pub fn launch_context(state: State<AppState>) -> LaunchContext {
+    state.launch.context()
+}
 
 #[tauri::command]
 pub fn pty_spawn(

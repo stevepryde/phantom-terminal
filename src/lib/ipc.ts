@@ -11,6 +11,11 @@ export interface SpawnOpts {
   cols: number;
 }
 
+export interface LaunchContext {
+  cwd?: string | null;
+  remember_tabs: boolean;
+}
+
 export interface TabRecord {
   id?: string | null;
   title: string;
@@ -167,3 +172,5 @@ export const configGet = (): Promise<AppConfig> => invoke("config_get");
 export const configSet = (config: AppConfig): Promise<void> => invoke("config_set", { config });
 
 export const homeDir = (): Promise<string | null> => invoke("home_dir");
+
+export const launchContext = (): Promise<LaunchContext> => invoke("launch_context");

@@ -123,6 +123,7 @@ Inputs, dropdowns, and adjacent buttons should share heights within a row.
 | Element | Radius | Guidance |
 | --- | --- | --- |
 | Window | `14px`, `0` maximized | Matches transparent macOS shell |
+| Linux window edge | `14px`, `0` maximized | Use a 1px Breeze-like inset outline on undecorated Linux windows so dark desktops still show a clear app edge |
 | Buttons and inputs | `4px` | Compact and utilitarian |
 | Menus and panels | `4px` | Use borders and background contrast |
 | Cards | `4px` | Use sparingly for repeated items only |
@@ -170,3 +171,4 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Settings `Section` | Provides title, hint, and vertical rhythm |
 | Settings `Field` | Provides consistent label placement |
 | Profile rows | Clickable list items with aligned metadata, an edit icon, and a star action for default selection |
+| Ephemeral indicator | A small status icon in the titlebar near Settings when launch mode will not restore or save tabs |

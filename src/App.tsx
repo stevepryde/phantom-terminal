@@ -10,6 +10,7 @@ import {
   type AppConfig,
   configGet,
   homeDir,
+  launchContext,
   ptyCwd,
   type TabRecord,
   tabsLoad,
@@ -36,12 +37,15 @@ import {
 import { TabBar, TitleBarChrome } from "./tabs/TabBar";
 import { TerminalView } from "./terminal/TerminalView";
 
+const isLinuxWindow = typeof navigator !== "undefined" && /\bLinux\b/i.test(navigator.userAgent);
+
 export default function App() {
   const tabs = useStore(tabsStore, (s) => s.tabs);
   const activeId = useStore(tabsStore, (s) => s.activeId);
   const { config, configError, configRef, initConfig, updateConfig } = useAppConfig();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [ephemeralMode, setEphemeralMode] = useState(false);
   const homePathRef = useRef<string | null>(null);
 
   const chromePaintRevision = useDisplayLayoutRefresh();
@@ -119,19 +123,23 @@ export default function App() {
   useEffect(() => {
     (async () => {
       const cfg = await configGet();
+      const launch = await launchContext();
+      setEphemeralMode(!launch.remember_tabs);
       initConfig(cfg);
       const home = await homeDir().catch(() => null);
       homePathRef.current = home;
       setHomeDir(home);
 
       if (tabsStore.state.tabs.length) {
-        persistence.markReady();
-        persistence.requestSave();
+        if (launch.remember_tabs) {
+          persistence.markReady();
+          persistence.requestSave();
+        }
         return;
       }
 
       let restored: TabRecord[] = [];
-      if (cfg.restore_on_launch) {
+      if (launch.remember_tabs && cfg.restore_on_launch) {
         try {
           restored = await tabsLoad();
         } catch (err) {
@@ -156,14 +164,17 @@ export default function App() {
       } else {
         replaceTabs([
           {
-            cwd: defaultLaunchCwd(cfg, home),
+            cwd: launch.cwd?.trim() || defaultLaunchCwd(cfg, home),
             shellProfileId: cfg.default_shell_profile_id,
             active: true,
           },
         ]);
       }
-      persistence.markReady();
-      persistence.requestSave();
+
+      if (launch.remember_tabs) {
+        persistence.markReady();
+        persistence.requestSave();
+      }
     })();
   }, []);
 
@@ -174,6 +185,7 @@ export default function App() {
           windowMaximized ? "app-window--maximized" : ""
         }`}
         data-ui-theme="phantom"
+        data-platform={isLinuxWindow ? "linux" : undefined}
         data-terminal-background="phantom"
         style={terminalBackgroundOpacityStyle(24)}
       >
@@ -199,6 +211,7 @@ export default function App() {
     },
     onCancelRename: () => setEditingId(null),
     onOpenSettings: openSettingsTab,
+    ephemeralMode,
   };
 
   const tabContent = (
@@ -245,6 +258,7 @@ export default function App() {
         windowMaximized ? "app-window--maximized" : ""
       }`}
       data-ui-theme={config.ui_theme}
+      data-platform={isLinuxWindow ? "linux" : undefined}
       data-terminal-background={config.terminal_background}
       style={terminalBackgroundOpacityStyle(config.terminal_background_opacity)}
     >
@@ -255,7 +269,11 @@ export default function App() {
         </>
       ) : (
         <>
-          <TitleBarChrome paintRevision={chromePaintRevision} onOpenSettings={openSettingsTab} />
+          <TitleBarChrome
+            paintRevision={chromePaintRevision}
+            ephemeralMode={ephemeralMode}
+            onOpenSettings={openSettingsTab}
+          />
           <div className="flex min-h-0 flex-1">
             <TabBar layout={tabLayout} {...tabBarProps} />
             {tabContent}

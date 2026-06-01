@@ -94,12 +94,14 @@ export function TerminalView({ tabId, cwd, active, config, shellProfileId, onSpa
         fit,
       );
 
+      const rows = Math.max(24, term.rows);
+      const cols = Math.max(80, term.cols);
       const ptyId = await spawnPty(
         {
           shell_profile_id: shellProfileId,
           cwd,
-          rows: Math.max(24, term.rows),
-          cols: Math.max(80, term.cols),
+          rows,
+          cols,
         },
         (bytes) => {
           if (bytes.length === 0) {
