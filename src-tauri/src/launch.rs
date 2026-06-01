@@ -74,22 +74,35 @@ where
         };
     }
 
+    let mut saw_empty_cwd_request = false;
     for (index, arg) in args.iter().enumerate() {
         if arg == "--cwd" {
-            if let Some(path) = args.get(index + 1).filter(|path| !option_like(path)) {
+            if let Some(path) = args
+                .get(index + 1)
+                .filter(|path| !option_like(path) && !path.is_empty())
+            {
                 return ParsedLaunch {
                     cwd: resolve_launch_cwd(path, current_dir),
                     remember_tabs: false,
                 };
             }
+            saw_empty_cwd_request = true;
         }
 
         if let Some(value) = option_value(arg, "--cwd=") {
+            if value.is_empty() {
+                saw_empty_cwd_request = true;
+                continue;
+            }
             return ParsedLaunch {
                 cwd: resolve_launch_cwd(&OsString::from(value), current_dir),
                 remember_tabs: false,
             };
         }
+    }
+
+    if saw_empty_cwd_request {
+        return ParsedLaunch::default();
     }
 
     let cwd = implicit_launch_cwd(current_dir, home_dir);
@@ -242,6 +255,26 @@ mod tests {
 
         assert!(!state.context().remember_tabs);
         assert!(state.context().cwd.as_deref().unwrap().ends_with("src"));
+    }
+
+    #[test]
+    fn bare_cwd_option_keeps_remembered_tabs_enabled() {
+        let cwd = env::current_dir().unwrap();
+        let parsed = parse(&["--cwd"], &cwd, cwd.parent());
+        let state = parsed_args_to_state(parsed);
+
+        assert!(state.context().remember_tabs);
+        assert_eq!(state.context().cwd, None);
+    }
+
+    #[test]
+    fn empty_cwd_option_value_keeps_remembered_tabs_enabled() {
+        let cwd = env::current_dir().unwrap();
+        let parsed = parse(&["--cwd="], &cwd, cwd.parent());
+        let state = parsed_args_to_state(parsed);
+
+        assert!(state.context().remember_tabs);
+        assert_eq!(state.context().cwd, None);
     }
 
     #[test]
