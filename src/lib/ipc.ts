@@ -14,7 +14,6 @@ export interface SpawnOpts {
 export interface LaunchContext {
   cwd?: string | null;
   remember_tabs: boolean;
-  command_available: boolean;
 }
 
 export interface TabRecord {
@@ -152,15 +151,6 @@ export async function spawnPty(
   const channel = new Channel<ArrayBuffer>();
   channel.onmessage = (msg) => onBytes(new Uint8Array(msg));
   return invoke<number>("pty_spawn", { opts, onData: channel });
-}
-
-export async function spawnLaunchPty(
-  opts: Pick<SpawnOpts, "rows" | "cols">,
-  onBytes: (data: Uint8Array) => void,
-): Promise<number> {
-  const channel = new Channel<ArrayBuffer>();
-  channel.onmessage = (msg) => onBytes(new Uint8Array(msg));
-  return invoke<number>("pty_spawn_launch", { opts, onData: channel });
 }
 
 export const ptyWrite = (id: number, data: Uint8Array): Promise<void> =>

@@ -41,12 +41,23 @@ bun run tauri dev
 Launch a fresh, non-remembering window in a specific directory:
 
 ```sh
-bun run tauri dev -- -- /path/to/project
+bun run tauri dev -- --cwd /path/to/project
 ```
 
-Installed builds also accept `/path/to/project`, `--cwd /path/to/project`, and
-`--working-directory /path/to/project`. Those launches use your normal settings,
-but they do not restore remembered tabs and do not update remembered tab state.
+Installed builds accept the same `--cwd` launch mode:
+
+```sh
+phantom-terminal --cwd /path/to/project
+```
+
+`--cwd` launches use your normal settings, but they do not restore remembered
+tabs and do not update remembered tab state. Without `--cwd`, Phantom also
+starts in non-remembering mode when it is launched from a non-home, non-root
+working directory. Use `--normal` to force the usual remembered-tabs launch:
+
+```sh
+phantom-terminal --normal
+```
 
 Build the frontend:
 

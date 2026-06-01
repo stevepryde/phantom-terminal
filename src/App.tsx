@@ -45,7 +45,7 @@ export default function App() {
   const { config, configError, configRef, initConfig, updateConfig } = useAppConfig();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [launchCommandTabId, setLaunchCommandTabId] = useState<string | null>(null);
+  const [ephemeralMode, setEphemeralMode] = useState(false);
   const homePathRef = useRef<string | null>(null);
 
   const chromePaintRevision = useDisplayLayoutRefresh();
@@ -124,6 +124,7 @@ export default function App() {
     (async () => {
       const cfg = await configGet();
       const launch = await launchContext();
+      setEphemeralMode(!launch.remember_tabs);
       initConfig(cfg);
       const home = await homeDir().catch(() => null);
       homePathRef.current = home;
@@ -149,7 +150,6 @@ export default function App() {
       persistence.remember(restored);
 
       if (restored.length) {
-        setLaunchCommandTabId(null);
         replaceTabs(
           restored.map((r) => ({
             id: r.id ?? null,
@@ -162,17 +162,13 @@ export default function App() {
           })),
         );
       } else {
-        const launchTabId = launch.command_available ? "launch-command" : null;
-        setLaunchCommandTabId(launchTabId);
-        const [id] = replaceTabs([
+        replaceTabs([
           {
-            id: launchTabId,
             cwd: launch.cwd?.trim() || defaultLaunchCwd(cfg, home),
             shellProfileId: cfg.default_shell_profile_id,
             active: true,
           },
         ]);
-        if (launch.command_available && id !== launchTabId) setLaunchCommandTabId(id);
       }
 
       if (launch.remember_tabs) {
@@ -215,6 +211,7 @@ export default function App() {
     },
     onCancelRename: () => setEditingId(null),
     onOpenSettings: openSettingsTab,
+    ephemeralMode,
   };
 
   const tabContent = (
@@ -247,7 +244,6 @@ export default function App() {
               active={tab.id === activeId}
               config={config}
               shellProfileId={tab.shellProfileId}
-              useLaunchCommand={tab.id === launchCommandTabId}
               onSpawn={setTabPty}
             />
           )}
@@ -273,7 +269,11 @@ export default function App() {
         </>
       ) : (
         <>
-          <TitleBarChrome paintRevision={chromePaintRevision} onOpenSettings={openSettingsTab} />
+          <TitleBarChrome
+            paintRevision={chromePaintRevision}
+            ephemeralMode={ephemeralMode}
+            onOpenSettings={openSettingsTab}
+          />
           <div className="flex min-h-0 flex-1">
             <TabBar layout={tabLayout} {...tabBarProps} />
             {tabContent}

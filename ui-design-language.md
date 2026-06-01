@@ -171,3 +171,4 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Settings `Section` | Provides title, hint, and vertical rhythm |
 | Settings `Field` | Provides consistent label placement |
 | Profile rows | Clickable list items with aligned metadata, an edit icon, and a star action for default selection |
+| Ephemeral indicator | A small status icon in the titlebar near Settings when launch mode will not restore or save tabs |

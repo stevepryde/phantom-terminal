@@ -1,4 +1,4 @@
-import { Plus, Settings, X } from "lucide-react";
+import { History, Plus, Settings, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { IconButton } from "../components/IconButton";
 import { WindowControls } from "../components/WindowControls";
@@ -20,6 +20,7 @@ interface Props {
   onCommitRename: (id: string, title: string) => void;
   onCancelRename: () => void;
   onOpenSettings: () => void;
+  ephemeralMode: boolean;
 }
 
 const TAB_SIDEBAR_WIDTH_KEY = "phantom.tabSidebarWidth";
@@ -30,9 +31,14 @@ const TAB_SIDEBAR_DEFAULT = 208;
 interface TitleBarChromeProps {
   paintRevision?: number;
   onOpenSettings: () => void;
+  ephemeralMode: boolean;
 }
 
-export function TitleBarChrome({ paintRevision = 0, onOpenSettings }: TitleBarChromeProps) {
+export function TitleBarChrome({
+  paintRevision = 0,
+  onOpenSettings,
+  ephemeralMode,
+}: TitleBarChromeProps) {
   return (
     <div
       data-tauri-drag-region
@@ -44,6 +50,7 @@ export function TitleBarChrome({ paintRevision = 0, onOpenSettings }: TitleBarCh
       <WindowControls placement="leading" />
       <div aria-hidden className="min-w-0 flex-1" data-tauri-drag-region />
       <div className="ml-auto flex items-stretch gap-1">
+        {ephemeralMode && <EphemeralIndicator />}
         <IconButton
           icon={Settings}
           label="Settings"
@@ -72,6 +79,7 @@ export function TabBar({
   onCommitRename,
   onCancelRename,
   onOpenSettings,
+  ephemeralMode,
 }: Props) {
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const activeIndex = tabs.findIndex((tab) => tab.id === activeId);
@@ -415,6 +423,7 @@ export function TabBar({
           onClick={onAdd}
         />
         <div className="ml-auto flex items-stretch gap-1">
+          {ephemeralMode && <EphemeralIndicator />}
           <IconButton
             icon={Settings}
             label="Settings"
@@ -428,6 +437,19 @@ export function TabBar({
       </div>
       {menuNode}
     </>
+  );
+}
+
+function EphemeralIndicator() {
+  return (
+    <div
+      role="img"
+      aria-label="Ephemeral session"
+      title="Ephemeral session: tabs will not be remembered"
+      className="my-1.5 flex h-7 w-7 shrink-0 items-center justify-center rounded text-sky-200/70"
+    >
+      <History aria-hidden size={17} strokeWidth={1.8} />
+    </div>
   );
 }
 

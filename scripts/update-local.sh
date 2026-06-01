@@ -108,14 +108,13 @@ case "$OS" in
         printf '%s\n' 'Type=Application'
         printf '%s\n' 'Name=Phantom Terminal'
         printf '%s\n' 'Comment=A terminal that remembers your tabs and sessions'
-        printf 'Exec=%s %%F\n' "$(desktop_quote "$dst")"
+        printf 'Exec=%s --cwd %%F\n' "$(desktop_quote "$dst")"
         printf '%s\n' 'Icon=phantom-terminal'
         printf '%s\n' 'Terminal=false'
         printf '%s\n' 'Categories=System;TerminalEmulator;Utility;'
         printf '%s\n' 'Keywords=terminal;shell;command;prompt;'
         printf '%s\n' 'MimeType=inode/directory;'
         printf '%s\n' 'StartupNotify=true'
-        printf '%s\n' 'X-TerminalArgExec=--execute'
       } > "$desktop_file"
       if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$applications_dir" >/dev/null 2>&1 || true
