@@ -88,7 +88,10 @@ quarantine flag for the rebuilt bundle.
 On Linux, the local install script also writes
 `~/.local/share/applications/com.phantom.terminal.desktop` with terminal-emulator
 metadata. Desktop environments that use `xdg-terminal-exec` can select it with
-the desktop id `com.phantom.terminal.desktop`.
+the desktop id `com.phantom.terminal.desktop`. The desktop launcher's `Exec`
+line intentionally starts Phantom in normal remembered-tabs mode; only
+`xdg-terminal-exec` uses the `X-TerminalArgDir=--cwd` metadata for cwd-specific,
+ephemeral launches.
 
 ## License
 
