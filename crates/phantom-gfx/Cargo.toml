@@ -1,0 +1,34 @@
+[package]
+name = "phantom-gfx"
+version = "0.1.2"
+description = "Phantom Terminal GPU grid renderer: glyph atlas + instanced wgpu pipelines"
+authors = ["Steve Pryde"]
+license = "MIT"
+edition = "2021"
+
+# Hand-rolled wgpu terminal renderer. Rasterizes the configured font with swash
+# (faces discovered via fontdb) into a glyph atlas, then draws the grid with two
+# instanced pipelines: solid quads (backgrounds, cursor, underline/strike) and
+# textured glyph quads (alpha-mask tinted by fg, plus colour-emoji passthrough).
+[dependencies]
+wgpu = "29"
+swash = "0.2"
+fontdb = "0.23"
+bytemuck = { version = "1", features = ["derive"] }
+phantom-core = { version = "0.1.2", path = "../phantom-core" }
+phantom-emu = { version = "0.1.2", path = "../phantom-emu" }
+# Only used by the optional headless offscreen-render harness; not in the app.
+pollster = { version = "0.4", optional = true }
+
+[features]
+# Offscreen render-to-image harness (`phantom_gfx::headless`) for pixel tests and
+# snapshot dumps. Off by default so the shipped app build never pulls pollster.
+headless = ["dep:pollster"]
+
+[dev-dependencies]
+# PNG encoding for the `snapshot` example's image dump.
+png = "0.17"
+
+[[example]]
+name = "snapshot"
+required-features = ["headless"]

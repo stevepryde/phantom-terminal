@@ -1,0 +1,15 @@
+[package]
+name = "phantom-emu"
+version = "0.1.2"
+description = "Phantom Terminal VT core: PTY bytes -> grid snapshot + key encoding, behind a swappable VtCore trait"
+authors = ["Steve Pryde"]
+license = "MIT"
+edition = "2021"
+
+# The terminal model lives behind the `VtCore` trait. Today it is backed by
+# `alacritty_terminal` (the Zed approach: borrow a battle-tested core, own the
+# renderer); the trait keeps the engine swappable (e.g. libghostty-vt) without
+# touching `phantom-gfx`/`phantom-app`. Pinned exactly because the crate makes
+# no API-stability guarantee.
+[dependencies]
+alacritty_terminal = "=0.26.0"
