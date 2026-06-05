@@ -355,7 +355,7 @@ impl App {
     }
 
     fn content_width(&self, width: u32) -> f32 {
-        (width as f32 - self.ui.panel_width_px()).max(1.0)
+        width.max(1) as f32
     }
 
     /// Cell grid `(rows, cols)` that fits the terminal viewport.
@@ -1230,7 +1230,7 @@ impl App {
         };
         let (w, h) = gpu.size();
         let layout = chrome::compute_layout(
-            (w as f32 - self.ui.panel_width_px()).max(1.0),
+            w.max(1) as f32,
             h as f32,
             renderer.cell_size().1,
             self.config.tab_layout != "vertical",

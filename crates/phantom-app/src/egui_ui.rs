@@ -104,14 +104,6 @@ impl UiState {
         self.active_panel == Some(PanelKind::Settings)
     }
 
-    pub fn panel_width_px(&self) -> f32 {
-        if self.active_panel.is_some() {
-            self.panel_width_px
-        } else {
-            0.0
-        }
-    }
-
     fn draw(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
         if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
             self.close_panel();
@@ -407,10 +399,10 @@ fn configure_style(ctx: &Context) {
 
 fn panel_frame() -> egui::Frame {
     egui::Frame::side_top_panel(&egui::Style::default())
-        .fill(Color32::from_rgb(17, 17, 22))
+        .fill(Color32::from_rgba_unmultiplied(17, 17, 22, 238))
         .stroke(egui::Stroke::new(
             1.0,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 32),
         ))
         .inner_margin(egui::Margin::same(18))
 }
@@ -592,18 +584,15 @@ mod tests {
     }
 
     #[test]
-    fn ui_state_tracks_settings_panel_width_only_when_open() {
+    fn ui_state_clears_settings_panel_width_when_closed() {
         let config = AppConfig::default();
         let mut state = UiState::new(&config);
-        state.panel_width_px = 320.0;
-        assert_eq!(state.panel_width_px(), 0.0);
 
         state.open_settings(&config);
         state.panel_width_px = 320.0;
-        assert_eq!(state.panel_width_px(), 320.0);
 
         state.close_panel();
-        assert_eq!(state.panel_width_px(), 0.0);
+        assert_eq!(state.panel_width_px, 0.0);
     }
 
     #[test]

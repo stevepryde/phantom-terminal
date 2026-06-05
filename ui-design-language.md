@@ -191,10 +191,10 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Pattern | Rule |
 | --- | --- |
 | Control plane | egui is the default UI for all non-terminal native surfaces |
-| Panel placement | Prefer a wide right side panel for contextual tools and settings; overlays remain acceptable for transient command search |
+| Panel placement | Prefer a wide right overlay panel for contextual tools and settings. Settings should float above the terminal instead of resizing the terminal grid; reserve terminal-resizing panels for explicit future workflow surfaces. |
 | Panel navigation | Multi-section panels use a fixed vertical tab rail at the left of the panel. Keep the rail wide enough for readable labels and keep the active tab visually selected. |
-| Styling | Use Phantom dark surfaces, compact spacing, low rounding, and cyan accent focus/selection states via egui `Visuals` and `Style` |
+| Styling | Use Phantom dark surfaces, compact spacing, low rounding, and cyan accent focus/selection states via egui `Visuals` and `Style`. Settings panels may be subtly translucent, but stay near-opaque enough for form readability. |
 | Settings | Autosave on change through validated `AppConfig`; edit drafts may exist inside widgets, but committed config must still validate in Rust |
 | Numeric controls | Use sliders, drag values, or paired steppers/text input; never rely on single-click increment-only behavior |
 | Contextual panels | Model future panels as typed app state such as Settings, Search, Shell Profile, Command Details, or Task Output |
-| Terminal boundary | egui panels may resize or reserve space around the terminal, but must not own terminal glyph rendering or PTY state |
+| Terminal boundary | egui panels may overlay the terminal and capture input while open, but must not own terminal glyph rendering or PTY state. Do not resize the terminal grid for settings overlays. |
