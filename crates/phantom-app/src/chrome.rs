@@ -1,6 +1,8 @@
 //! Native chrome: window layout and the tab bar. Drawn with the phantom-gfx
 //! frame API; returns hit regions so the app can route clicks.
 
+use std::time::Instant;
+
 use phantom_gfx::Renderer;
 
 const PAD: f32 = 8.0;
@@ -10,6 +12,8 @@ const SETTINGS_W: f32 = 34.0;
 const MAX_TAB_W: f32 = 220.0;
 const MIN_TAB_W: f32 = 70.0;
 const TERMINAL_MARGIN: f32 = 8.0;
+const HOVER_FADE_SECONDS: f32 = 0.14;
+const HOVER_EPSILON: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -109,6 +113,104 @@ pub struct TabBarHits {
     pub settings: Rect,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChromeHoverTarget {
+    #[default]
+    None,
+    Tab(usize),
+    Close(usize),
+    Settings,
+}
+
+impl ChromeHoverTarget {
+    pub fn is_clickable(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Default)]
+pub struct ChromeAnimationState {
+    hover: ChromeHoverTarget,
+    tab_hover: Vec<f32>,
+    close_hover: Vec<f32>,
+    settings_hover: f32,
+    last_tick: Option<Instant>,
+}
+
+impl ChromeAnimationState {
+    pub fn set_hover(&mut self, hover: ChromeHoverTarget) -> bool {
+        if self.hover == hover {
+            return false;
+        }
+        self.hover = hover;
+        true
+    }
+
+    pub fn advance(&mut self, now: Instant, tab_count: usize) -> bool {
+        self.tab_hover.resize(tab_count, 0.0);
+        self.close_hover.resize(tab_count, 0.0);
+
+        let dt = self.last_tick.map_or(1.0 / 60.0, |last| {
+            now.saturating_duration_since(last).as_secs_f32()
+        });
+        self.last_tick = Some(now);
+        let amount = (dt / HOVER_FADE_SECONDS).clamp(0.0, 1.0);
+
+        let mut animating = false;
+        for index in 0..tab_count {
+            let tab_target = match self.hover {
+                ChromeHoverTarget::Tab(i) | ChromeHoverTarget::Close(i) if i == index => 1.0,
+                _ => 0.0,
+            };
+            let close_target = if self.hover == ChromeHoverTarget::Close(index) {
+                1.0
+            } else {
+                0.0
+            };
+            animating |= ease_value(&mut self.tab_hover[index], tab_target, amount);
+            animating |= ease_value(&mut self.close_hover[index], close_target, amount);
+        }
+        let settings_target = if self.hover == ChromeHoverTarget::Settings {
+            1.0
+        } else {
+            0.0
+        };
+        animating |= ease_value(&mut self.settings_hover, settings_target, amount);
+        animating
+    }
+
+    fn tab(&self, index: usize) -> f32 {
+        self.tab_hover.get(index).copied().unwrap_or_default()
+    }
+
+    fn close(&self, index: usize) -> f32 {
+        self.close_hover.get(index).copied().unwrap_or_default()
+    }
+
+    fn settings(&self) -> f32 {
+        self.settings_hover
+    }
+}
+
+impl TabBarHits {
+    pub fn hover_target(&self, px: f32, py: f32) -> ChromeHoverTarget {
+        if self.settings.contains(px, py) {
+            return ChromeHoverTarget::Settings;
+        }
+        for tab in &self.tabs {
+            if tab.close.contains(px, py) {
+                return ChromeHoverTarget::Close(tab.index);
+            }
+        }
+        for tab in &self.tabs {
+            if tab.rect.contains(px, py) {
+                return ChromeHoverTarget::Tab(tab.index);
+            }
+        }
+        ChromeHoverTarget::None
+    }
+}
+
 /// Draw the tab bar and return click regions. `titles` and `active` describe the
 /// open tabs.
 #[allow(clippy::too_many_arguments)]
@@ -121,6 +223,7 @@ pub fn draw_tab_bar(
     colors: &ChromeColors,
     rename: Option<&str>,
     settings_open: bool,
+    animations: &ChromeAnimationState,
 ) -> TabBarHits {
     let bar = layout.bar;
     r.fill_rect(bar.x, bar.y, bar.w, bar.h, colors.bar_bg);
@@ -157,6 +260,7 @@ pub fn draw_tab_bar(
                 colors,
                 cell_w,
                 true,
+                animations.tab(i),
                 editing,
             );
             let close = Rect {
@@ -165,7 +269,7 @@ pub fn draw_tab_bar(
                 w: CLOSE_W,
                 h: rect.h,
             };
-            r.text(queue, close.x, close.y + PAD, "x", colors.dim_text);
+            draw_close_button(r, queue, close, colors, animations.close(i));
             tabs.push(TabHit {
                 index: i,
                 rect,
@@ -180,7 +284,7 @@ pub fn draw_tab_bar(
             h: tab_h,
         };
         r.text(queue, new_tab.x + PAD, new_tab.y + PAD, "+", colors.text);
-        draw_settings_button(r, queue, settings, colors, settings_open);
+        draw_settings_button(r, settings, colors, settings_open, animations.settings());
         TabBarHits {
             tabs,
             new_tab,
@@ -213,6 +317,7 @@ pub fn draw_tab_bar(
                 colors,
                 cell_w,
                 false,
+                animations.tab(i),
                 editing,
             );
             let close = Rect {
@@ -221,7 +326,7 @@ pub fn draw_tab_bar(
                 w: CLOSE_W,
                 h: rect.h,
             };
-            r.text(queue, close.x, close.y + PAD, "x", colors.dim_text);
+            draw_close_button(r, queue, close, colors, animations.close(i));
             tabs.push(TabHit {
                 index: i,
                 rect,
@@ -242,7 +347,7 @@ pub fn draw_tab_bar(
             "+ new tab",
             colors.dim_text,
         );
-        draw_settings_button(r, queue, settings, colors, settings_open);
+        draw_settings_button(r, settings, colors, settings_open, animations.settings());
         TabBarHits {
             tabs,
             new_tab,
@@ -253,11 +358,12 @@ pub fn draw_tab_bar(
 
 fn draw_settings_button(
     r: &mut Renderer,
-    queue: &wgpu::Queue,
     rect: Rect,
     colors: &ChromeColors,
     active: bool,
+    hover: f32,
 ) {
+    let hover = hover.clamp(0.0, 1.0);
     if active {
         r.fill_rect(
             rect.x + 4.0,
@@ -274,12 +380,64 @@ fn draw_settings_button(
             colors.accent,
         );
     }
+    let (cell_w, cell_h) = r.cell_size();
+    let base_icon = if active { colors.text } else { colors.dim_text };
+    let color = mix(base_icon, colors.accent, hover);
+    draw_settings_icon(
+        r,
+        rect.x + (rect.w - cell_w) * 0.5,
+        rect.y + (rect.h - cell_h) * 0.5,
+        cell_w,
+        cell_h,
+        color,
+    );
+}
+
+fn draw_settings_icon(r: &mut Renderer, x: f32, y: f32, w: f32, h: f32, color: [u8; 4]) {
+    let line_w = (w * 0.9).max(12.0);
+    let line_h = 2.0;
+    let knob = 4.0;
+    let left = x + (w - line_w) * 0.5;
+    let top = y + h * 0.28;
+    let gap = h * 0.22;
+    for (row, knob_offset) in [(0.0, 0.22), (1.0, 0.68), (2.0, 0.42)] {
+        let line_y = top + row * gap;
+        r.fill_rect(left, line_y, line_w, line_h, color);
+        r.fill_rect(
+            left + line_w * knob_offset - knob * 0.5,
+            line_y - 1.0,
+            knob,
+            knob,
+            color,
+        );
+    }
+}
+
+fn draw_close_button(
+    r: &mut Renderer,
+    queue: &wgpu::Queue,
+    rect: Rect,
+    colors: &ChromeColors,
+    hover: f32,
+) {
+    let hover = hover.clamp(0.0, 1.0);
+    if hover > 0.0 {
+        let size = rect.w.min(rect.h) - 4.0;
+        r.fill_rect(
+            rect.x + (rect.w - size) * 0.5,
+            rect.y + (rect.h - size) * 0.5,
+            size,
+            size,
+            with_alpha(colors.accent, (32.0 * hover) as u8),
+        );
+    }
+    let (cell_w, cell_h) = r.cell_size();
     r.text(
         queue,
-        rect.x + PAD,
-        rect.y + PAD,
-        "\u{2699}",
-        if active { colors.text } else { colors.dim_text },
+        rect.x + (rect.w - cell_w) * 0.5,
+        rect.y + (rect.h - cell_h) * 0.5,
+        "\u{00d7}",
+        mix(colors.dim_text, colors.accent, hover),
     );
 }
 
@@ -293,8 +451,10 @@ fn draw_tab_label(
     colors: &ChromeColors,
     cell_w: f32,
     underline_accent: bool,
+    hover: f32,
     editing: Option<&str>,
 ) {
+    let hover = hover.clamp(0.0, 1.0);
     r.fill_rect(
         rect.x,
         rect.y,
@@ -306,6 +466,15 @@ fn draw_tab_label(
             colors.bar_bg
         },
     );
+    if hover > 0.0 {
+        r.fill_rect(
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            with_alpha(colors.text, (22.0 * hover) as u8),
+        );
+    }
     if active && underline_accent {
         r.fill_rect(rect.x, rect.y + rect.h - 2.0, rect.w, 2.0, colors.accent);
     } else if active {
@@ -351,6 +520,21 @@ fn truncate_left(s: &str, max: usize) -> String {
         return s.to_string();
     }
     s.chars().skip(count - max).collect()
+}
+
+fn ease_value(value: &mut f32, target: f32, amount: f32) -> bool {
+    *value += (target - *value) * amount;
+    if (*value - target).abs() <= HOVER_EPSILON {
+        *value = target;
+        false
+    } else {
+        true
+    }
+}
+
+fn with_alpha(mut color: [u8; 4], alpha: u8) -> [u8; 4] {
+    color[3] = alpha;
+    color
 }
 
 fn shade(c: [u8; 4], factor: f32) -> [u8; 4] {
@@ -403,6 +587,75 @@ mod tests {
         assert!(r.contains(29.9, 29.9));
         assert!(!r.contains(30.0, 20.0));
         assert!(!r.contains(9.9, 20.0));
+    }
+
+    #[test]
+    fn hover_target_prefers_close_over_tab() {
+        let hits = TabBarHits {
+            tabs: vec![TabHit {
+                index: 0,
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 100.0,
+                    h: 30.0,
+                },
+                close: Rect {
+                    x: 80.0,
+                    y: 0.0,
+                    w: 20.0,
+                    h: 30.0,
+                },
+            }],
+            new_tab: Rect {
+                x: 100.0,
+                y: 0.0,
+                w: 30.0,
+                h: 30.0,
+            },
+            settings: Rect {
+                x: 130.0,
+                y: 0.0,
+                w: 30.0,
+                h: 30.0,
+            },
+        };
+
+        assert_eq!(hits.hover_target(10.0, 10.0), ChromeHoverTarget::Tab(0));
+        assert_eq!(hits.hover_target(90.0, 10.0), ChromeHoverTarget::Close(0));
+        assert_eq!(hits.hover_target(140.0, 10.0), ChromeHoverTarget::Settings);
+    }
+
+    #[test]
+    fn chrome_animation_eases_toward_hover_target() {
+        let now = Instant::now();
+        let mut state = ChromeAnimationState::default();
+        assert!(state.set_hover(ChromeHoverTarget::Settings));
+        assert!(state.advance(now, 1));
+        assert!(state.settings() > 0.0);
+
+        assert!(state.set_hover(ChromeHoverTarget::None));
+        assert!(!state.advance(now + std::time::Duration::from_millis(500), 1));
+        assert_eq!(state.settings(), 0.0);
+    }
+
+    #[test]
+    fn chrome_hover_targets_report_clickability() {
+        assert!(!ChromeHoverTarget::None.is_clickable());
+        assert!(ChromeHoverTarget::Tab(0).is_clickable());
+        assert!(ChromeHoverTarget::Close(0).is_clickable());
+        assert!(ChromeHoverTarget::Settings.is_clickable());
+    }
+
+    #[test]
+    fn close_hover_keeps_parent_tab_hovered() {
+        let now = Instant::now();
+        let mut state = ChromeAnimationState::default();
+        assert!(state.set_hover(ChromeHoverTarget::Close(0)));
+        assert!(state.advance(now, 1));
+
+        assert!(state.tab(0) > 0.0);
+        assert!(state.close(0) > 0.0);
     }
 
     #[test]

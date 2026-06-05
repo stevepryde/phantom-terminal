@@ -43,7 +43,7 @@ use tab::Tab;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -131,7 +131,10 @@ pub struct App {
     next_tab_id: u64,
 
     cursor_pos: (f32, f32),
+    cursor_seen: bool,
+    cursor_pointer: bool,
     last_hits: Option<chrome::TabBarHits>,
+    chrome_anim: chrome::ChromeAnimationState,
 
     clipboard: Option<arboard::Clipboard>,
     left_down: bool,
@@ -158,6 +161,7 @@ pub struct App {
     // Debounced session save.
     save_after: Option<Instant>,
     cwd_deadline: Instant,
+    last_terminal_grid: Option<(u16, u16)>,
 
     blink_enabled: bool,
     cursor_on: bool,
@@ -190,7 +194,10 @@ impl App {
             active: 0,
             next_tab_id: 0,
             cursor_pos: (0.0, 0.0),
+            cursor_seen: false,
+            cursor_pointer: false,
             last_hits: None,
+            chrome_anim: chrome::ChromeAnimationState::default(),
             clipboard: arboard::Clipboard::new().ok(),
             left_down: false,
             selecting: false,
@@ -207,6 +214,7 @@ impl App {
             rename: None,
             save_after: None,
             cwd_deadline: now + CWD_POLL_INTERVAL,
+            last_terminal_grid: None,
             blink_enabled,
             cursor_on: true,
             next_toggle: now + BLINK_INTERVAL,
@@ -240,14 +248,17 @@ impl App {
             }
             AppInput::MouseMove { x, y } => {
                 self.cursor_pos = (x, y);
+                self.cursor_seen = true;
                 self.on_mouse_move();
             }
             AppInput::MouseDown { x, y } => {
                 self.cursor_pos = (x, y);
+                self.cursor_seen = true;
                 self.on_mouse_down();
             }
             AppInput::MouseUp { x, y } => {
                 self.cursor_pos = (x, y);
+                self.cursor_seen = true;
                 self.on_mouse_up();
             }
             AppInput::Wheel { lines } => self.on_scroll(lines),
@@ -575,11 +586,7 @@ impl App {
             renderer.resize(&gpu.queue, w, h);
             self.renderer = Some(renderer);
         }
-        let (rows, cols) = self.viewport_grid();
-        for tab in &mut self.tabs {
-            tab.core.resize(rows, cols);
-            let _ = self.pty.resize(tab.pty_id, rows, cols);
-        }
+        self.sync_terminal_grid(true);
         self.request_redraw();
     }
 
@@ -841,6 +848,7 @@ impl App {
     }
 
     fn on_mouse_move(&mut self) {
+        self.update_chrome_hover();
         if !self.left_down {
             return;
         }
@@ -859,6 +867,46 @@ impl App {
             {
                 self.report_mouse(px, py, MouseEvent::Drag);
             }
+        }
+    }
+
+    fn update_chrome_hover(&mut self) {
+        if !self.cursor_seen {
+            return;
+        }
+        let (px, py) = self.cursor_pos;
+        let hover = self
+            .last_hits
+            .as_ref()
+            .map_or(chrome::ChromeHoverTarget::None, |hits| {
+                hits.hover_target(px, py)
+            });
+        self.set_pointer_cursor(hover.is_clickable());
+        if self.chrome_anim.set_hover(hover) {
+            self.request_redraw();
+        }
+    }
+
+    fn clear_chrome_hover(&mut self) {
+        self.cursor_seen = false;
+        self.set_pointer_cursor(false);
+        if self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None) {
+            self.request_redraw();
+        }
+    }
+
+    fn set_pointer_cursor(&mut self, pointer: bool) {
+        if self.cursor_pointer == pointer {
+            return;
+        }
+        self.cursor_pointer = pointer;
+        if let Some(gpu) = self.gpu.as_ref() {
+            let icon = if pointer {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            };
+            gpu.window.set_cursor(icon);
         }
     }
 
@@ -983,12 +1031,21 @@ impl App {
         if let (Some(renderer), Some(gpu)) = (self.renderer.as_ref(), self.gpu.as_ref()) {
             renderer.resize(&gpu.queue, width, height);
         }
+        self.sync_terminal_grid(true);
+        self.request_redraw();
+    }
+
+    fn sync_terminal_grid(&mut self, force: bool) {
         let (rows, cols) = self.viewport_grid();
+        let grid = (rows, cols);
+        if !force && self.last_terminal_grid == Some(grid) {
+            return;
+        }
         for tab in &mut self.tabs {
             tab.core.resize(rows, cols);
             let _ = self.pty.resize(tab.pty_id, rows, cols);
         }
-        self.request_redraw();
+        self.last_terminal_grid = Some(grid);
     }
 
     /// Poll the active tab's shell cwd; update its title and persist on change.
@@ -1057,6 +1114,7 @@ impl App {
         if config_changed {
             self.apply_config_change();
         }
+        self.sync_terminal_grid(false);
 
         let (Some(gpu), Some(renderer)) = (self.gpu.as_mut(), self.renderer.as_mut()) else {
             return;
@@ -1073,6 +1131,7 @@ impl App {
             themes::ui_theme_accent(&self.config.ui_theme),
         );
         let titles: Vec<String> = self.tabs.iter().map(|t| t.title()).collect();
+        let chrome_animating = self.chrome_anim.advance(Instant::now(), titles.len());
 
         renderer.begin();
         let hits = chrome::draw_tab_bar(
@@ -1084,6 +1143,7 @@ impl App {
             &colors,
             self.rename.as_deref(),
             self.ui.settings_open(),
+            &self.chrome_anim,
         );
         if let Some(tab) = self.tabs.get(self.active) {
             let snapshot = tab.core.snapshot();
@@ -1138,6 +1198,10 @@ impl App {
             gpu.present(renderer);
         }
         self.last_hits = Some(hits);
+        self.update_chrome_hover();
+        if chrome_animating {
+            self.request_redraw();
+        }
     }
 
     fn pump_blink(&mut self) -> bool {
@@ -1270,6 +1334,9 @@ impl ApplicationHandler<AppEvent> for App {
         if matches!(event, WindowEvent::RedrawRequested) {
             self.render();
             return;
+        }
+        if matches!(event, WindowEvent::CursorLeft { .. }) {
+            self.clear_chrome_hover();
         }
 
         let egui_response = match (self.gpu.as_ref(), self.egui.as_mut()) {

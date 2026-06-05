@@ -145,7 +145,8 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 | Editable rows | The primary row area should be clickable, with separate icon affordances for secondary actions |
 | Terminal tabs | Horizontal tabs fill the full space between vertical separators; selected tabs use only a bottom underline, while inactive tabs stay transparent except for temporary hover fill. Vertical tabs live in a left sidebar, use horizontal separators, and show selection with a right-aligned border. |
 | Terminal pane | Use a consistent `8px` text inset on all sides while letting the backdrop fill edge-to-edge; keep emulator blank-row trimming separate from intentional layout padding |
-| Settings action | Keep the Settings action as an icon-only chrome button near the top-right of the active chrome area; route it through the same settings toggle path as the keyboard shortcut and command palette |
+| Settings action | Keep the Settings action as an icon-only chrome button near the top-right of the active chrome area; route it through the same settings toggle path as the keyboard shortcut and command palette. Draw the icon with tintable chrome geometry rather than font or emoji glyphs. |
+| Chrome hover | Tabs and close buttons use brief background-opacity fades on hover. Hovering a close button also keeps its parent tab hovered. Close and Settings icons fade toward the current UI theme accent. Settings hover changes icon colour only, with no hover background or scale. Tab, close, and Settings hover targets use the pointer cursor. |
 
 ## Accessibility
 
@@ -160,6 +161,8 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 ## Motion
 
 Use minimal motion. Menu open/close can be instant; avoid animated settings transitions unless they improve orientation. Respect reduced-motion expectations by keeping essential state changes non-animated.
+
+Chrome affordances may use short hover fades around `140ms`. Avoid springy, scaling, or decorative movement in tab chrome.
 
 ## Iconography
 
