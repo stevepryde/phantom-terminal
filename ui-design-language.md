@@ -12,11 +12,13 @@ These rules capture deliberate product decisions and should not be changed casua
 | --- | --- |
 | Terminal tabs | Horizontal tabs fill the full space between vertical separators. Active state is a bottom underline only: no bubble, pill, or persistent filled background. Vertical tabs use the same transparent tab surface in a left sidebar, with horizontal separators and an active right border. |
 | Terminal pane inset | Terminal text has a consistent `8px` inset on all sides, while backdrop artwork fills the pane edge-to-edge. If the terminal emulator creates a single empty top screen row, visually trim that row rather than removing the intentional pane inset. |
+| Settings affordance | Horizontal tab chrome exposes an icon-only Settings action at the top-right edge. Vertical tab chrome exposes the same action in a small sidebar header row so it never overlaps terminal output. |
 | Font settings | Terminal font is app-wide and lives in Appearance. Shell profiles must not expose font or appearance controls unless a full appearance-profile feature is intentionally designed. |
 | Profile settings | Profiles are listed first, then edited one at a time. Do not show multiple profile forms inline. |
 | Default profile | Default selection happens with the icon-only star action on each profile row. Do not reintroduce a separate default-profile dropdown. |
 | Autosave | Settings save immediately on change. Do not add a save button for settings panes. |
 | Native dialogs | Do not use native `confirm`, `alert`, or `prompt` for app UI. Use inline confirmation, in-app dialogs, or toasts. |
+| Native app control UI | The native Rust app uses egui for non-terminal controls and contextual panels. The terminal viewport stays custom-rendered by `phantom-gfx`; do not rebuild settings, sidebars, forms, sliders, or inspectors as ad-hoc terminal-renderer widgets. |
 
 ## Palette
 
@@ -143,6 +145,7 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 | Editable rows | The primary row area should be clickable, with separate icon affordances for secondary actions |
 | Terminal tabs | Horizontal tabs fill the full space between vertical separators; selected tabs use only a bottom underline, while inactive tabs stay transparent except for temporary hover fill. Vertical tabs live in a left sidebar, use horizontal separators, and show selection with a right-aligned border. |
 | Terminal pane | Use a consistent `8px` text inset on all sides while letting the backdrop fill edge-to-edge; keep emulator blank-row trimming separate from intentional layout padding |
+| Settings action | Keep the Settings action as an icon-only chrome button near the top-right of the active chrome area; route it through the same settings toggle path as the keyboard shortcut and command palette |
 
 ## Accessibility
 
@@ -166,6 +169,8 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 
 | Component | Rule |
 | --- | --- |
+| Native egui layer | Use for settings, contextual side panels, command details, inspectors, forms, sliders, steppers, color controls, and future right-side panels in `phantom-app` |
+| Terminal renderer | `phantom-gfx` owns terminal cells, glyph rendering, cursor, selection, and terminal backdrop only |
 | `CustomDropdown` | The only dropdown/select primitive for app UI |
 | `IconButton` | Use for chrome-like icon-only actions |
 | Settings `Section` | Provides title, hint, and vertical rhythm |
@@ -173,3 +178,16 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Profile rows | Clickable list items with aligned metadata, an edit icon, and a star action for default selection |
 | Ephemeral indicator | A small status icon in the titlebar near Settings when launch mode will not restore or save tabs |
 | `WindowResizeHandles` | Linux-only invisible edge handles for the decorationless Tauri window; keep them thin enough to avoid terminal scrollbar conflicts |
+
+## Native App Egui Rules
+
+| Pattern | Rule |
+| --- | --- |
+| Control plane | egui is the default UI for all non-terminal native surfaces |
+| Panel placement | Prefer a wide right side panel for contextual tools and settings; overlays remain acceptable for transient command search |
+| Panel navigation | Multi-section panels use a fixed vertical tab rail at the left of the panel. Keep the rail wide enough for readable labels and keep the active tab visually selected. |
+| Styling | Use Phantom dark surfaces, compact spacing, low rounding, and cyan accent focus/selection states via egui `Visuals` and `Style` |
+| Settings | Autosave on change through validated `AppConfig`; edit drafts may exist inside widgets, but committed config must still validate in Rust |
+| Numeric controls | Use sliders, drag values, or paired steppers/text input; never rely on single-click increment-only behavior |
+| Contextual panels | Model future panels as typed app state such as Settings, Search, Shell Profile, Command Details, or Task Output |
+| Terminal boundary | egui panels may resize or reserve space around the terminal, but must not own terminal glyph rendering or PTY state |

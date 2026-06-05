@@ -73,6 +73,27 @@ fn glyph_draws_in_its_cell_and_not_elsewhere() {
 }
 
 #[test]
+fn starship_prompt_symbol_draws_when_font_stack_covers_it() {
+    let config = AppConfig::default();
+    let mut h = harness_or_skip!(&config, 240, 120);
+    let (rows, cols) = h.grid();
+    let mut term = core(rows, cols);
+    term.advance("\u{276f}".as_bytes());
+
+    let img = h.render_snapshot(&term.snapshot(), false);
+    let bg = img.avg(0, 0, 1, 1);
+    let (x, y, w, hh) = cell_sample(&h, 0, 0);
+    let drawn = img.avg(x, y, w, hh);
+
+    let bg_sum: u32 = bg.iter().sum();
+    let drawn_sum: u32 = drawn.iter().sum();
+    assert!(
+        drawn_sum > bg_sum + 20,
+        "prompt symbol did not render ({drawn_sum} vs {bg_sum})"
+    );
+}
+
+#[test]
 fn foreground_color_reaches_the_pixels() {
     let config = AppConfig::default();
     let mut h = harness_or_skip!(&config, 240, 120);

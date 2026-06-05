@@ -14,17 +14,18 @@
 pub mod event;
 
 mod chrome;
+mod egui_ui;
 mod gpu;
 mod input;
 mod keybindings;
 mod palette;
-mod settings;
 mod tab;
 mod themes;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use egui_ui::{EguiLayer, UiState};
 use event::{AppInput, Mods};
 use gpu::GpuContext;
 use keybindings::{Action, Keymap};
@@ -38,7 +39,6 @@ use phantom_emu::{
     MouseProtocol, SelSide, VtCore,
 };
 use phantom_gfx::Renderer;
-use settings::{SettingsOutcome, SettingsState};
 use tab::Tab;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -123,6 +123,7 @@ pub struct App {
 
     gpu: Option<GpuContext>,
     renderer: Option<Renderer>,
+    egui: Option<EguiLayer>,
 
     keymap: Keymap,
     tabs: Vec<Tab>,
@@ -143,7 +144,7 @@ pub struct App {
     exit_requested: bool,
 
     palette: PaletteState,
-    settings: SettingsState,
+    ui: UiState,
     notice: Option<Notice>,
 
     // Launch behaviour.
@@ -174,6 +175,7 @@ impl App {
         let blink_enabled = config.cursor_blink;
         let ephemeral = launch.cwd.is_some();
         let now = Instant::now();
+        let ui = UiState::new(&config);
         Self {
             outbox,
             config,
@@ -182,6 +184,7 @@ impl App {
             mods: Mods::default(),
             gpu: None,
             renderer: None,
+            egui: None,
             keymap,
             tabs: Vec::new(),
             active: 0,
@@ -196,7 +199,7 @@ impl App {
             fullscreen: false,
             exit_requested: false,
             palette: PaletteState::default(),
-            settings: SettingsState::default(),
+            ui,
             notice: None,
             launch_cwd: launch.cwd,
             remember_tabs: launch.remember_tabs,
@@ -305,7 +308,7 @@ impl App {
     }
 
     pub fn settings_open(&self) -> bool {
-        self.settings.open
+        self.ui.settings_open()
     }
 
     pub fn renaming(&self) -> bool {
@@ -330,13 +333,17 @@ impl App {
         self.config.tab_layout != "vertical"
     }
 
+    fn content_width(&self, width: u32) -> f32 {
+        (width as f32 - self.ui.panel_width_px()).max(1.0)
+    }
+
     /// Cell grid `(rows, cols)` that fits the terminal viewport.
     fn viewport_grid(&self) -> (u16, u16) {
         match (self.gpu.as_ref(), self.renderer.as_ref()) {
             (Some(gpu), Some(renderer)) => {
                 let (w, h) = gpu.size();
                 let layout = chrome::compute_layout(
-                    w as f32,
+                    self.content_width(w),
                     h as f32,
                     renderer.cell_size().1,
                     self.horizontal(),
@@ -510,11 +517,7 @@ impl App {
                 self.request_redraw();
             }
             Action::ToggleSettings => {
-                if self.settings.open {
-                    self.settings.close();
-                } else {
-                    self.settings.open();
-                }
+                self.ui.toggle_settings(&self.config);
                 self.request_redraw();
             }
         }
@@ -534,7 +537,7 @@ impl App {
                 self.config.ui_theme = name;
                 self.save_config();
             }
-            PaletteAction::OpenSettings => self.settings.open(),
+            PaletteAction::OpenSettings => self.ui.open_settings(&self.config),
         }
         self.request_redraw();
     }
@@ -556,15 +559,6 @@ impl App {
         self.save_config();
         self.blink_enabled = self.config.cursor_blink;
         self.rebuild_renderer();
-    }
-
-    fn apply_settings_outcome(&mut self, outcome: SettingsOutcome) {
-        match outcome {
-            SettingsOutcome::None => {}
-            SettingsOutcome::Close => self.settings.close(),
-            SettingsOutcome::Changed => self.apply_config_change(),
-            SettingsOutcome::Invalid(message) => self.show_notice(message),
-        }
     }
 
     /// Recreate the renderer (font/theme/scale) and resize every tab.
@@ -616,18 +610,6 @@ impl App {
 
     /// Route a key press (after the winit adapter has normalized it).
     fn handle_key_input(&mut self, key: Key, text: Option<&str>) {
-        // Settings panel captures all keys while open.
-        if self.settings.open {
-            if self.keymap.lookup(key, self.mods) == Some(Action::ToggleSettings) {
-                self.settings.close();
-                self.request_redraw();
-                return;
-            }
-            let outcome = self.settings.handle_key(key, text, &mut self.config);
-            self.apply_settings_outcome(outcome);
-            self.request_redraw();
-            return;
-        }
         // Command palette captures all keys while open.
         if self.palette.open {
             if self.keymap.lookup(key, self.mods) == Some(Action::TogglePalette) {
@@ -739,13 +721,16 @@ impl App {
     fn handle_click(&mut self) {
         enum Hit {
             New,
+            Settings,
             Close(usize),
             Switch(usize),
         }
         let (px, py) = self.cursor_pos;
         let mut hit = None;
         if let Some(hits) = &self.last_hits {
-            if hits.new_tab.contains(px, py) {
+            if hits.settings.contains(px, py) {
+                hit = Some(Hit::Settings);
+            } else if hits.new_tab.contains(px, py) {
                 hit = Some(Hit::New);
             } else {
                 for th in &hits.tabs {
@@ -762,6 +747,10 @@ impl App {
         }
         match hit {
             Some(Hit::New) => self.spawn_tab(None, None),
+            Some(Hit::Settings) => {
+                self.ui.toggle_settings(&self.config);
+                self.request_redraw();
+            }
             Some(Hit::Close(i)) => self.close_tab(i),
             Some(Hit::Switch(i)) => {
                 self.active = i;
@@ -778,7 +767,7 @@ impl App {
         let renderer = self.renderer.as_ref()?;
         let (w, h) = gpu.size();
         Some(chrome::compute_layout(
-            w as f32,
+            self.content_width(w),
             h as f32,
             renderer.cell_size().1,
             self.horizontal(),
@@ -822,22 +811,6 @@ impl App {
 
     fn on_mouse_down(&mut self) {
         let (px, py) = self.cursor_pos;
-        if self.settings.open {
-            if let (Some(gpu), Some(renderer)) = (self.gpu.as_ref(), self.renderer.as_ref()) {
-                let (w, h) = gpu.size();
-                let outcome = self.settings.handle_mouse(
-                    px,
-                    py,
-                    w as f32,
-                    h as f32,
-                    renderer.cell_size().1,
-                    &mut self.config,
-                );
-                self.apply_settings_outcome(outcome);
-                self.request_redraw();
-            }
-            return;
-        }
         if self.palette.open {
             return;
         }
@@ -1077,12 +1050,20 @@ impl App {
 
     fn render(&mut self) {
         self.redraw_queued = false;
+        let config_changed = match (self.gpu.as_ref(), self.egui.as_mut()) {
+            (Some(gpu), Some(egui)) => egui.run(&gpu.window, &mut self.ui, &mut self.config),
+            _ => false,
+        };
+        if config_changed {
+            self.apply_config_change();
+        }
+
         let (Some(gpu), Some(renderer)) = (self.gpu.as_mut(), self.renderer.as_mut()) else {
             return;
         };
         let (w, h) = gpu.size();
         let layout = chrome::compute_layout(
-            w as f32,
+            (w as f32 - self.ui.panel_width_px()).max(1.0),
             h as f32,
             renderer.cell_size().1,
             self.config.tab_layout != "vertical",
@@ -1102,6 +1083,7 @@ impl App {
             self.active,
             &colors,
             self.rename.as_deref(),
+            self.ui.settings_open(),
         );
         if let Some(tab) = self.tabs.get(self.active) {
             let snapshot = tab.core.snapshot();
@@ -1123,17 +1105,7 @@ impl App {
                 renderer.fill_rect(px, py + ch - 2.0, width, 2.0, colors.accent);
             }
         }
-        if self.settings.open {
-            renderer.begin_overlay();
-            self.settings.draw(
-                renderer,
-                &gpu.queue,
-                &self.config,
-                w as f32,
-                h as f32,
-                &colors,
-            );
-        } else if self.palette.open {
+        if self.palette.open {
             renderer.begin_overlay();
             self.palette
                 .draw(renderer, &gpu.queue, w as f32, h as f32, &colors);
@@ -1160,7 +1132,11 @@ impl App {
             );
         }
         renderer.end(&gpu.device, &gpu.queue);
-        gpu.present(renderer);
+        if let Some(egui) = self.egui.as_mut() {
+            gpu.present_with_overlay(renderer, Some(egui));
+        } else {
+            gpu.present(renderer);
+        }
         self.last_hits = Some(hits);
     }
 
@@ -1273,9 +1249,11 @@ impl ApplicationHandler<AppEvent> for App {
         );
         let (w, h) = gpu.size();
         renderer.resize(&gpu.queue, w, h);
+        let egui = EguiLayer::new(&gpu.window, &gpu.device, gpu.format());
 
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
+        self.egui = Some(egui);
 
         self.start();
         self.request_redraw();
@@ -1293,8 +1271,20 @@ impl ApplicationHandler<AppEvent> for App {
             self.render();
             return;
         }
-        if let Some(input) = translate(&event, self.mods, self.cursor_pos) {
-            self.handle_input(input);
+
+        let egui_response = match (self.gpu.as_ref(), self.egui.as_mut()) {
+            (Some(gpu), Some(egui)) => Some(egui.on_window_event(&gpu.window, &event)),
+            _ => None,
+        };
+        if egui_response.is_some_and(|response| response.repaint) {
+            self.request_redraw();
+        }
+        let consumed = egui_response.is_some_and(|response| response.consumed);
+
+        if !consumed {
+            if let Some(input) = translate(&event, self.mods, self.cursor_pos) {
+                self.handle_input(input);
+            }
         }
         if self.exit_requested {
             event_loop.exit();

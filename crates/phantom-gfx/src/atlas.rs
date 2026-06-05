@@ -1,5 +1,5 @@
 //! Glyph atlas: an RGBA texture packed with rasterized glyphs, plus a cache
-//! keyed by `(face slot, glyph id)`. Packing uses a simple shelf allocator,
+//! keyed by `(resolved face, glyph id)`. Packing uses a simple shelf allocator,
 //! which is a good fit for the near-uniform heights of monospace glyphs.
 
 use std::collections::HashMap;
@@ -51,10 +51,11 @@ impl ShelfPacker {
     }
 }
 
-/// Cache key: which face the glyph came from, and its glyph id within that face.
+/// Cache key: which resolved face the glyph came from, and its glyph id within
+/// that face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
-    pub slot: u8,
+    pub face: u32,
     pub glyph_id: u16,
 }
 

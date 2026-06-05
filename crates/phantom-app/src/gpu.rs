@@ -14,6 +14,19 @@ use wgpu::{
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+pub trait FrameOverlay {
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+    );
+
+    fn paint(&mut self, pass: &mut wgpu::RenderPass<'static>);
+
+    fn after_submit(&mut self) {}
+}
+
 pub struct GpuContext {
     pub window: Arc<Window>,
     pub device: wgpu::Device,
@@ -85,17 +98,25 @@ impl GpuContext {
 
     /// Acquire the next frame, clear it, and let `renderer` draw the prepared
     /// instances. Transient surface states trigger a redraw rather than a panic.
-    pub fn present(&mut self, renderer: &Renderer) {
+    pub fn present(&mut self, renderer: &Renderer) -> bool {
+        self.present_with_overlay(renderer, None)
+    }
+
+    pub fn present_with_overlay(
+        &mut self,
+        renderer: &Renderer,
+        mut overlay: Option<&mut dyn FrameOverlay>,
+    ) -> bool {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 self.window.request_redraw();
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 self.surface.configure(&self.device, &self.surface_config);
                 self.window.request_redraw();
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface = self
@@ -104,11 +125,11 @@ impl GpuContext {
                     .expect("recreate surface");
                 self.surface.configure(&self.device, &self.surface_config);
                 self.window.request_redraw();
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 eprintln!("surface validation error");
-                return;
+                return false;
             }
         };
 
@@ -116,6 +137,9 @@ impl GpuContext {
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor { label: None });
+        if let Some(overlay) = overlay.as_deref_mut() {
+            overlay.prepare(&self.device, &self.queue, &mut encoder);
+        }
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("phantom-frame"),
@@ -134,9 +158,17 @@ impl GpuContext {
                 multiview_mask: None,
             });
             renderer.render(&mut pass);
+            let mut pass = pass.forget_lifetime();
+            if let Some(overlay) = overlay.as_deref_mut() {
+                overlay.paint(&mut pass);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        if let Some(overlay) = overlay {
+            overlay.after_submit();
+        }
+        true
     }
 }

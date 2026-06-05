@@ -425,16 +425,18 @@ impl Renderer {
         baseline_y: f32,
         color: Rgba,
     ) {
-        let glyph_id = self.font.glyph_id(slot, ch);
+        let Some(resolved) = self.font.resolve_glyph(slot, ch) else {
+            return;
+        };
         let key = GlyphKey {
-            slot: slot as u8,
-            glyph_id,
+            face: resolved.face,
+            glyph_id: resolved.glyph_id,
         };
         let entry = match self.atlas.get(key) {
             Some(entry) => Some(entry),
             None => self
                 .font
-                .rasterize(slot, glyph_id)
+                .rasterize(resolved)
                 .map(|raster| self.atlas.insert(queue, key, &raster)),
         };
         if let Some(entry) = entry {

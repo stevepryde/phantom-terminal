@@ -150,7 +150,7 @@ fn command_palette_filters_and_executes() {
     assert!(!app.palette_open());
     assert!(app.settings_open());
 
-    app.handle_input(press(Key::Escape)); // close settings
+    app.handle_input(primary(',')); // close settings
     assert!(!app.settings_open());
 }
 
@@ -168,19 +168,11 @@ fn command_palette_switches_ui_theme() {
 }
 
 #[test]
-fn settings_panel_edits_and_validates_config() {
+fn settings_shortcut_toggles_panel() {
     let mut app = app();
 
     app.handle_input(primary(',')); // Cmd+, : open settings
     assert!(app.settings_open());
-
-    // Row 4 is "Cursor blink" (bool); navigate down to it and toggle.
-    for _ in 0..4 {
-        app.handle_input(press(Key::Down));
-    }
-    let before = app.config().cursor_blink;
-    app.handle_input(press(Key::Right)); // toggle bool
-    assert_ne!(app.config().cursor_blink, before);
 
     // Toggling settings binding again closes it.
     app.handle_input(primary(','));
@@ -250,18 +242,4 @@ fn close_last_tab_clears_remembered_tabs() {
 
     assert!(app.exit_requested());
     assert_eq!(app.remembered_tab_count_for_tests(), Some(0));
-}
-
-#[test]
-fn invalid_settings_edit_shows_notice() {
-    let mut app = app();
-
-    app.handle_input(primary(',')); // open settings on Font family
-    app.handle_input(press(Key::Enter)); // edit current font family
-    for _ in 0.."monospace".len() {
-        app.handle_input(press(Key::Backspace));
-    }
-    app.handle_input(press(Key::Enter));
-
-    assert_eq!(app.notice_text(), Some("Invalid setting value"));
 }

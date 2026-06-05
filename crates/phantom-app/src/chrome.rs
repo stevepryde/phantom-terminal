@@ -6,8 +6,10 @@ use phantom_gfx::Renderer;
 const PAD: f32 = 8.0;
 const CLOSE_W: f32 = 16.0;
 const NEW_TAB_W: f32 = 30.0;
+const SETTINGS_W: f32 = 34.0;
 const MAX_TAB_W: f32 = 220.0;
 const MIN_TAB_W: f32 = 70.0;
+const TERMINAL_MARGIN: f32 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -44,10 +46,10 @@ pub fn compute_layout(w: f32, h: f32, cell_h: f32, horizontal: bool) -> Layout {
                 h: bar_h,
             },
             viewport: Rect {
-                x: 0.0,
-                y: bar_h,
-                w,
-                h: (h - bar_h).max(0.0),
+                x: TERMINAL_MARGIN,
+                y: bar_h + TERMINAL_MARGIN,
+                w: (w - TERMINAL_MARGIN * 2.0).max(0.0),
+                h: (h - bar_h - TERMINAL_MARGIN * 2.0).max(0.0),
             },
             horizontal,
         }
@@ -61,10 +63,10 @@ pub fn compute_layout(w: f32, h: f32, cell_h: f32, horizontal: bool) -> Layout {
                 h,
             },
             viewport: Rect {
-                x: bar_w,
-                y: 0.0,
-                w: (w - bar_w).max(0.0),
-                h,
+                x: bar_w + TERMINAL_MARGIN,
+                y: TERMINAL_MARGIN,
+                w: (w - bar_w - TERMINAL_MARGIN * 2.0).max(0.0),
+                h: (h - TERMINAL_MARGIN * 2.0).max(0.0),
             },
             horizontal,
         }
@@ -104,10 +106,12 @@ pub struct TabHit {
 pub struct TabBarHits {
     pub tabs: Vec<TabHit>,
     pub new_tab: Rect,
+    pub settings: Rect,
 }
 
 /// Draw the tab bar and return click regions. `titles` and `active` describe the
 /// open tabs.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_tab_bar(
     r: &mut Renderer,
     queue: &wgpu::Queue,
@@ -116,6 +120,7 @@ pub fn draw_tab_bar(
     active: usize,
     colors: &ChromeColors,
     rename: Option<&str>,
+    settings_open: bool,
 ) -> TabBarHits {
     let bar = layout.bar;
     r.fill_rect(bar.x, bar.y, bar.w, bar.h, colors.bar_bg);
@@ -124,7 +129,13 @@ pub fn draw_tab_bar(
     let n = titles.len().max(1);
 
     if layout.horizontal {
-        let avail = (bar.w - NEW_TAB_W).max(0.0);
+        let settings = Rect {
+            x: bar.x + (bar.w - SETTINGS_W).max(0.0),
+            y: bar.y,
+            w: SETTINGS_W,
+            h: bar.h,
+        };
+        let avail = (bar.w - NEW_TAB_W - SETTINGS_W).max(0.0);
         let tab_w = (avail / n as f32).clamp(MIN_TAB_W, MAX_TAB_W);
         let tab_h = bar.h;
         let mut tabs = Vec::with_capacity(titles.len());
@@ -163,17 +174,28 @@ pub fn draw_tab_bar(
             x += tab_w;
         }
         let new_tab = Rect {
-            x: x.min(bar.x + bar.w - NEW_TAB_W),
+            x: x.min(settings.x - NEW_TAB_W).max(bar.x),
             y: bar.y,
             w: NEW_TAB_W,
             h: tab_h,
         };
         r.text(queue, new_tab.x + PAD, new_tab.y + PAD, "+", colors.text);
-        TabBarHits { tabs, new_tab }
+        draw_settings_button(r, queue, settings, colors, settings_open);
+        TabBarHits {
+            tabs,
+            new_tab,
+            settings,
+        }
     } else {
         let row_h = (r_cell_h(r) + PAD * 2.0).ceil();
+        let settings = Rect {
+            x: bar.x + (bar.w - SETTINGS_W).max(0.0),
+            y: bar.y,
+            w: SETTINGS_W,
+            h: row_h,
+        };
         let mut tabs = Vec::with_capacity(titles.len());
-        let mut y = bar.y;
+        let mut y = bar.y + row_h;
         for (i, title) in titles.iter().enumerate() {
             let rect = Rect {
                 x: bar.x,
@@ -220,8 +242,45 @@ pub fn draw_tab_bar(
             "+ new tab",
             colors.dim_text,
         );
-        TabBarHits { tabs, new_tab }
+        draw_settings_button(r, queue, settings, colors, settings_open);
+        TabBarHits {
+            tabs,
+            new_tab,
+            settings,
+        }
     }
+}
+
+fn draw_settings_button(
+    r: &mut Renderer,
+    queue: &wgpu::Queue,
+    rect: Rect,
+    colors: &ChromeColors,
+    active: bool,
+) {
+    if active {
+        r.fill_rect(
+            rect.x + 4.0,
+            rect.y + 4.0,
+            rect.w - 8.0,
+            rect.h - 8.0,
+            colors.active_bg,
+        );
+        r.fill_rect(
+            rect.x + rect.w - 2.0,
+            rect.y + 6.0,
+            2.0,
+            rect.h - 12.0,
+            colors.accent,
+        );
+    }
+    r.text(
+        queue,
+        rect.x + PAD,
+        rect.y + PAD,
+        "\u{2699}",
+        if active { colors.text } else { colors.dim_text },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,17 +375,20 @@ mod tests {
     fn horizontal_layout_splits_off_top_bar() {
         let l = compute_layout(800.0, 600.0, 20.0, true);
         assert_eq!(l.bar.h, 36.0); // 20 + 8*2
-        assert_eq!(l.viewport.y, 36.0);
-        assert_eq!(l.viewport.h, 564.0);
-        assert_eq!(l.viewport.w, 800.0);
+        assert_eq!(l.viewport.x, 8.0);
+        assert_eq!(l.viewport.y, 44.0);
+        assert_eq!(l.viewport.h, 548.0);
+        assert_eq!(l.viewport.w, 784.0);
     }
 
     #[test]
     fn vertical_layout_splits_off_left_bar() {
         let l = compute_layout(1000.0, 600.0, 20.0, false);
         assert!(l.bar.w >= 120.0 && l.bar.w <= 240.0);
-        assert_eq!(l.viewport.x, l.bar.w);
-        assert_eq!(l.viewport.w, 1000.0 - l.bar.w);
+        assert_eq!(l.viewport.x, l.bar.w + 8.0);
+        assert_eq!(l.viewport.y, 8.0);
+        assert_eq!(l.viewport.w, 1000.0 - l.bar.w - 16.0);
+        assert_eq!(l.viewport.h, 584.0);
     }
 
     #[test]
