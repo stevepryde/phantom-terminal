@@ -62,6 +62,7 @@ pub enum SettingsOutcome {
     /// The config changed and validated; the caller should persist it and
     /// rebuild the renderer (font / theme may have changed).
     Changed,
+    Invalid(String),
 }
 
 #[derive(Default)]
@@ -70,6 +71,7 @@ pub struct SettingsState {
     selected: usize,
     editing: Option<String>,
     fields: Vec<Field>,
+    message: Option<String>,
 }
 
 impl SettingsState {
@@ -77,12 +79,14 @@ impl SettingsState {
         self.fields = build_fields();
         self.selected = 0;
         self.editing = None;
+        self.message = None;
         self.open = true;
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.editing = None;
+        self.message = None;
     }
 
     pub fn handle_key(
@@ -126,14 +130,17 @@ impl SettingsState {
         match key {
             Key::Escape => {
                 self.editing = None;
+                self.message = None;
                 SettingsOutcome::None
             }
             Key::Enter => {
                 let buf = self.editing.take().unwrap_or_default();
                 if self.commit_text(&buf, config) {
+                    self.message = None;
                     SettingsOutcome::Changed
                 } else {
-                    SettingsOutcome::None
+                    self.message = Some("Invalid value".to_string());
+                    SettingsOutcome::Invalid("Invalid setting value".to_string())
                 }
             }
             Key::Backspace => {
@@ -183,9 +190,11 @@ impl SettingsState {
         }
         if next.validate().is_ok() {
             *config = next;
+            self.message = None;
             SettingsOutcome::Changed
         } else {
-            SettingsOutcome::None
+            self.message = Some("Invalid value".to_string());
+            SettingsOutcome::Invalid("Invalid setting value".to_string())
         }
     }
 
@@ -218,6 +227,42 @@ impl SettingsState {
         }
     }
 
+    pub fn handle_mouse(
+        &mut self,
+        x: f32,
+        y: f32,
+        win_w: f32,
+        win_h: f32,
+        cell_h: f32,
+        config: &mut AppConfig,
+    ) -> SettingsOutcome {
+        if self.fields.is_empty() {
+            return SettingsOutcome::None;
+        }
+        let layout = settings_layout(win_w, win_h, cell_h, self.selected, self.fields.len());
+        if x < layout.x || x >= layout.x + layout.w || y < layout.y || y >= layout.y + layout.h {
+            return SettingsOutcome::None;
+        }
+        let Some(index) = layout.row_at(y) else {
+            return SettingsOutcome::None;
+        };
+        self.selected = index;
+        self.editing = None;
+        if x >= layout.value_x {
+            match &self.fields[self.selected].kind {
+                FieldKind::Enum(_) | FieldKind::Bool | FieldKind::Number { .. } => {
+                    self.adjust(1, config)
+                }
+                FieldKind::Text | FieldKind::Hex(_) => {
+                    self.editing = Some(self.current_value(config));
+                    SettingsOutcome::None
+                }
+            }
+        } else {
+            SettingsOutcome::None
+        }
+    }
+
     fn current_value(&self, config: &AppConfig) -> String {
         value_string(config, &self.fields[self.selected], self.selected)
     }
@@ -233,37 +278,35 @@ impl SettingsState {
     ) {
         let cell_h = r.cell_size().1;
         let pad = 12.0;
-        let row_h = cell_h + 6.0;
+        let layout = settings_layout(win_w, win_h, cell_h, self.selected, self.fields.len());
+        let row_h = layout.row_h;
 
         r.fill_rect(0.0, 0.0, win_w, win_h, [0, 0, 0, 170]);
 
-        let panel_w = (win_w * 0.7).clamp(420.0, 860.0);
-        let panel_h = pad * 3.0 + row_h * (VISIBLE_ROWS as f32 + 2.0);
-        let px = ((win_w - panel_w) / 2.0).max(0.0);
-        let py = ((win_h - panel_h) / 2.0).max(20.0);
+        let panel_w = layout.w;
+        let panel_h = layout.h;
+        let px = layout.x;
+        let py = layout.y;
+        let visible_rows = layout.visible_rows;
 
         r.fill_rect(px, py, panel_w, panel_h, colors.bar_bg);
         r.fill_rect(px, py, panel_w, 2.0, colors.accent);
 
         r.text(queue, px + pad, py + pad, "Settings", colors.text);
-        r.text(
-            queue,
-            px + pad,
-            py + pad + row_h,
-            "\u{2191}\u{2193} navigate   \u{2190}\u{2192} change   Enter edit   Esc close",
-            colors.dim_text,
-        );
+        if let Some(message) = &self.message {
+            r.text(queue, px + pad, py + pad + row_h, message, colors.accent);
+        }
 
-        let value_x = px + panel_w * 0.5;
+        let value_x = layout.value_x;
         let highlight = [colors.accent[0], colors.accent[1], colors.accent[2], 70];
-        let start = self.selected.saturating_sub(VISIBLE_ROWS - 1);
-        let mut y = py + pad * 2.0 + row_h * 2.0;
+        let start = layout.start;
+        let mut y = layout.row_start;
         for (i, field) in self
             .fields
             .iter()
             .enumerate()
             .skip(start)
-            .take(VISIBLE_ROWS)
+            .take(visible_rows)
         {
             let selected = i == self.selected;
             if selected {
@@ -370,6 +413,69 @@ fn build_fields() -> Vec<Field> {
         });
     }
     fields
+}
+
+struct SettingsLayout {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    row_start: f32,
+    row_h: f32,
+    value_x: f32,
+    start: usize,
+    visible_rows: usize,
+    total_rows: usize,
+}
+
+impl SettingsLayout {
+    fn row_at(&self, y: f32) -> Option<usize> {
+        if y < self.row_start {
+            return None;
+        }
+        let row = ((y - self.row_start) / self.row_h).floor() as usize;
+        if row >= self.visible_rows {
+            return None;
+        }
+        let index = self.start + row;
+        (index < self.total_rows).then_some(index)
+    }
+}
+
+fn settings_layout(
+    win_w: f32,
+    win_h: f32,
+    cell_h: f32,
+    selected: usize,
+    total_rows: usize,
+) -> SettingsLayout {
+    let pad = 12.0;
+    let row_h = cell_h + 6.0;
+    let panel_w = (win_w * 0.82)
+        .clamp(280.0, 860.0)
+        .min((win_w - pad * 2.0).max(120.0));
+    let visible_rows = visible_rows(win_h, row_h, pad).min(total_rows.max(1));
+    let panel_h =
+        (pad * 3.0 + row_h * (visible_rows as f32 + 2.0)).min((win_h - pad * 2.0).max(row_h * 4.0));
+    let px = ((win_w - panel_w) / 2.0).max(0.0);
+    let py = ((win_h - panel_h) / 2.0).max(pad);
+    SettingsLayout {
+        x: px,
+        y: py,
+        w: panel_w,
+        h: panel_h,
+        row_start: py + pad * 2.0 + row_h * 2.0,
+        row_h,
+        value_x: px + panel_w * 0.5,
+        start: selected.saturating_sub(visible_rows - 1),
+        visible_rows,
+        total_rows,
+    }
+}
+
+fn visible_rows(win_h: f32, row_h: f32, pad: f32) -> usize {
+    let available = (win_h - pad * 5.0 - row_h * 2.0).max(row_h * 3.0);
+    ((available / row_h).floor() as usize).clamp(3, VISIBLE_ROWS)
 }
 
 fn value_string(config: &AppConfig, field: &Field, index: usize) -> String {
@@ -564,5 +670,23 @@ mod tests {
     fn build_fields_covers_scalars_and_colors() {
         let fields = build_fields();
         assert_eq!(fields.len(), 11 + COLOR_KEYS.len());
+    }
+
+    #[test]
+    fn mouse_click_on_value_changes_selected_setting() {
+        let mut settings = SettingsState::default();
+        let mut config = AppConfig::default();
+        settings.open();
+        settings.selected = 4; // Cursor blink
+        let before = config.cursor_blink;
+        let layout = settings_layout(800.0, 600.0, 18.0, settings.selected, settings.fields.len());
+        let row = settings.selected - layout.start;
+        let y = layout.row_start + row as f32 * layout.row_h + 2.0;
+        let x = layout.value_x + 2.0;
+
+        let outcome = settings.handle_mouse(x, y, 800.0, 600.0, 18.0, &mut config);
+
+        assert!(matches!(outcome, SettingsOutcome::Changed));
+        assert_ne!(config.cursor_blink, before);
     }
 }

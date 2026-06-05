@@ -24,7 +24,7 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
-    pub async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Self {
+    pub async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Result<Self, String> {
         let physical = window.inner_size();
 
         let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
@@ -33,15 +33,15 @@ impl GpuContext {
         let adapter = instance
             .request_adapter(&RequestAdapterOptions::default())
             .await
-            .expect("no suitable GPU adapter");
+            .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor::default())
             .await
-            .expect("failed to request device");
+            .map_err(|e| format!("failed to request device: {e}"))?;
 
         let surface = instance
             .create_surface(window.clone())
-            .expect("failed to create surface");
+            .map_err(|e| format!("failed to create surface: {e}"))?;
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: TextureFormat::Bgra8UnormSrgb,
@@ -54,14 +54,14 @@ impl GpuContext {
         };
         surface.configure(&device, &surface_config);
 
-        Self {
+        Ok(Self {
             window,
             device,
             queue,
             instance,
             surface,
             surface_config,
-        }
+        })
     }
 
     pub fn format(&self) -> TextureFormat {

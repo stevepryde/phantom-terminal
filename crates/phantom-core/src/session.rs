@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 
+pub const MAX_TAB_RECORDS: usize = 128;
+pub const MAX_TAB_ID_LEN: usize = 128;
+pub const MAX_TAB_TITLE_LEN: usize = 256;
+pub const MAX_TAB_CWD_LEN: usize = 4096;
+pub const MAX_TAB_PROFILE_ID_LEN: usize = 128;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabRecord {
     #[serde(default)]
@@ -29,6 +35,28 @@ pub struct TabRecord {
     pub updated_at: Option<String>,
 }
 
+impl TabRecord {
+    pub fn validate(&self) -> AppResult<()> {
+        validate_optional_len("tab id", self.id.as_deref(), MAX_TAB_ID_LEN)?;
+        validate_len("tab title", &self.title, MAX_TAB_TITLE_LEN)?;
+        validate_len("tab cwd", &self.cwd, MAX_TAB_CWD_LEN)?;
+        validate_optional_len(
+            "tab shell profile id",
+            self.shell_profile_id.as_deref(),
+            MAX_TAB_PROFILE_ID_LEN,
+        )?;
+        validate_no_nul("tab title", &self.title)?;
+        validate_no_nul("tab cwd", &self.cwd)?;
+        if let Some(id) = &self.id {
+            validate_no_nul("tab id", id)?;
+        }
+        if let Some(profile_id) = &self.shell_profile_id {
+            validate_no_nul("tab shell profile id", profile_id)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct SessionStore {
     conn: Mutex<Connection>,
 }
@@ -44,6 +72,15 @@ impl SessionStore {
         restrict_db_permissions(&path);
         migrate(&conn)?;
         restrict_db_permissions(&path);
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn in_memory_for_tests() -> AppResult<Self> {
+        let conn = Connection::open_in_memory()?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -71,13 +108,16 @@ impl SessionStore {
                 updated_at: row.get(7)?,
             })
         })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let tabs = rows.collect::<Result<Vec<_>, _>>()?;
+        validate_tab_records(&tabs)?;
+        Ok(tabs)
     }
 
     pub fn save_tabs(&self, tabs: &[TabRecord]) -> AppResult<()> {
         if tabs.is_empty() {
             return Ok(());
         }
+        validate_tab_records(tabs)?;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let previous_cwds = previous_cwds_by_id(&tx)?;
@@ -100,6 +140,12 @@ impl SessionStore {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_tabs(&self) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM tabs", [])?;
         Ok(())
     }
 
@@ -253,6 +299,41 @@ fn stable_tab_records(
     stable
 }
 
+fn validate_tab_records(tabs: &[TabRecord]) -> AppResult<()> {
+    if tabs.len() > MAX_TAB_RECORDS {
+        return Err(AppError::Other(format!(
+            "no more than {MAX_TAB_RECORDS} tabs can be remembered"
+        )));
+    }
+    for tab in tabs {
+        tab.validate()?;
+    }
+    Ok(())
+}
+
+fn validate_len(name: &str, value: &str, max: usize) -> AppResult<()> {
+    if value.len() > max {
+        return Err(AppError::Other(format!(
+            "{name} must be at most {max} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_len(name: &str, value: Option<&str>, max: usize) -> AppResult<()> {
+    if let Some(value) = value {
+        validate_len(name, value, max)?;
+    }
+    Ok(())
+}
+
+fn validate_no_nul(name: &str, value: &str) -> AppResult<()> {
+    if value.contains('\0') {
+        return Err(AppError::Other(format!("{name} cannot contain NUL bytes")));
+    }
+    Ok(())
+}
+
 fn save_config_conn(conn: &Connection, config: &AppConfig) -> AppResult<()> {
     let json = serde_json::to_string(config)?;
     conn.execute(
@@ -394,6 +475,24 @@ mod tests {
         let loaded = store.load_tabs().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].cwd, "/known");
+    }
+
+    #[test]
+    fn clear_tabs_removes_remembered_tabs() {
+        let store = in_memory();
+        store.save_tabs(&[tab("old", "/known", true)]).unwrap();
+
+        store.clear_tabs().unwrap();
+
+        assert!(store.load_tabs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn save_tabs_rejects_oversized_title() {
+        let store = in_memory();
+        let oversized = tab(&"x".repeat(MAX_TAB_TITLE_LEN + 1), "/known", true);
+
+        assert!(store.save_tabs(&[oversized]).is_err());
     }
 
     #[test]

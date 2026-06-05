@@ -20,5 +20,8 @@ pub use config::{AppConfig, Keybinding, ShellProfile, Theme};
 pub use error::{AppError, AppResult};
 pub use launch::{LaunchContext, LaunchState};
 pub use pty::{LaunchOpts, PtyManager, PtySink, SpawnOpts};
-pub use session::{SessionStore, TabRecord};
+pub use session::{
+    SessionStore, TabRecord, MAX_TAB_CWD_LEN, MAX_TAB_ID_LEN, MAX_TAB_PROFILE_ID_LEN,
+    MAX_TAB_RECORDS, MAX_TAB_TITLE_LEN,
+};
 pub use spawn::{default_home_dir, resolve_launch_opts};

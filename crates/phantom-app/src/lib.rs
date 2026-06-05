@@ -31,7 +31,7 @@ use keybindings::{Action, Keymap};
 use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
     default_home_dir, resolve_launch_opts, AppConfig, LaunchContext, PtyManager, PtySink,
-    SessionStore, TabRecord,
+    SessionStore, TabRecord, MAX_TAB_TITLE_LEN,
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
@@ -48,6 +48,8 @@ use winit::window::{Fullscreen, Window, WindowId};
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+const NOTICE_TIMEOUT: Duration = Duration::from_secs(6);
+const MAX_NOTICE_LEN: usize = 240;
 
 /// PTY output delivered from a reader thread, tagged with the tab it belongs to.
 #[derive(Debug)]
@@ -107,6 +109,11 @@ enum ClipAction {
     Paste,
 }
 
+struct Notice {
+    text: String,
+    until: Instant,
+}
+
 pub struct App {
     outbox: Arc<dyn PtyOutbox>,
     config: AppConfig,
@@ -128,6 +135,7 @@ pub struct App {
     clipboard: Option<arboard::Clipboard>,
     left_down: bool,
     selecting: bool,
+    redraw_queued: bool,
     /// In-progress IME composition text (shown at the cursor).
     preedit: String,
     fullscreen: bool,
@@ -136,6 +144,7 @@ pub struct App {
 
     palette: PaletteState,
     settings: SettingsState,
+    notice: Option<Notice>,
 
     // Launch behaviour.
     launch_cwd: Option<String>,
@@ -182,11 +191,13 @@ impl App {
             clipboard: arboard::Clipboard::new().ok(),
             left_down: false,
             selecting: false,
+            redraw_queued: false,
             preedit: String::new(),
             fullscreen: false,
             exit_requested: false,
             palette: PaletteState::default(),
             settings: SettingsState::default(),
+            notice: None,
             launch_cwd: launch.cwd,
             remember_tabs: launch.remember_tabs,
             ephemeral,
@@ -301,6 +312,18 @@ impl App {
         self.rename.is_some()
     }
 
+    pub fn notice_text(&self) -> Option<&str> {
+        self.notice.as_ref().map(|notice| notice.text.as_str())
+    }
+
+    #[doc(hidden)]
+    pub fn remembered_tab_count_for_tests(&self) -> Option<usize> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.load_tabs().ok())
+            .map(|tabs| tabs.len())
+    }
+
     // ── Internal logic ─────────────────────────────────────────────────────
 
     fn horizontal(&self) -> bool {
@@ -324,9 +347,33 @@ impl App {
         }
     }
 
-    fn request_redraw(&self) {
+    fn request_redraw(&mut self) {
+        if self.redraw_queued {
+            return;
+        }
+        self.redraw_queued = true;
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.request_redraw();
+        }
+    }
+
+    fn show_notice(&mut self, message: impl Into<String>) {
+        let text = truncate_to_chars(&message.into(), MAX_NOTICE_LEN);
+        self.notice = Some(Notice {
+            text,
+            until: Instant::now() + NOTICE_TIMEOUT,
+        });
+        self.request_redraw();
+    }
+
+    fn clear_expired_notice(&mut self, now: Instant) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| now >= notice.until)
+        {
+            self.notice = None;
+            self.request_redraw();
         }
     }
 
@@ -376,10 +423,15 @@ impl App {
             {
                 Ok(launch) => launch,
                 Err(e) => {
-                    eprintln!("failed to resolve launch options: {e}");
+                    self.show_notice(format!("Could not resolve shell profile: {e}"));
                     return;
                 }
             };
+        let start_cwd = launch
+            .cwd
+            .clone()
+            .or_else(default_home_dir)
+            .unwrap_or_default();
 
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -390,7 +442,7 @@ impl App {
         let pty_id = match self.pty.spawn(launch, sink) {
             Ok(id) => id,
             Err(e) => {
-                eprintln!("failed to spawn shell: {e}");
+                self.show_notice(format!("Could not start shell: {e}"));
                 return;
             }
         };
@@ -401,7 +453,6 @@ impl App {
             self.config.scrollback_lines,
             cursor_shape(&self.config.cursor_style),
         );
-        let start_cwd = cwd.or_else(default_home_dir).unwrap_or_default();
         self.tabs
             .push(Tab::new(tab_id, core, pty_id, start_cwd, profile_id));
         self.active = self.tabs.len() - 1;
@@ -489,10 +540,13 @@ impl App {
     }
 
     fn save_config(&mut self) {
-        if let Some(store) = self.store.as_ref() {
-            if let Err(e) = store.save_config(&self.config) {
-                eprintln!("failed to save config: {e}");
-            }
+        let error = self
+            .store
+            .as_ref()
+            .and_then(|store| store.save_config(&self.config).err());
+        if let Some(e) = error {
+            eprintln!("failed to save config: {e}");
+            self.show_notice(format!("Could not save settings: {e}"));
         }
     }
 
@@ -502,6 +556,15 @@ impl App {
         self.save_config();
         self.blink_enabled = self.config.cursor_blink;
         self.rebuild_renderer();
+    }
+
+    fn apply_settings_outcome(&mut self, outcome: SettingsOutcome) {
+        match outcome {
+            SettingsOutcome::None => {}
+            SettingsOutcome::Close => self.settings.close(),
+            SettingsOutcome::Changed => self.apply_config_change(),
+            SettingsOutcome::Invalid(message) => self.show_notice(message),
+        }
     }
 
     /// Recreate the renderer (font/theme/scale) and resize every tab.
@@ -560,11 +623,8 @@ impl App {
                 self.request_redraw();
                 return;
             }
-            match self.settings.handle_key(key, text, &mut self.config) {
-                SettingsOutcome::None => {}
-                SettingsOutcome::Close => self.settings.close(),
-                SettingsOutcome::Changed => self.apply_config_change(),
-            }
+            let outcome = self.settings.handle_key(key, text, &mut self.config);
+            self.apply_settings_outcome(outcome);
             self.request_redraw();
             return;
         }
@@ -652,7 +712,7 @@ impl App {
             Key::Enter => {
                 if let Some(buf) = self.rename.take() {
                     if let Some(tab) = self.tabs.get_mut(self.active) {
-                        tab.custom_title = buf.trim().to_string();
+                        tab.custom_title = sanitize_title(&buf);
                     }
                     self.mark_dirty();
                 }
@@ -666,7 +726,9 @@ impl App {
             _ => {
                 if let (Some(buf), Some(text)) = (self.rename.as_mut(), text) {
                     for c in text.chars().filter(|c| !c.is_control()) {
-                        buf.push(c);
+                        if buf.len() + c.len_utf8() <= MAX_TAB_TITLE_LEN {
+                            buf.push(c);
+                        }
                     }
                 }
             }
@@ -760,6 +822,25 @@ impl App {
 
     fn on_mouse_down(&mut self) {
         let (px, py) = self.cursor_pos;
+        if self.settings.open {
+            if let (Some(gpu), Some(renderer)) = (self.gpu.as_ref(), self.renderer.as_ref()) {
+                let (w, h) = gpu.size();
+                let outcome = self.settings.handle_mouse(
+                    px,
+                    py,
+                    w as f32,
+                    h as f32,
+                    renderer.cell_size().1,
+                    &mut self.config,
+                );
+                self.apply_settings_outcome(outcome);
+                self.request_redraw();
+            }
+            return;
+        }
+        if self.palette.open {
+            return;
+        }
         if !self.point_in_viewport(px, py) {
             self.handle_click();
             return;
@@ -973,7 +1054,7 @@ impl App {
                 };
                 TabRecord {
                     id: Some(t.id.to_string()),
-                    title,
+                    title: sanitize_title(&title),
                     cwd: t.cwd.clone(),
                     sort_order: i as i64,
                     is_active: i == active,
@@ -983,12 +1064,19 @@ impl App {
                 }
             })
             .collect();
-        if let Err(e) = store.save_tabs(&records) {
+        let result = if records.is_empty() {
+            store.clear_tabs()
+        } else {
+            store.save_tabs(&records)
+        };
+        if let Err(e) = result {
             eprintln!("failed to save tabs: {e}");
+            self.show_notice(format!("Could not remember tabs: {e}"));
         }
     }
 
     fn render(&mut self) {
+        self.redraw_queued = false;
         let (Some(gpu), Some(renderer)) = (self.gpu.as_mut(), self.renderer.as_mut()) else {
             return;
         };
@@ -1049,6 +1137,27 @@ impl App {
             renderer.begin_overlay();
             self.palette
                 .draw(renderer, &gpu.queue, w as f32, h as f32, &colors);
+        }
+        if let Some(notice) = self.notice.as_ref() {
+            renderer.begin_overlay();
+            let pad = 10.0;
+            let cell_h = renderer.cell_size().1;
+            let text_w = renderer.text_width(&notice.text);
+            let available_w = (w as f32 - pad * 2.0).max(40.0);
+            let min_w = available_w.min(120.0);
+            let box_w = (text_w + pad * 2.0).clamp(min_w, available_w);
+            let box_h = cell_h + pad * 2.0;
+            let x = ((w as f32 - box_w) / 2.0).max(pad);
+            let y = (h as f32 - box_h - pad).max(pad);
+            renderer.fill_rect(x, y, box_w, box_h, [12, 16, 22, 235]);
+            renderer.fill_rect(x, y, 3.0, box_h, colors.accent);
+            renderer.text(
+                &gpu.queue,
+                x + pad,
+                y + pad,
+                &truncate_to_fit(&notice.text, renderer, box_w - pad * 2.0),
+                colors.text,
+            );
         }
         renderer.end(&gpu.device, &gpu.queue);
         gpu.present(renderer);
@@ -1146,7 +1255,14 @@ impl ApplicationHandler<AppEvent> for App {
                 .create_window(Window::default_attributes().with_title("Phantom Terminal"))
                 .expect("failed to create window"),
         );
-        let gpu = pollster::block_on(GpuContext::new(window, event_loop));
+        let gpu = match pollster::block_on(GpuContext::new(window.clone(), event_loop)) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                window.set_title(&format!("Phantom Terminal - {error}"));
+                self.show_notice(error);
+                return;
+            }
+        };
         gpu.window.set_ime_allowed(true);
         let renderer = Renderer::new(
             &gpu.device,
@@ -1200,6 +1316,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.save_after = None;
             }
         }
+        self.clear_expired_notice(now);
         if self.exit_requested {
             event_loop.exit();
             return;
@@ -1211,6 +1328,9 @@ impl ApplicationHandler<AppEvent> for App {
         }
         if let Some(deadline) = self.save_after {
             next = next.min(deadline);
+        }
+        if let Some(notice) = self.notice.as_ref() {
+            next = next.min(notice.until);
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
@@ -1230,6 +1350,40 @@ fn basename(path: &str) -> String {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "shell".to_string(),
     }
+}
+
+fn sanitize_title(title: &str) -> String {
+    let trimmed = title.trim();
+    let clean: String = trimmed.chars().filter(|c| !c.is_control()).collect();
+    truncate_to_chars(&clean, MAX_TAB_TITLE_LEN)
+}
+
+fn truncate_to_chars(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut out = String::new();
+    for ch in value.chars() {
+        if out.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn truncate_to_fit(value: &str, renderer: &Renderer, max_width: f32) -> String {
+    let cell_w = renderer.cell_size().0.max(1.0);
+    let max_chars = (max_width / cell_w).floor().max(1.0) as usize;
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = value.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
 }
 
 /// Run the app under a winit event loop (the production entry point).

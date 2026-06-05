@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use phantom_app::event::{AppInput, Mods};
 use phantom_app::{App, AppEvent, PtyOutbox};
-use phantom_core::{AppConfig, LaunchContext};
+use phantom_core::{AppConfig, LaunchContext, SessionStore, TabRecord};
 use phantom_emu::Key;
 
 /// Collects PTY output instead of waking a winit loop.
@@ -36,6 +36,17 @@ fn app() -> App {
         Arc::new(TestOutbox::default()),
         AppConfig::default(),
         None,
+        launched(),
+    );
+    app.start();
+    app
+}
+
+fn app_with_store(store: SessionStore) -> App {
+    let mut app = App::new(
+        Arc::new(TestOutbox::default()),
+        AppConfig::default(),
+        Some(store),
         launched(),
     );
     app.start();
@@ -216,4 +227,41 @@ fn close_last_tab_requests_exit() {
     assert_eq!(app.tab_count(), 1);
     app.handle_input(primary('w')); // close the only tab
     assert!(app.exit_requested());
+}
+
+#[test]
+fn close_last_tab_clears_remembered_tabs() {
+    let store = SessionStore::in_memory_for_tests().unwrap();
+    store
+        .save_tabs(&[TabRecord {
+            id: Some("old".into()),
+            title: "old".into(),
+            cwd: "/old".into(),
+            sort_order: 0,
+            is_active: true,
+            shell_profile_id: None,
+            created_at: None,
+            updated_at: None,
+        }])
+        .unwrap();
+    let mut app = app_with_store(store);
+
+    app.handle_input(primary('w'));
+
+    assert!(app.exit_requested());
+    assert_eq!(app.remembered_tab_count_for_tests(), Some(0));
+}
+
+#[test]
+fn invalid_settings_edit_shows_notice() {
+    let mut app = app();
+
+    app.handle_input(primary(',')); // open settings on Font family
+    app.handle_input(press(Key::Enter)); // edit current font family
+    for _ in 0.."monospace".len() {
+        app.handle_input(press(Key::Backspace));
+    }
+    app.handle_input(press(Key::Enter));
+
+    assert_eq!(app.notice_text(), Some("Invalid setting value"));
 }
