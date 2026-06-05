@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/phantom-core", "crates/phantom-emu", "crates/phantom-gfx", "crates/phantom-app", "src-tauri"]
+resolver = "2"
+
+# Shared dependency versions for every workspace member. Members opt in with
+# `dep.workspace = true`, so a version bump happens in exactly one place.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.9"
+rusqlite = { version = "0.40", features = ["bundled"] }
+directories = "6"
+thiserror = "2"
+libc = "0.2"

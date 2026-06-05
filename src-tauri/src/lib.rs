@@ -1,13 +1,6 @@
 mod commands;
-mod config;
-mod error;
-mod launch;
-mod pty;
-mod session;
 
-use launch::LaunchState;
-use pty::PtyManager;
-use session::SessionStore;
+use phantom_core::{LaunchState, PtyManager, SessionStore};
 
 pub struct AppState {
     pub launch: LaunchState,

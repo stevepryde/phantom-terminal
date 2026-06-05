@@ -1,0 +1,20 @@
+[package]
+name = "phantom-core"
+version = "0.1.2"
+description = "Phantom Terminal core: PTY lifecycle, config, session store, launch parsing"
+authors = ["Steve Pryde"]
+license = "MIT"
+edition = "2021"
+
+# UI-agnostic backend shared by the Tauri build (during the native pivot) and the
+# native winit/wgpu app. No GUI, IPC, or rendering dependencies belong here.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+portable-pty = { workspace = true }
+rusqlite = { workspace = true }
+directories = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }

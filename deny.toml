@@ -1,5 +1,7 @@
-# cargo-deny configuration — supply-chain policy for the Rust backend.
-# Run: cargo deny check
+# cargo-deny configuration — supply-chain policy for the whole Rust workspace
+# (phantom-core / phantom-emu / phantom-gfx / phantom-app, plus the Tauri build
+# that still ships during the native pivot). Run from the workspace root:
+#   cargo deny check
 
 [advisories]
 version = 2
@@ -68,6 +70,10 @@ allow = [
   "CC0-1.0",
   "Unicode-3.0",
   "Unicode-DFS-2016",
+  # Boost Software License — clipboard-win / error-code (arboard's Windows
+  # clipboard backend; permissive, OSI-approved). Windows-only at runtime, but
+  # present in the all-platform lockfile.
+  "BSL-1.0",
 ]
 
 [sources]

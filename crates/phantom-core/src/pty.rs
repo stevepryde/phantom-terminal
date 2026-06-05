@@ -8,11 +8,26 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Deserialize;
-use tauri::ipc::{Channel, InvokeResponseBody};
 
 use crate::error::{AppError, AppResult};
 
 const MAX_LIVE_PTY_SESSIONS: usize = 256;
+
+/// Consumer of a PTY session's output.
+///
+/// The reader thread owns the sink and calls [`on_bytes`](PtySink::on_bytes) for
+/// each chunk read from the PTY master, then [`on_eof`](PtySink::on_eof) exactly
+/// once when the shell exits or the pipe closes. This keeps `phantom-core`
+/// UI-agnostic: the Tauri build forwards bytes over an IPC channel, while the
+/// native app feeds them straight into the terminal emulator in-process.
+pub trait PtySink: Send + 'static {
+    /// Handle a chunk of PTY output. Return `false` to stop the reader (e.g. the
+    /// consumer has gone away); returning `true` continues reading.
+    fn on_bytes(&mut self, bytes: &[u8]) -> bool;
+
+    /// Called once after the PTY reaches EOF or the reader stops. Default no-op.
+    fn on_eof(&mut self) {}
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SpawnOpts {
@@ -26,6 +41,7 @@ pub struct SpawnOpts {
     pub cols: u16,
 }
 
+#[derive(Debug)]
 pub struct LaunchOpts {
     /// Executable to run. Empty/None falls back to the user's `$SHELL`.
     pub command: Option<String>,
@@ -85,8 +101,9 @@ impl PtyManager {
         }
     }
 
-    /// Spawn a shell in a new PTY. Output bytes are streamed back over `on_data`.
-    pub fn spawn(&self, opts: LaunchOpts, on_data: Channel<InvokeResponseBody>) -> AppResult<u32> {
+    /// Spawn a shell in a new PTY. Output bytes are delivered to `sink` from a
+    /// dedicated reader thread until the shell exits or the pipe closes.
+    pub fn spawn<S: PtySink>(&self, opts: LaunchOpts, mut sink: S) -> AppResult<u32> {
         let reservation = self.reserve_session()?;
         let size = PtySize {
             rows: opts.rows.max(1),
@@ -153,7 +170,7 @@ impl PtyManager {
             },
         );
 
-        // Reader pump: forward PTY output to the frontend until EOF/close.
+        // Reader pump: forward PTY output to the sink until EOF/close.
         let sessions = Arc::clone(&self.sessions);
         let live_sessions = Arc::clone(&self.live_sessions);
         std::thread::Builder::new()
@@ -164,16 +181,13 @@ impl PtyManager {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if on_data
-                                .send(InvokeResponseBody::Raw(buf[..n].to_vec()))
-                                .is_err()
-                            {
+                            if !sink.on_bytes(&buf[..n]) {
                                 break;
                             }
                         }
                     }
                 }
-                let _ = on_data.send(InvokeResponseBody::Raw(Vec::new()));
+                sink.on_eof();
                 // Shell exited or pipe closed: drop the session.
                 let removed = sessions
                     .lock()

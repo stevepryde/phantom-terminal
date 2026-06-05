@@ -1,0 +1,1253 @@
+//! Phantom Terminal — native terminal app.
+//!
+//! Manages multiple terminal tabs over a single window: a native tab bar, the
+//! VT model per tab ([`AlacrittyCore`]), the [`phantom_gfx`] renderer, keyboard
+//! and mouse routing, cursor blink, tab rename, live cwd tracking, and session
+//! persistence/restore.
+//!
+//! The app *logic* is decoupled from winit: all input arrives as engine-
+//! independent [`event::AppInput`] via [`App::handle_input`], PTY output is
+//! delivered through the [`PtyOutbox`] trait, and "exit" is a flag the host
+//! drains. The winit event loop ([`run`]) is a thin adapter, which also makes
+//! the whole app drivable headlessly in tests.
+
+pub mod event;
+
+mod chrome;
+mod gpu;
+mod input;
+mod keybindings;
+mod palette;
+mod settings;
+mod tab;
+mod themes;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use event::{AppInput, Mods};
+use gpu::GpuContext;
+use keybindings::{Action, Keymap};
+use palette::{PaletteAction, PaletteOutcome, PaletteState};
+use phantom_core::{
+    default_home_dir, resolve_launch_opts, AppConfig, LaunchContext, PtyManager, PtySink,
+    SessionStore, TabRecord,
+};
+use phantom_emu::{
+    encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
+    MouseProtocol, SelSide, VtCore,
+};
+use phantom_gfx::Renderer;
+use settings::{SettingsOutcome, SettingsState};
+use tab::Tab;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::window::{Fullscreen, Window, WindowId};
+
+const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const CWD_POLL_INTERVAL: Duration = Duration::from_millis(400);
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// PTY output delivered from a reader thread, tagged with the tab it belongs to.
+#[derive(Debug)]
+pub enum AppEvent {
+    PtyBytes { tab: u64, bytes: Vec<u8> },
+    PtyExit { tab: u64 },
+}
+
+/// Sink for PTY output events. The winit host wraps an [`EventLoopProxy`]; tests
+/// wrap a collector. Returning `false` tells the reader thread to stop.
+pub trait PtyOutbox: Send + Sync + 'static {
+    fn send(&self, event: AppEvent) -> bool;
+}
+
+/// Production outbox: wakes the winit loop with the event.
+struct ProxyOutbox(EventLoopProxy<AppEvent>);
+
+impl PtyOutbox for ProxyOutbox {
+    fn send(&self, event: AppEvent) -> bool {
+        self.0.send_event(event).is_ok()
+    }
+}
+
+/// Forwards one tab's PTY output to the outbox, tagged with the tab id. Lives on
+/// the PTY reader thread.
+struct ProxySink {
+    outbox: Arc<dyn PtyOutbox>,
+    tab: u64,
+}
+
+impl PtySink for ProxySink {
+    fn on_bytes(&mut self, bytes: &[u8]) -> bool {
+        self.outbox.send(AppEvent::PtyBytes {
+            tab: self.tab,
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    fn on_eof(&mut self) {
+        self.outbox.send(AppEvent::PtyExit { tab: self.tab });
+    }
+}
+
+/// A mouse interaction to report to a mouse-aware application.
+#[derive(Clone, Copy)]
+enum MouseEvent {
+    Press,
+    Release,
+    Drag,
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Clone, Copy)]
+enum ClipAction {
+    Copy,
+    Paste,
+}
+
+pub struct App {
+    outbox: Arc<dyn PtyOutbox>,
+    config: AppConfig,
+    pty: PtyManager,
+    store: Option<SessionStore>,
+    mods: Mods,
+
+    gpu: Option<GpuContext>,
+    renderer: Option<Renderer>,
+
+    keymap: Keymap,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u64,
+
+    cursor_pos: (f32, f32),
+    last_hits: Option<chrome::TabBarHits>,
+
+    clipboard: Option<arboard::Clipboard>,
+    left_down: bool,
+    selecting: bool,
+    /// In-progress IME composition text (shown at the cursor).
+    preedit: String,
+    fullscreen: bool,
+    /// Set when the app wants to quit; the host drains it.
+    exit_requested: bool,
+
+    palette: PaletteState,
+    settings: SettingsState,
+
+    // Launch behaviour.
+    launch_cwd: Option<String>,
+    remember_tabs: bool,
+    ephemeral: bool,
+
+    // Tab rename edit buffer (active tab) when in rename mode.
+    rename: Option<String>,
+
+    // Debounced session save.
+    save_after: Option<Instant>,
+    cwd_deadline: Instant,
+
+    blink_enabled: bool,
+    cursor_on: bool,
+    next_toggle: Instant,
+}
+
+impl App {
+    pub fn new(
+        outbox: Arc<dyn PtyOutbox>,
+        config: AppConfig,
+        store: Option<SessionStore>,
+        launch: LaunchContext,
+    ) -> Self {
+        let keymap = Keymap::from_config(&config.keybindings);
+        let blink_enabled = config.cursor_blink;
+        let ephemeral = launch.cwd.is_some();
+        let now = Instant::now();
+        Self {
+            outbox,
+            config,
+            pty: PtyManager::new(),
+            store,
+            mods: Mods::default(),
+            gpu: None,
+            renderer: None,
+            keymap,
+            tabs: Vec::new(),
+            active: 0,
+            next_tab_id: 0,
+            cursor_pos: (0.0, 0.0),
+            last_hits: None,
+            clipboard: arboard::Clipboard::new().ok(),
+            left_down: false,
+            selecting: false,
+            preedit: String::new(),
+            fullscreen: false,
+            exit_requested: false,
+            palette: PaletteState::default(),
+            settings: SettingsState::default(),
+            launch_cwd: launch.cwd,
+            remember_tabs: launch.remember_tabs,
+            ephemeral,
+            rename: None,
+            save_after: None,
+            cwd_deadline: now + CWD_POLL_INTERVAL,
+            blink_enabled,
+            cursor_on: true,
+            next_toggle: now + BLINK_INTERVAL,
+        }
+    }
+
+    // ── Public surface for the host and tests ──────────────────────────────
+
+    /// Open the initial tab(s) (restore / launch-arg / default shell).
+    pub fn start(&mut self) {
+        self.startup_tabs();
+    }
+
+    /// Dispatch one engine-independent input event.
+    pub fn handle_input(&mut self, input: AppInput) {
+        match input {
+            AppInput::ModifiersChanged(mods) => self.mods = mods,
+            AppInput::Resized { width, height } => self.on_resize(width, height),
+            AppInput::ScaleChanged => self.rebuild_renderer(),
+            AppInput::CloseRequested => {
+                self.save_tabs();
+                for tab in &self.tabs {
+                    let _ = self.pty.kill(tab.pty_id);
+                }
+                self.exit_requested = true;
+            }
+            AppInput::ImeCommit(text) => self.commit_text(&text),
+            AppInput::ImePreedit(text) => {
+                self.preedit = text;
+                self.request_redraw();
+            }
+            AppInput::MouseMove { x, y } => {
+                self.cursor_pos = (x, y);
+                self.on_mouse_move();
+            }
+            AppInput::MouseDown { x, y } => {
+                self.cursor_pos = (x, y);
+                self.on_mouse_down();
+            }
+            AppInput::MouseUp { x, y } => {
+                self.cursor_pos = (x, y);
+                self.on_mouse_up();
+            }
+            AppInput::Wheel { lines } => self.on_scroll(lines),
+            AppInput::Key { key, text, mods } => {
+                self.mods = mods;
+                self.handle_key_input(key, text.as_deref());
+            }
+        }
+    }
+
+    /// Feed a PTY output event into the matching tab.
+    pub fn on_pty_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::PtyBytes { tab, bytes } => {
+                let mut response = None;
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.core.advance(&bytes);
+                    let out = t.core.take_pty_output();
+                    if !out.is_empty() {
+                        response = Some((t.pty_id, out));
+                    }
+                }
+                if let Some((pty_id, out)) = response {
+                    let _ = self.pty.write(pty_id, &out);
+                }
+                self.request_redraw();
+            }
+            AppEvent::PtyExit { tab } => {
+                if let Some(index) = self.tabs.iter().position(|t| t.id == tab) {
+                    self.close_tab(index);
+                }
+            }
+        }
+    }
+
+    pub fn exit_requested(&self) -> bool {
+        self.exit_requested
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn active_title(&self) -> Option<String> {
+        self.tabs.get(self.active).map(|t| t.title())
+    }
+
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    pub fn palette_open(&self) -> bool {
+        self.palette.open
+    }
+
+    pub fn settings_open(&self) -> bool {
+        self.settings.open
+    }
+
+    pub fn renaming(&self) -> bool {
+        self.rename.is_some()
+    }
+
+    // ── Internal logic ─────────────────────────────────────────────────────
+
+    fn horizontal(&self) -> bool {
+        self.config.tab_layout != "vertical"
+    }
+
+    /// Cell grid `(rows, cols)` that fits the terminal viewport.
+    fn viewport_grid(&self) -> (u16, u16) {
+        match (self.gpu.as_ref(), self.renderer.as_ref()) {
+            (Some(gpu), Some(renderer)) => {
+                let (w, h) = gpu.size();
+                let layout = chrome::compute_layout(
+                    w as f32,
+                    h as f32,
+                    renderer.cell_size().1,
+                    self.horizontal(),
+                );
+                renderer.grid_size(layout.viewport.w as u32, layout.viewport.h as u32)
+            }
+            _ => (24, 80),
+        }
+    }
+
+    fn request_redraw(&self) {
+        if let Some(gpu) = self.gpu.as_ref() {
+            gpu.window.request_redraw();
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        if !self.ephemeral && self.save_after.is_none() {
+            self.save_after = Some(Instant::now() + SAVE_DEBOUNCE);
+        }
+    }
+
+    fn startup_tabs(&mut self) {
+        if let Some(cwd) = self.launch_cwd.take() {
+            self.spawn_tab(None, Some(cwd));
+            return;
+        }
+
+        if self.config.restore_on_launch && self.remember_tabs {
+            let records = self
+                .store
+                .as_ref()
+                .and_then(|s| s.load_tabs().ok())
+                .unwrap_or_default();
+            if !records.is_empty() {
+                let mut active = 0;
+                for (i, rec) in records.iter().enumerate() {
+                    self.spawn_tab(rec.shell_profile_id.clone(), Some(rec.cwd.clone()));
+                    if rec.title != basename(&rec.cwd) {
+                        if let Some(tab) = self.tabs.last_mut() {
+                            tab.custom_title = rec.title.clone();
+                        }
+                    }
+                    if rec.is_active {
+                        active = i;
+                    }
+                }
+                self.active = active.min(self.tabs.len().saturating_sub(1));
+                return;
+            }
+        }
+
+        self.spawn_tab(None, None);
+    }
+
+    fn spawn_tab(&mut self, profile_id: Option<String>, cwd: Option<String>) {
+        let (rows, cols) = self.viewport_grid();
+        let launch =
+            match resolve_launch_opts(&self.config, profile_id.as_deref(), cwd.clone(), rows, cols)
+            {
+                Ok(launch) => launch,
+                Err(e) => {
+                    eprintln!("failed to resolve launch options: {e}");
+                    return;
+                }
+            };
+
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let sink = ProxySink {
+            outbox: Arc::clone(&self.outbox),
+            tab: tab_id,
+        };
+        let pty_id = match self.pty.spawn(launch, sink) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("failed to spawn shell: {e}");
+                return;
+            }
+        };
+
+        let core = AlacrittyCore::new(
+            rows,
+            cols,
+            self.config.scrollback_lines,
+            cursor_shape(&self.config.cursor_style),
+        );
+        let start_cwd = cwd.or_else(default_home_dir).unwrap_or_default();
+        self.tabs
+            .push(Tab::new(tab_id, core, pty_id, start_cwd, profile_id));
+        self.active = self.tabs.len() - 1;
+        self.mark_dirty();
+        self.request_redraw();
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(index);
+        let _ = self.pty.kill(tab.pty_id);
+        if self.tabs.is_empty() {
+            self.save_tabs();
+            self.exit_requested = true;
+            return;
+        }
+        // Keep `active` pointing at the same tab: if a tab before it was removed,
+        // everything shifted down by one; otherwise just clamp if it was last.
+        if index < self.active {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        self.rename = None;
+        self.mark_dirty();
+        self.request_redraw();
+    }
+
+    fn handle_action(&mut self, action: Action) {
+        match action {
+            Action::NewTab => self.spawn_tab(None, None),
+            Action::CloseTab => self.close_tab(self.active),
+            Action::SwitchTab(n) => {
+                let i = (n as usize).saturating_sub(1);
+                if i < self.tabs.len() {
+                    self.active = i;
+                    self.mark_dirty();
+                    self.request_redraw();
+                }
+            }
+            Action::RenameTab => {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    self.rename = Some(tab.title());
+                    self.request_redraw();
+                }
+            }
+            Action::TogglePalette => {
+                if self.palette.open {
+                    self.palette.close();
+                } else {
+                    self.palette.open(&self.config);
+                }
+                self.request_redraw();
+            }
+            Action::ToggleSettings => {
+                if self.settings.open {
+                    self.settings.close();
+                } else {
+                    self.settings.open();
+                }
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn dispatch_palette(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::NewTab => self.spawn_tab(None, None),
+            PaletteAction::CloseTab => self.close_tab(self.active),
+            PaletteAction::RenameTab => {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    self.rename = Some(tab.title());
+                }
+            }
+            PaletteAction::NewTabWithProfile(id) => self.spawn_tab(Some(id), None),
+            PaletteAction::SetUiTheme(name) => {
+                self.config.ui_theme = name;
+                self.save_config();
+            }
+            PaletteAction::OpenSettings => self.settings.open(),
+        }
+        self.request_redraw();
+    }
+
+    fn save_config(&mut self) {
+        if let Some(store) = self.store.as_ref() {
+            if let Err(e) = store.save_config(&self.config) {
+                eprintln!("failed to save config: {e}");
+            }
+        }
+    }
+
+    /// Persist the (already-validated) config and rebuild the renderer so font,
+    /// theme, and layout changes take effect.
+    fn apply_config_change(&mut self) {
+        self.save_config();
+        self.blink_enabled = self.config.cursor_blink;
+        self.rebuild_renderer();
+    }
+
+    /// Recreate the renderer (font/theme/scale) and resize every tab.
+    fn rebuild_renderer(&mut self) {
+        if let Some(gpu) = self.gpu.as_ref() {
+            let renderer = Renderer::new(
+                &gpu.device,
+                &gpu.queue,
+                gpu.format(),
+                &self.config,
+                gpu.scale_factor(),
+            );
+            let (w, h) = gpu.size();
+            renderer.resize(&gpu.queue, w, h);
+            self.renderer = Some(renderer);
+        }
+        let (rows, cols) = self.viewport_grid();
+        for tab in &mut self.tabs {
+            tab.core.resize(rows, cols);
+            let _ = self.pty.resize(tab.pty_id, rows, cols);
+        }
+        self.request_redraw();
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        let mode = self.fullscreen.then(|| Fullscreen::Borderless(None));
+        if let Some(gpu) = self.gpu.as_ref() {
+            gpu.window.set_fullscreen(mode);
+        }
+    }
+
+    /// Commit IME-composed (or otherwise finalized) text to the active tab.
+    fn commit_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.reset_blink();
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.scroll(-1_000_000);
+            tab.core.selection_clear();
+        }
+        if let Some(tab) = self.tabs.get(self.active) {
+            let _ = self.pty.write(tab.pty_id, text.as_bytes());
+        }
+        self.preedit.clear();
+        self.request_redraw();
+    }
+
+    /// Route a key press (after the winit adapter has normalized it).
+    fn handle_key_input(&mut self, key: Key, text: Option<&str>) {
+        // Settings panel captures all keys while open.
+        if self.settings.open {
+            if self.keymap.lookup(key, self.mods) == Some(Action::ToggleSettings) {
+                self.settings.close();
+                self.request_redraw();
+                return;
+            }
+            match self.settings.handle_key(key, text, &mut self.config) {
+                SettingsOutcome::None => {}
+                SettingsOutcome::Close => self.settings.close(),
+                SettingsOutcome::Changed => self.apply_config_change(),
+            }
+            self.request_redraw();
+            return;
+        }
+        // Command palette captures all keys while open.
+        if self.palette.open {
+            if self.keymap.lookup(key, self.mods) == Some(Action::TogglePalette) {
+                self.palette.close();
+                self.request_redraw();
+                return;
+            }
+            match self.palette.handle_key(key, text) {
+                PaletteOutcome::None => {}
+                PaletteOutcome::Close => self.palette.close(),
+                PaletteOutcome::Execute(action) => {
+                    self.palette.close();
+                    self.dispatch_palette(action);
+                }
+            }
+            self.request_redraw();
+            return;
+        }
+        // Rename mode captures all keys.
+        if self.rename.is_some() {
+            self.handle_rename_key(key, text);
+            return;
+        }
+        // Clipboard shortcuts.
+        if let Some(action) = self.clipboard_action(key, self.mods) {
+            match action {
+                ClipAction::Copy => self.copy_selection(),
+                ClipAction::Paste => self.paste_clipboard(),
+            }
+            return;
+        }
+        // Fullscreen toggle.
+        if key == Key::F(11) {
+            self.toggle_fullscreen();
+            return;
+        }
+        // Shift+PageUp/Down scroll the viewport by a page.
+        if self.mods.shift {
+            let dir = match key {
+                Key::PageUp => Some(1),
+                Key::PageDown => Some(-1),
+                _ => None,
+            };
+            if let Some(dir) = dir {
+                let page = (self.viewport_grid().0 as i32).max(1);
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.core.scroll(dir * page);
+                }
+                self.request_redraw();
+                return;
+            }
+        }
+        // Keybindings.
+        if let Some(action) = self.keymap.lookup(key, self.mods) {
+            self.handle_action(action);
+            return;
+        }
+        // Otherwise: send to the focused terminal.
+        let app_cursor = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.core.application_cursor_keys())
+            .unwrap_or(false);
+        let bytes = encode_key(key, self.mods.emu(), app_cursor);
+        if !bytes.is_empty() {
+            self.reset_blink();
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                // Typing snaps to the bottom and clears any selection.
+                t.core.scroll(-1_000_000);
+                t.core.selection_clear();
+            }
+            if let Some(t) = self.tabs.get(self.active) {
+                let _ = self.pty.write(t.pty_id, &bytes);
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// Handle a keypress while renaming the active tab.
+    fn handle_rename_key(&mut self, key: Key, text: Option<&str>) {
+        match key {
+            Key::Enter => {
+                if let Some(buf) = self.rename.take() {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.custom_title = buf.trim().to_string();
+                    }
+                    self.mark_dirty();
+                }
+            }
+            Key::Escape => self.rename = None,
+            Key::Backspace => {
+                if let Some(buf) = self.rename.as_mut() {
+                    buf.pop();
+                }
+            }
+            _ => {
+                if let (Some(buf), Some(text)) = (self.rename.as_mut(), text) {
+                    for c in text.chars().filter(|c| !c.is_control()) {
+                        buf.push(c);
+                    }
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn handle_click(&mut self) {
+        enum Hit {
+            New,
+            Close(usize),
+            Switch(usize),
+        }
+        let (px, py) = self.cursor_pos;
+        let mut hit = None;
+        if let Some(hits) = &self.last_hits {
+            if hits.new_tab.contains(px, py) {
+                hit = Some(Hit::New);
+            } else {
+                for th in &hits.tabs {
+                    if th.close.contains(px, py) {
+                        hit = Some(Hit::Close(th.index));
+                        break;
+                    }
+                    if th.rect.contains(px, py) {
+                        hit = Some(Hit::Switch(th.index));
+                        break;
+                    }
+                }
+            }
+        }
+        match hit {
+            Some(Hit::New) => self.spawn_tab(None, None),
+            Some(Hit::Close(i)) => self.close_tab(i),
+            Some(Hit::Switch(i)) => {
+                self.active = i;
+                self.rename = None;
+                self.mark_dirty();
+                self.request_redraw();
+            }
+            None => {}
+        }
+    }
+
+    fn layout(&self) -> Option<chrome::Layout> {
+        let gpu = self.gpu.as_ref()?;
+        let renderer = self.renderer.as_ref()?;
+        let (w, h) = gpu.size();
+        Some(chrome::compute_layout(
+            w as f32,
+            h as f32,
+            renderer.cell_size().1,
+            self.horizontal(),
+        ))
+    }
+
+    fn point_in_viewport(&self, px: f32, py: f32) -> bool {
+        self.layout().is_some_and(|l| l.viewport.contains(px, py))
+    }
+
+    /// Map a window pixel to a viewport `(row, col, side)`, if inside the grid.
+    fn viewport_cell(&self, px: f32, py: f32) -> Option<(usize, usize, SelSide)> {
+        let layout = self.layout()?;
+        let vp = layout.viewport;
+        if !vp.contains(px, py) {
+            return None;
+        }
+        let (cw, ch) = self.renderer.as_ref()?.cell_size();
+        let (rows, cols) = self.viewport_grid();
+        let lx = px - vp.x;
+        let ly = py - vp.y;
+        let col = ((lx / cw).floor() as i64).clamp(0, cols as i64 - 1) as usize;
+        let row = ((ly / ch).floor() as i64).clamp(0, rows as i64 - 1) as usize;
+        let side = if lx - col as f32 * cw < cw / 2.0 {
+            SelSide::Left
+        } else {
+            SelSide::Right
+        };
+        Some((row, col, side))
+    }
+
+    fn active_mouse_mode(&self) -> phantom_emu::MouseMode {
+        self.tabs
+            .get(self.active)
+            .map(|t| t.core.mouse_mode())
+            .unwrap_or(phantom_emu::MouseMode {
+                protocol: MouseProtocol::Off,
+                sgr: false,
+            })
+    }
+
+    fn on_mouse_down(&mut self) {
+        let (px, py) = self.cursor_pos;
+        if !self.point_in_viewport(px, py) {
+            self.handle_click();
+            return;
+        }
+        self.left_down = true;
+        if self.active_mouse_mode().reports() {
+            self.report_mouse(px, py, MouseEvent::Press);
+        } else if let Some((row, col, side)) = self.viewport_cell(px, py) {
+            self.selecting = true;
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.core.selection_start(row, col, side);
+            }
+            self.request_redraw();
+        }
+    }
+
+    fn on_mouse_up(&mut self) {
+        let (px, py) = self.cursor_pos;
+        self.left_down = false;
+        if self.selecting {
+            self.selecting = false;
+        } else if self.active_mouse_mode().reports() {
+            self.report_mouse(px, py, MouseEvent::Release);
+        }
+    }
+
+    fn on_mouse_move(&mut self) {
+        if !self.left_down {
+            return;
+        }
+        let (px, py) = self.cursor_pos;
+        if self.selecting {
+            if let Some((row, col, side)) = self.viewport_cell(px, py) {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.core.selection_update(row, col, side);
+                }
+                self.request_redraw();
+            }
+        } else {
+            let mode = self.active_mouse_mode();
+            if mode.reports()
+                && matches!(mode.protocol, MouseProtocol::Drag | MouseProtocol::Motion)
+            {
+                self.report_mouse(px, py, MouseEvent::Drag);
+            }
+        }
+    }
+
+    fn on_scroll(&mut self, lines: i32) {
+        let (px, py) = self.cursor_pos;
+        if self.active_mouse_mode().reports() {
+            let event = if lines > 0 {
+                MouseEvent::WheelUp
+            } else {
+                MouseEvent::WheelDown
+            };
+            for _ in 0..lines.unsigned_abs() {
+                self.report_mouse(px, py, event);
+            }
+        } else {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                // Positive lines (wheel up) scroll back into history.
+                tab.core.scroll(lines * 3);
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// Encode and send a mouse event to a mouse-aware application.
+    fn report_mouse(&mut self, px: f32, py: f32, event: MouseEvent) {
+        let Some((row, col, _)) = self.viewport_cell(px, py) else {
+            return;
+        };
+        let (mode, pty_id) = match self.tabs.get(self.active) {
+            Some(t) => (t.core.mouse_mode(), t.pty_id),
+            None => return,
+        };
+        if !mode.reports() {
+            return;
+        }
+        let (base, pressed) = match event {
+            MouseEvent::Press => (0u8, true),
+            MouseEvent::Release => (0u8, false),
+            MouseEvent::Drag => (32u8, true),
+            MouseEvent::WheelUp => (64u8, true),
+            MouseEvent::WheelDown => (65u8, true),
+        };
+        let mut button = base;
+        if self.mods.shift {
+            button += 4;
+        }
+        if self.mods.alt {
+            button += 8;
+        }
+        if self.mods.ctrl {
+            button += 16;
+        }
+        let bytes = if mode.sgr {
+            encode_mouse_sgr(button, col as u16, row as u16, pressed)
+        } else if pressed {
+            encode_mouse_legacy(button, col as u16, row as u16)
+        } else {
+            encode_mouse_legacy(3 + (button & !3), col as u16, row as u16)
+        };
+        let _ = self.pty.write(pty_id, &bytes);
+    }
+
+    fn copy_selection(&mut self) {
+        let text = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.core.selection_text());
+        if let (Some(text), Some(clipboard)) = (text, self.clipboard.as_mut()) {
+            let _ = clipboard.set_text(text);
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        let text = match self.clipboard.as_mut() {
+            Some(clipboard) => clipboard.get_text().ok(),
+            None => None,
+        };
+        let Some(text) = text.filter(|t| !t.is_empty()) else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let pty_id = tab.pty_id;
+        let mut bytes = Vec::new();
+        if tab.core.bracketed_paste() {
+            // Strip the end marker so pasted content can't break out of the
+            // bracketed-paste guard and inject commands.
+            let sanitized = text.replace("\u{1b}[201~", "");
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(sanitized.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+        } else {
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        let _ = self.pty.write(pty_id, &bytes);
+    }
+
+    /// Detect a copy/paste shortcut: Cmd+C/V on macOS, Ctrl+Shift+C/V elsewhere
+    /// (so a bare Ctrl+C still reaches the shell as SIGINT).
+    fn clipboard_action(&self, key: Key, mods: Mods) -> Option<ClipAction> {
+        let mac = cfg!(target_os = "macos");
+        let primary = if mac { mods.sup } else { mods.ctrl };
+        if !primary || (!mac && !mods.shift) {
+            return None;
+        }
+        let c = match key {
+            Key::Char(c) => c.to_ascii_lowercase(),
+            _ => return None,
+        };
+        match c {
+            'c' => Some(ClipAction::Copy),
+            'v' => Some(ClipAction::Paste),
+            _ => None,
+        }
+    }
+
+    fn on_resize(&mut self, width: u32, height: u32) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.resize(width, height);
+        }
+        if let (Some(renderer), Some(gpu)) = (self.renderer.as_ref(), self.gpu.as_ref()) {
+            renderer.resize(&gpu.queue, width, height);
+        }
+        let (rows, cols) = self.viewport_grid();
+        for tab in &mut self.tabs {
+            tab.core.resize(rows, cols);
+            let _ = self.pty.resize(tab.pty_id, rows, cols);
+        }
+        self.request_redraw();
+    }
+
+    /// Poll the active tab's shell cwd; update its title and persist on change.
+    fn poll_cwd(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let pty_id = tab.pty_id;
+        let current = tab.cwd.clone();
+        if let Some(cwd) = self.pty.cwd(pty_id) {
+            if cwd != current {
+                self.tabs[self.active].cwd = cwd;
+                self.mark_dirty();
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn save_tabs(&mut self) {
+        if self.ephemeral {
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let active = self.active;
+        let records: Vec<TabRecord> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let title = if t.custom_title.is_empty() {
+                    t.title()
+                } else {
+                    t.custom_title.clone()
+                };
+                TabRecord {
+                    id: Some(t.id.to_string()),
+                    title,
+                    cwd: t.cwd.clone(),
+                    sort_order: i as i64,
+                    is_active: i == active,
+                    shell_profile_id: t.profile_id.clone(),
+                    created_at: None,
+                    updated_at: None,
+                }
+            })
+            .collect();
+        if let Err(e) = store.save_tabs(&records) {
+            eprintln!("failed to save tabs: {e}");
+        }
+    }
+
+    fn render(&mut self) {
+        let (Some(gpu), Some(renderer)) = (self.gpu.as_mut(), self.renderer.as_mut()) else {
+            return;
+        };
+        let (w, h) = gpu.size();
+        let layout = chrome::compute_layout(
+            w as f32,
+            h as f32,
+            renderer.cell_size().1,
+            self.config.tab_layout != "vertical",
+        );
+        let colors = chrome::ChromeColors::from_renderer(
+            renderer,
+            themes::ui_theme_accent(&self.config.ui_theme),
+        );
+        let titles: Vec<String> = self.tabs.iter().map(|t| t.title()).collect();
+
+        renderer.begin();
+        let hits = chrome::draw_tab_bar(
+            renderer,
+            &gpu.queue,
+            &layout,
+            &titles,
+            self.active,
+            &colors,
+            self.rename.as_deref(),
+        );
+        if let Some(tab) = self.tabs.get(self.active) {
+            let snapshot = tab.core.snapshot();
+            renderer.draw_terminal(
+                &gpu.queue,
+                &snapshot,
+                self.cursor_on,
+                layout.viewport.x,
+                layout.viewport.y,
+            );
+            // IME composition text, drawn at the cursor with an underline.
+            if !self.preedit.is_empty() {
+                let (cw, ch) = renderer.cell_size();
+                let px = layout.viewport.x + snapshot.cursor.col as f32 * cw;
+                let py = layout.viewport.y + snapshot.cursor.row as f32 * ch;
+                let width = renderer.text_width(&self.preedit);
+                renderer.fill_rect(px, py, width, ch, colors.bar_bg);
+                renderer.text(&gpu.queue, px, py, &self.preedit, colors.text);
+                renderer.fill_rect(px, py + ch - 2.0, width, 2.0, colors.accent);
+            }
+        }
+        if self.settings.open {
+            renderer.begin_overlay();
+            self.settings.draw(
+                renderer,
+                &gpu.queue,
+                &self.config,
+                w as f32,
+                h as f32,
+                &colors,
+            );
+        } else if self.palette.open {
+            renderer.begin_overlay();
+            self.palette
+                .draw(renderer, &gpu.queue, w as f32, h as f32, &colors);
+        }
+        renderer.end(&gpu.device, &gpu.queue);
+        gpu.present(renderer);
+        self.last_hits = Some(hits);
+    }
+
+    fn pump_blink(&mut self) -> bool {
+        if !self.blink_enabled {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= self.next_toggle {
+            self.cursor_on = !self.cursor_on;
+            self.next_toggle = now + BLINK_INTERVAL;
+            return true;
+        }
+        false
+    }
+
+    fn reset_blink(&mut self) {
+        self.cursor_on = true;
+        self.next_toggle = Instant::now() + BLINK_INTERVAL;
+    }
+}
+
+/// Translate a winit window event into an engine-independent [`AppInput`], using
+/// the current modifier state for key events. Returns `None` for events we
+/// ignore (and for `RedrawRequested`, which the caller handles directly).
+fn translate(event: &WindowEvent, mods: Mods, cursor: (f32, f32)) -> Option<AppInput> {
+    Some(match event {
+        WindowEvent::CloseRequested => AppInput::CloseRequested,
+        WindowEvent::ModifiersChanged(m) => {
+            AppInput::ModifiersChanged(input::winit_mods(m.state()))
+        }
+        WindowEvent::Resized(size) => AppInput::Resized {
+            width: size.width,
+            height: size.height,
+        },
+        WindowEvent::ScaleFactorChanged { .. } => AppInput::ScaleChanged,
+        WindowEvent::Ime(ime) => match ime {
+            Ime::Commit(text) => AppInput::ImeCommit(text.clone()),
+            Ime::Preedit(text, _) => AppInput::ImePreedit(text.clone()),
+            Ime::Enabled | Ime::Disabled => AppInput::ImePreedit(String::new()),
+        },
+        WindowEvent::CursorMoved { position, .. } => AppInput::MouseMove {
+            x: position.x as f32,
+            y: position.y as f32,
+        },
+        WindowEvent::MouseInput {
+            state,
+            button: MouseButton::Left,
+            ..
+        } => match state {
+            ElementState::Pressed => AppInput::MouseDown {
+                x: cursor.0,
+                y: cursor.1,
+            },
+            ElementState::Released => AppInput::MouseUp {
+                x: cursor.0,
+                y: cursor.1,
+            },
+        },
+        WindowEvent::MouseWheel { delta, .. } => {
+            let lines = match delta {
+                MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                MouseScrollDelta::PixelDelta(p) => (p.y / 24.0) as i32,
+            };
+            if lines == 0 {
+                return None;
+            }
+            AppInput::Wheel { lines }
+        }
+        WindowEvent::KeyboardInput { event, .. } => {
+            if event.state != ElementState::Pressed {
+                return None;
+            }
+            let key = input::map_key(&event.logical_key)?;
+            AppInput::Key {
+                key,
+                text: event.text.as_ref().map(|s| s.to_string()),
+                mods,
+            }
+        }
+        _ => return None,
+    })
+}
+
+impl ApplicationHandler<AppEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gpu.is_some() {
+            return;
+        }
+        let window = Arc::new(
+            event_loop
+                .create_window(Window::default_attributes().with_title("Phantom Terminal"))
+                .expect("failed to create window"),
+        );
+        let gpu = pollster::block_on(GpuContext::new(window, event_loop));
+        gpu.window.set_ime_allowed(true);
+        let renderer = Renderer::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            &self.config,
+            gpu.scale_factor(),
+        );
+        let (w, h) = gpu.size();
+        renderer.resize(&gpu.queue, w, h);
+
+        self.gpu = Some(gpu);
+        self.renderer = Some(renderer);
+
+        self.start();
+        self.request_redraw();
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        self.on_pty_event(event);
+        if self.exit_requested {
+            event_loop.exit();
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if matches!(event, WindowEvent::RedrawRequested) {
+            self.render();
+            return;
+        }
+        if let Some(input) = translate(&event, self.mods, self.cursor_pos) {
+            self.handle_input(input);
+        }
+        if self.exit_requested {
+            event_loop.exit();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if self.pump_blink() {
+            self.request_redraw();
+        }
+        if now >= self.cwd_deadline {
+            self.poll_cwd();
+            self.cwd_deadline = now + CWD_POLL_INTERVAL;
+        }
+        if let Some(deadline) = self.save_after {
+            if now >= deadline {
+                self.save_tabs();
+                self.save_after = None;
+            }
+        }
+        if self.exit_requested {
+            event_loop.exit();
+            return;
+        }
+
+        let mut next = self.cwd_deadline;
+        if self.blink_enabled {
+            next = next.min(self.next_toggle);
+        }
+        if let Some(deadline) = self.save_after {
+            next = next.min(deadline);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+    }
+}
+
+fn cursor_shape(style: &str) -> CursorShape {
+    match style {
+        "bar" => CursorShape::Beam,
+        "underline" => CursorShape::Underline,
+        _ => CursorShape::Block,
+    }
+}
+
+fn basename(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit('/').next() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => "shell".to_string(),
+    }
+}
+
+/// Run the app under a winit event loop (the production entry point).
+pub fn run() {
+    let store = SessionStore::open()
+        .map_err(|e| eprintln!("session store unavailable ({e}); not persisting"))
+        .ok();
+    let config = store
+        .as_ref()
+        .and_then(|s| s.load_config().ok())
+        .unwrap_or_default();
+    let launch = phantom_core::LaunchState::from_env().context();
+
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .expect("failed to build event loop");
+    let proxy = event_loop.create_proxy();
+    let outbox: Arc<dyn PtyOutbox> = Arc::new(ProxyOutbox(proxy));
+    let mut app = App::new(outbox, config, store, launch);
+    event_loop.run_app(&mut app).expect("event loop error");
+}

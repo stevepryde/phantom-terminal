@@ -1,0 +1,22 @@
+[package]
+name = "phantom-app"
+version = "0.1.2"
+description = "Phantom Terminal native app: winit window + wgpu/glyphon renderer over the VT core"
+authors = ["Steve Pryde"]
+license = "MIT"
+edition = "2021"
+
+[[bin]]
+name = "phantom"
+path = "src/main.rs"
+
+# Native shell: winit window + PTY wiring, drawing the VT snapshot through the
+# hand-rolled phantom-gfx renderer.
+[dependencies]
+arboard = "3"
+phantom-core = { version = "0.1.2", path = "../phantom-core" }
+phantom-emu = { version = "0.1.2", path = "../phantom-emu" }
+phantom-gfx = { version = "0.1.2", path = "../phantom-gfx" }
+pollster = "0.4.0"
+wgpu = "29"
+winit = "0.30"

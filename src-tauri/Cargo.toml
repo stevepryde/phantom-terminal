@@ -19,13 +19,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Thin Tauri shell over the UI-agnostic core. All terminal/config/session logic
+# lives in `phantom-core`; this crate only adapts it to the webview IPC surface.
 tauri = { version = "2", features = ["macos-private-api"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-portable-pty = "0.9"
-rusqlite = { version = "0.40", features = ["bundled"] }
-directories = "6"
-thiserror = "2"
+# Version pin (not just a path) so cargo-deny's wildcard ban is satisfied.
+phantom-core = { version = "0.1.2", path = "../crates/phantom-core" }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
+[dev-dependencies]
+# Used only to construct a `rusqlite::Error` in the command_error mapping tests.
+rusqlite = { workspace = true }

@@ -1,0 +1,24 @@
+//! Phantom Terminal core.
+//!
+//! UI-agnostic backend: PTY lifecycle, configuration + validation, the SQLite
+//! session store, and launch-argument parsing. This crate has no GUI, IPC, or
+//! rendering dependencies so it can be shared by the Tauri build (during the
+//! native pivot) and the native winit/wgpu app.
+//!
+//! Security note: every user-controlled config field is bounds-checked in
+//! [`AppConfig::validate`], and process spawning only ever resolves a stored,
+//! validated [`ShellProfile`] (never an ad-hoc command). See [`resolve_launch_opts`].
+
+pub mod config;
+pub mod error;
+pub mod launch;
+pub mod pty;
+pub mod session;
+pub mod spawn;
+
+pub use config::{AppConfig, Keybinding, ShellProfile, Theme};
+pub use error::{AppError, AppResult};
+pub use launch::{LaunchContext, LaunchState};
+pub use pty::{LaunchOpts, PtyManager, PtySink, SpawnOpts};
+pub use session::{SessionStore, TabRecord};
+pub use spawn::{default_home_dir, resolve_launch_opts};

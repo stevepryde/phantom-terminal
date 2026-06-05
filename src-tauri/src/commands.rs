@@ -2,15 +2,28 @@ use tauri::http::HeaderMap;
 use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request};
 use tauri::State;
 
-use crate::config::AppConfig;
-use crate::error::{command_error, AppError};
-use crate::launch::LaunchContext;
-use crate::pty::{LaunchOpts, SpawnOpts};
-use crate::session::TabRecord;
+use phantom_core::{
+    default_home_dir, resolve_launch_opts, AppConfig, AppError, LaunchContext, PtySink, SpawnOpts,
+    TabRecord,
+};
+
 use crate::AppState;
 
-const MAX_SPAWN_CWD_LEN: usize = 4096;
 const PTY_ID_HEADER: &str = "Phantom-Pty-Id";
+
+/// Bridges PTY output to the webview: each chunk is forwarded over the IPC
+/// channel, and an empty buffer on EOF signals process death to the frontend.
+struct ChannelSink(Channel<InvokeResponseBody>);
+
+impl PtySink for ChannelSink {
+    fn on_bytes(&mut self, bytes: &[u8]) -> bool {
+        self.0.send(InvokeResponseBody::Raw(bytes.to_vec())).is_ok()
+    }
+
+    fn on_eof(&mut self) {
+        let _ = self.0.send(InvokeResponseBody::Raw(Vec::new()));
+    }
+}
 
 #[tauri::command]
 pub fn launch_context(state: State<AppState>) -> LaunchContext {
@@ -27,33 +40,18 @@ pub fn pty_spawn(
     // Trust model: the webview may choose a stored profile id, but it never
     // sends ad hoc commands to execute. Profile command/args changes flow
     // through config_set and Rust validation before this spawn boundary.
-    let profile = config
-        .profile(opts.shell_profile_id.as_deref())
-        .ok_or_else(|| AppError::InvalidConfig("no shell profile available".to_string()))
-        .map_err(command_error)?;
-    let cwd = opts
-        .cwd
-        .filter(|cwd| !cwd.trim().is_empty())
-        .or_else(|| profile.cwd.clone())
-        .or_else(default_home_dir);
-    validate_spawn_cwd(cwd.as_deref()).map_err(command_error)?;
+    let launch = resolve_launch_opts(
+        &config,
+        opts.shell_profile_id.as_deref(),
+        opts.cwd,
+        opts.rows,
+        opts.cols,
+    )
+    .map_err(command_error)?;
 
     state
         .pty
-        .spawn(
-            LaunchOpts {
-                command: if profile.command.trim().is_empty() {
-                    None
-                } else {
-                    Some(profile.command.clone())
-                },
-                args: profile.args.clone(),
-                cwd,
-                rows: opts.rows,
-                cols: opts.cols,
-            },
-            on_data,
-        )
+        .spawn(launch, ChannelSink(on_data))
         .map_err(command_error)
 }
 
@@ -113,27 +111,22 @@ pub fn home_dir() -> Option<String> {
     default_home_dir()
 }
 
-fn default_home_dir() -> Option<String> {
-    directories::BaseDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
-}
-
-fn validate_spawn_cwd(cwd: Option<&str>) -> crate::error::AppResult<()> {
-    if let Some(cwd) = cwd {
-        if cwd.len() > MAX_SPAWN_CWD_LEN {
-            return Err(crate::error::AppError::InvalidConfig(
-                "working directory path is too long".to_string(),
-            ));
-        }
-        if cwd.contains('\0') {
-            return Err(crate::error::AppError::InvalidConfig(
-                "working directory cannot contain NUL bytes".to_string(),
-            ));
-        }
+/// Map an internal error onto a stable, user-safe string for the IPC boundary.
+/// Full internal detail is logged locally; filesystem paths and database
+/// internals never cross to the webview.
+fn command_error(error: AppError) -> String {
+    eprintln!("IPC command failed: {error}");
+    match error {
+        AppError::Pty(message) => format!("terminal error: {message}"),
+        AppError::InvalidConfig(message) => format!("invalid config: {message}"),
+        AppError::Io(_) => "filesystem operation failed".to_string(),
+        AppError::Sqlite(_) => "session database operation failed".to_string(),
+        AppError::Json(_) => "stored data could not be decoded".to_string(),
+        AppError::Other(_) => "operation failed".to_string(),
     }
-    Ok(())
 }
 
-fn pty_id_from_headers(headers: &HeaderMap) -> crate::error::AppResult<u32> {
+fn pty_id_from_headers(headers: &HeaderMap) -> phantom_core::AppResult<u32> {
     let value = headers
         .get(PTY_ID_HEADER)
         .ok_or_else(|| AppError::InvalidConfig("missing pty id header".to_string()))?
@@ -149,29 +142,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_spawn_cwd_accepts_none_and_normal_paths() {
-        validate_spawn_cwd(None).unwrap();
-        validate_spawn_cwd(Some("/Users/steve/projects/phantom-terminal")).unwrap();
+    fn command_error_hides_io_details_from_ipc() {
+        let error = AppError::Io(std::io::Error::other(
+            "permission denied: /Users/steve/Library/Application Support/phantom/terminal/phantom.db",
+        ));
+
+        let visible = command_error(error);
+
+        assert_eq!(visible, "filesystem operation failed");
+        assert!(!visible.contains("/Users/steve"));
     }
 
     #[test]
-    fn validate_spawn_cwd_rejects_too_long_paths() {
-        let cwd = "a".repeat(MAX_SPAWN_CWD_LEN + 1);
+    fn command_error_hides_sqlite_details_from_ipc() {
+        let error = AppError::Sqlite(rusqlite::Error::InvalidPath(
+            "/Users/steve/private/phantom.db".into(),
+        ));
 
-        let error = validate_spawn_cwd(Some(&cwd)).unwrap_err().to_string();
+        let visible = command_error(error);
 
-        assert_eq!(error, "invalid config: working directory path is too long");
+        assert_eq!(visible, "session database operation failed");
+        assert!(!visible.contains("/Users/steve"));
     }
 
     #[test]
-    fn validate_spawn_cwd_rejects_nul_bytes() {
-        let error = validate_spawn_cwd(Some("/tmp\0/phantom"))
-            .unwrap_err()
-            .to_string();
-
+    fn command_error_preserves_user_facing_config_and_pty_messages() {
         assert_eq!(
-            error,
-            "invalid config: working directory cannot contain NUL bytes"
+            command_error(AppError::InvalidConfig(
+                "font size must be between 8 and 48".into()
+            )),
+            "invalid config: font size must be between 8 and 48"
+        );
+        assert_eq!(
+            command_error(AppError::Pty("too many terminals".into())),
+            "terminal error: too many terminals"
         );
     }
 

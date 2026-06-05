@@ -1,9 +1,9 @@
 # osv-scanner advisory policy — mirrors the cargo-deny ignore list in
-# src-tauri/deny.toml. Every entry is an *unmaintained* or *unsound* informational
+# deny.toml. Every entry is an *unmaintained* or *unsound* informational
 # advisory in a transitive dependency that Tauri 2 pins (GTK3 / gtk-rs 0.18, unic-*),
 # with no safe upgrade available while we track Tauri 2. None is an exploitable
 # vulnerability and none is in our direct dependency tree. Keep this in sync with
-# src-tauri/deny.toml; revisit when Tauri migrates off GTK3 / unic.
+# deny.toml; revisit when Tauri migrates off GTK3 / unic.
 #
 # Passed to osv-scanner via `--config=osv-scanner.toml` in .github/workflows/ci.yml.
 
