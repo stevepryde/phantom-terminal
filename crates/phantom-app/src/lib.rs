@@ -1404,6 +1404,17 @@ fn translate(event: &WindowEvent, mods: Mods, cursor: (f32, f32)) -> Option<AppI
     })
 }
 
+fn terminal_owns_keyboard(palette_open: bool, renaming: bool, settings_open: bool) -> bool {
+    !palette_open && !renaming && !settings_open
+}
+
+fn is_keyboard_event(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+    )
+}
+
 impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gpu.is_some() {
@@ -1458,17 +1469,27 @@ impl ApplicationHandler<AppEvent> for App {
             self.clear_chrome_hover();
         }
 
-        let egui_response = match (self.gpu.as_ref(), self.egui.as_mut()) {
-            (Some(gpu), Some(egui)) => Some(egui.on_window_event(&gpu.window, &event)),
-            _ => None,
+        let terminal_owns_keyboard = terminal_owns_keyboard(
+            self.palette.open,
+            self.rename.is_some(),
+            self.ui.settings_open(),
+        );
+        let egui_response = if terminal_owns_keyboard && is_keyboard_event(&event) {
+            None
+        } else {
+            match (self.gpu.as_ref(), self.egui.as_mut()) {
+                (Some(gpu), Some(egui)) => Some(egui.on_window_event(&gpu.window, &event)),
+                _ => None,
+            }
         };
         if egui_response.is_some_and(|response| response.repaint) {
             self.request_redraw();
         }
         let consumed = egui_response.is_some_and(|response| response.consumed);
+        let input = translate(&event, self.mods, self.cursor_pos);
 
         if !consumed {
-            if let Some(input) = translate(&event, self.mods, self.cursor_pos) {
+            if let Some(input) = input {
                 self.handle_input(input);
             }
         }
@@ -1580,4 +1601,17 @@ pub fn run() {
     let outbox: Arc<dyn PtyOutbox> = Arc::new(ProxyOutbox(proxy));
     let mut app = App::new(outbox, config, store, launch);
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_events_bypass_egui_only_when_terminal_owns_input() {
+        assert!(terminal_owns_keyboard(false, false, false));
+        assert!(!terminal_owns_keyboard(true, false, false));
+        assert!(!terminal_owns_keyboard(false, true, false));
+        assert!(!terminal_owns_keyboard(false, false, true));
+    }
 }
