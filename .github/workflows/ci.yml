@@ -103,7 +103,7 @@ jobs:
           rm -f actionlint.tar.gz
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - uses: taiki-e/install-action@15413b256f995d819248ea62704771a959284285 # v2.79.13
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: zizmor
 
@@ -153,7 +153,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: taiki-e/install-action@15413b256f995d819248ea62704771a959284285 # v2.79.13
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: cargo-audit,cargo-deny
 
@@ -247,7 +247,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: taiki-e/install-action@15413b256f995d819248ea62704771a959284285 # v2.79.13
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: cargo-cyclonedx
 
