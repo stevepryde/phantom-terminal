@@ -9,6 +9,7 @@
 //! to match an sRGB surface.
 
 mod atlas;
+mod backdrop;
 mod font;
 #[cfg(feature = "headless")]
 pub mod headless;
@@ -22,6 +23,7 @@ use phantom_core::AppConfig;
 use phantom_emu::{CursorShape, Snapshot};
 
 use atlas::{GlyphAtlas, GlyphKey};
+use backdrop::BackdropRenderer;
 use font::{face_slot, FontSet, REGULAR};
 use palette::{Palette, Rgba};
 
@@ -62,6 +64,7 @@ pub struct Renderer {
     palette: Palette,
     font: FontSet,
     atlas: GlyphAtlas,
+    backdrop: BackdropRenderer,
 
     solid_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
@@ -181,6 +184,7 @@ impl Renderer {
             ],
         });
 
+        let backdrop = BackdropRenderer::new(device, queue, format, &uniform_layout);
         let solid_pipeline = build_pipeline(
             device,
             format,
@@ -207,6 +211,7 @@ impl Renderer {
             palette,
             font,
             atlas,
+            backdrop,
             solid_pipeline,
             glyph_pipeline,
             uniform_buffer,
@@ -295,6 +300,7 @@ impl Renderer {
 
     /// Start a frame: clear both layers and target the base layer.
     pub fn begin(&mut self) {
+        self.backdrop.clear();
         for layer in 0..2 {
             self.solids[layer].clear();
             self.glyphs[layer].clear();
@@ -311,6 +317,19 @@ impl Renderer {
     /// Fill an axis-aligned rectangle (physical px) in the current layer.
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
         self.solids[self.target].push(solid(x, y, w, h, color));
+    }
+
+    /// Draw the selected local terminal backdrop behind terminal cells.
+    pub fn draw_terminal_backdrop(
+        &mut self,
+        name: &str,
+        opacity_percent: u8,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) {
+        self.backdrop.draw(name, opacity_percent, x, y, w, h);
     }
 
     /// Draw monospace `s` with its top-left at `(x, y)` in the current layer.
@@ -459,6 +478,7 @@ impl Renderer {
 
     /// Upload the frame's instance data. Call once after all draws.
     pub fn end(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.backdrop.end(queue);
         self.solid_counts = [self.solids[0].len() as u32, self.solids[1].len() as u32];
         self.glyph_counts = [self.glyphs[0].len() as u32, self.glyphs[1].len() as u32];
 
@@ -493,8 +513,9 @@ impl Renderer {
         let [base_solids, overlay_solids] = self.solid_counts;
         let [base_glyphs, overlay_glyphs] = self.glyph_counts;
 
-        // Draw order = compositing order: base solids, base glyphs, then the
-        // overlay layer on top.
+        // Draw order = compositing order: terminal backdrop, base solids, base
+        // glyphs, then the overlay layer on top.
+        self.backdrop.render(pass, &self.uniform_bind_group);
         self.draw_solids(pass, 0..base_solids);
         self.draw_glyphs(pass, 0..base_glyphs);
         self.draw_solids(pass, base_solids..base_solids + overlay_solids);

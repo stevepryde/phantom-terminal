@@ -77,6 +77,26 @@ pub fn compute_layout(w: f32, h: f32, cell_h: f32, horizontal: bool) -> Layout {
     }
 }
 
+/// Area behind the terminal viewport. This includes the intentional text inset
+/// so backdrops can fill the pane while terminal glyphs stay padded.
+pub fn terminal_pane(layout: &Layout) -> Rect {
+    if layout.horizontal {
+        Rect {
+            x: layout.bar.x,
+            y: layout.bar.y + layout.bar.h,
+            w: layout.bar.w,
+            h: layout.viewport.h + TERMINAL_MARGIN * 2.0,
+        }
+    } else {
+        Rect {
+            x: layout.bar.x + layout.bar.w,
+            y: layout.bar.y,
+            w: layout.viewport.w + TERMINAL_MARGIN * 2.0,
+            h: layout.bar.h,
+        }
+    }
+}
+
 pub struct ChromeColors {
     pub bar_bg: [u8; 4],
     pub active_bg: [u8; 4],
@@ -111,6 +131,12 @@ pub struct TabBarHits {
     pub tabs: Vec<TabHit>,
     pub new_tab: Rect,
     pub settings: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DragIndicator {
+    pub source: usize,
+    pub drop_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -209,6 +235,30 @@ impl TabBarHits {
         }
         ChromeHoverTarget::None
     }
+
+    pub fn tab_body_at(&self, px: f32, py: f32) -> Option<usize> {
+        for tab in &self.tabs {
+            if tab.rect.contains(px, py) && !tab.close.contains(px, py) {
+                return Some(tab.index);
+            }
+        }
+        None
+    }
+
+    pub fn drop_index(&self, px: f32, py: f32, horizontal: bool) -> usize {
+        for tab in &self.tabs {
+            let midpoint = if horizontal {
+                tab.rect.x + tab.rect.w * 0.5
+            } else {
+                tab.rect.y + tab.rect.h * 0.5
+            };
+            let pointer = if horizontal { px } else { py };
+            if pointer < midpoint {
+                return tab.index;
+            }
+        }
+        self.tabs.len()
+    }
 }
 
 /// Draw the tab bar and return click regions. `titles` and `active` describe the
@@ -224,6 +274,7 @@ pub fn draw_tab_bar(
     rename: Option<&str>,
     settings_open: bool,
     animations: &ChromeAnimationState,
+    drag_indicator: Option<DragIndicator>,
 ) -> TabBarHits {
     let bar = layout.bar;
     r.fill_rect(bar.x, bar.y, bar.w, bar.h, colors.bar_bg);
@@ -251,6 +302,12 @@ pub fn draw_tab_bar(
                 h: tab_h,
             };
             let editing = if i == active { rename } else { None };
+            let dragging = drag_indicator.is_some_and(|drag| drag.source == i);
+            let hover = if drag_indicator.is_some() {
+                0.0
+            } else {
+                animations.tab(i)
+            };
             draw_tab_label(
                 r,
                 queue,
@@ -260,7 +317,8 @@ pub fn draw_tab_bar(
                 colors,
                 cell_w,
                 true,
-                animations.tab(i),
+                hover,
+                dragging,
                 editing,
             );
             let close = Rect {
@@ -269,7 +327,12 @@ pub fn draw_tab_bar(
                 w: CLOSE_W,
                 h: rect.h,
             };
-            draw_close_button(r, queue, close, colors, animations.close(i));
+            let close_hover = if drag_indicator.is_some() {
+                0.0
+            } else {
+                animations.close(i)
+            };
+            draw_close_button(r, queue, close, colors, close_hover);
             tabs.push(TabHit {
                 index: i,
                 rect,
@@ -285,11 +348,19 @@ pub fn draw_tab_bar(
         };
         r.text(queue, new_tab.x + PAD, new_tab.y + PAD, "+", colors.text);
         draw_settings_button(r, settings, colors, settings_open, animations.settings());
-        TabBarHits {
+        let hits = TabBarHits {
             tabs,
             new_tab,
             settings,
-        }
+        };
+        draw_drop_indicator(
+            r,
+            &hits,
+            colors,
+            layout.horizontal,
+            drag_indicator.and_then(|drag| drag.drop_index),
+        );
+        hits
     } else {
         let row_h = (r_cell_h(r) + PAD * 2.0).ceil();
         let settings = Rect {
@@ -308,6 +379,12 @@ pub fn draw_tab_bar(
                 h: row_h,
             };
             let editing = if i == active { rename } else { None };
+            let dragging = drag_indicator.is_some_and(|drag| drag.source == i);
+            let hover = if drag_indicator.is_some() {
+                0.0
+            } else {
+                animations.tab(i)
+            };
             draw_tab_label(
                 r,
                 queue,
@@ -317,7 +394,8 @@ pub fn draw_tab_bar(
                 colors,
                 cell_w,
                 false,
-                animations.tab(i),
+                hover,
+                dragging,
                 editing,
             );
             let close = Rect {
@@ -326,7 +404,12 @@ pub fn draw_tab_bar(
                 w: CLOSE_W,
                 h: rect.h,
             };
-            draw_close_button(r, queue, close, colors, animations.close(i));
+            let close_hover = if drag_indicator.is_some() {
+                0.0
+            } else {
+                animations.close(i)
+            };
+            draw_close_button(r, queue, close, colors, close_hover);
             tabs.push(TabHit {
                 index: i,
                 rect,
@@ -348,11 +431,55 @@ pub fn draw_tab_bar(
             colors.dim_text,
         );
         draw_settings_button(r, settings, colors, settings_open, animations.settings());
-        TabBarHits {
+        let hits = TabBarHits {
             tabs,
             new_tab,
             settings,
-        }
+        };
+        draw_drop_indicator(
+            r,
+            &hits,
+            colors,
+            layout.horizontal,
+            drag_indicator.and_then(|drag| drag.drop_index),
+        );
+        hits
+    }
+}
+
+fn draw_drop_indicator(
+    r: &mut Renderer,
+    hits: &TabBarHits,
+    colors: &ChromeColors,
+    horizontal: bool,
+    indicator: Option<usize>,
+) {
+    let Some(index) = indicator else {
+        return;
+    };
+    if hits.tabs.is_empty() {
+        return;
+    }
+    let index = index.min(hits.tabs.len());
+    let rect = if index == hits.tabs.len() {
+        hits.tabs[hits.tabs.len() - 1].rect
+    } else {
+        hits.tabs[index].rect
+    };
+    if horizontal {
+        let x = if index == hits.tabs.len() {
+            rect.x + rect.w
+        } else {
+            rect.x
+        };
+        r.fill_rect(x - 1.5, rect.y + 5.0, 3.0, rect.h - 10.0, colors.accent);
+    } else {
+        let y = if index == hits.tabs.len() {
+            rect.y + rect.h
+        } else {
+            rect.y
+        };
+        r.fill_rect(rect.x + 6.0, y - 1.5, rect.w - 12.0, 3.0, colors.accent);
     }
 }
 
@@ -452,6 +579,7 @@ fn draw_tab_label(
     cell_w: f32,
     underline_accent: bool,
     hover: f32,
+    dragging: bool,
     editing: Option<&str>,
 ) {
     let hover = hover.clamp(0.0, 1.0);
@@ -475,6 +603,9 @@ fn draw_tab_label(
             with_alpha(colors.text, (22.0 * hover) as u8),
         );
     }
+    if dragging {
+        draw_drag_source(r, rect, colors);
+    }
     if active && underline_accent {
         r.fill_rect(rect.x, rect.y + rect.h - 2.0, rect.w, 2.0, colors.accent);
     } else if active {
@@ -489,10 +620,40 @@ fn draw_tab_label(
         ),
         None => (
             truncate(title, max_chars),
-            if active { colors.text } else { colors.dim_text },
+            if dragging || active {
+                colors.text
+            } else {
+                colors.dim_text
+            },
         ),
     };
     r.text(queue, rect.x + PAD, rect.y + PAD, &label, text_color);
+}
+
+fn draw_drag_source(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
+    r.fill_rect(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        with_alpha(colors.accent, 28),
+    );
+    r.fill_rect(rect.x, rect.y, rect.w, 2.0, with_alpha(colors.accent, 170));
+    r.fill_rect(
+        rect.x,
+        rect.y + rect.h - 2.0,
+        rect.w,
+        2.0,
+        with_alpha(colors.accent, 170),
+    );
+    r.fill_rect(rect.x, rect.y, 2.0, rect.h, with_alpha(colors.accent, 130));
+    r.fill_rect(
+        rect.x + rect.w - 2.0,
+        rect.y,
+        2.0,
+        rect.h,
+        with_alpha(colors.accent, 130),
+    );
 }
 
 fn r_cell_h(r: &Renderer) -> f32 {
@@ -555,6 +716,68 @@ fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
 mod tests {
     use super::*;
 
+    fn tab_hit(index: usize, x: f32, y: f32) -> TabHit {
+        TabHit {
+            index,
+            rect: Rect {
+                x,
+                y,
+                w: 100.0,
+                h: 30.0,
+            },
+            close: Rect {
+                x: x + 80.0,
+                y,
+                w: 20.0,
+                h: 30.0,
+            },
+        }
+    }
+
+    fn horizontal_hits() -> TabBarHits {
+        TabBarHits {
+            tabs: vec![
+                tab_hit(0, 0.0, 0.0),
+                tab_hit(1, 100.0, 0.0),
+                tab_hit(2, 200.0, 0.0),
+            ],
+            new_tab: Rect {
+                x: 300.0,
+                y: 0.0,
+                w: 30.0,
+                h: 30.0,
+            },
+            settings: Rect {
+                x: 330.0,
+                y: 0.0,
+                w: 30.0,
+                h: 30.0,
+            },
+        }
+    }
+
+    fn vertical_hits() -> TabBarHits {
+        TabBarHits {
+            tabs: vec![
+                tab_hit(0, 0.0, 0.0),
+                tab_hit(1, 0.0, 30.0),
+                tab_hit(2, 0.0, 60.0),
+            ],
+            new_tab: Rect {
+                x: 0.0,
+                y: 90.0,
+                w: 100.0,
+                h: 30.0,
+            },
+            settings: Rect {
+                x: 0.0,
+                y: 120.0,
+                w: 100.0,
+                h: 30.0,
+            },
+        }
+    }
+
     #[test]
     fn horizontal_layout_splits_off_top_bar() {
         let l = compute_layout(800.0, 600.0, 20.0, true);
@@ -576,6 +799,28 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_terminal_pane_wraps_viewport_inset_below_tab_bar() {
+        let l = compute_layout(800.0, 600.0, 20.0, true);
+        let pane = terminal_pane(&l);
+
+        assert_eq!(pane.x, 0.0);
+        assert_eq!(pane.y, l.bar.h);
+        assert_eq!(pane.w, 800.0);
+        assert_eq!(pane.h, 600.0 - l.bar.h);
+    }
+
+    #[test]
+    fn vertical_terminal_pane_wraps_viewport_inset_beside_tab_bar() {
+        let l = compute_layout(1000.0, 600.0, 20.0, false);
+        let pane = terminal_pane(&l);
+
+        assert_eq!(pane.x, l.bar.w);
+        assert_eq!(pane.y, 0.0);
+        assert_eq!(pane.w, 1000.0 - l.bar.w);
+        assert_eq!(pane.h, 600.0);
+    }
+
+    #[test]
     fn rect_contains_is_half_open() {
         let r = Rect {
             x: 10.0,
@@ -592,21 +837,7 @@ mod tests {
     #[test]
     fn hover_target_prefers_close_over_tab() {
         let hits = TabBarHits {
-            tabs: vec![TabHit {
-                index: 0,
-                rect: Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: 100.0,
-                    h: 30.0,
-                },
-                close: Rect {
-                    x: 80.0,
-                    y: 0.0,
-                    w: 20.0,
-                    h: 30.0,
-                },
-            }],
+            tabs: vec![tab_hit(0, 0.0, 0.0)],
             new_tab: Rect {
                 x: 100.0,
                 y: 0.0,
@@ -624,6 +855,35 @@ mod tests {
         assert_eq!(hits.hover_target(10.0, 10.0), ChromeHoverTarget::Tab(0));
         assert_eq!(hits.hover_target(90.0, 10.0), ChromeHoverTarget::Close(0));
         assert_eq!(hits.hover_target(140.0, 10.0), ChromeHoverTarget::Settings);
+    }
+
+    #[test]
+    fn tab_body_hit_excludes_close_button() {
+        let hits = horizontal_hits();
+
+        assert_eq!(hits.tab_body_at(10.0, 10.0), Some(0));
+        assert_eq!(hits.tab_body_at(90.0, 10.0), None);
+        assert_eq!(hits.tab_body_at(310.0, 10.0), None);
+    }
+
+    #[test]
+    fn horizontal_drop_index_uses_tab_midpoints() {
+        let hits = horizontal_hits();
+
+        assert_eq!(hits.drop_index(49.0, 10.0, true), 0);
+        assert_eq!(hits.drop_index(51.0, 10.0, true), 1);
+        assert_eq!(hits.drop_index(151.0, 10.0, true), 2);
+        assert_eq!(hits.drop_index(299.0, 10.0, true), 3);
+    }
+
+    #[test]
+    fn vertical_drop_index_uses_tab_midpoints() {
+        let hits = vertical_hits();
+
+        assert_eq!(hits.drop_index(10.0, 14.0, false), 0);
+        assert_eq!(hits.drop_index(10.0, 16.0, false), 1);
+        assert_eq!(hits.drop_index(10.0, 46.0, false), 2);
+        assert_eq!(hits.drop_index(10.0, 89.0, false), 3);
     }
 
     #[test]

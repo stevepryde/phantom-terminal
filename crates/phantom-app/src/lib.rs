@@ -50,6 +50,7 @@ const CWD_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_NOTICE_LEN: usize = 240;
+const TAB_DRAG_TOLERANCE_PX: f32 = 8.0;
 
 /// PTY output delivered from a reader thread, tagged with the tab it belongs to.
 #[derive(Debug)]
@@ -114,6 +115,13 @@ struct Notice {
     until: Instant,
 }
 
+struct TabDrag {
+    from: usize,
+    start: (f32, f32),
+    target: usize,
+    active: bool,
+}
+
 pub struct App {
     outbox: Arc<dyn PtyOutbox>,
     config: AppConfig,
@@ -135,6 +143,7 @@ pub struct App {
     cursor_pointer: bool,
     last_hits: Option<chrome::TabBarHits>,
     chrome_anim: chrome::ChromeAnimationState,
+    tab_drag: Option<TabDrag>,
 
     clipboard: Option<arboard::Clipboard>,
     left_down: bool,
@@ -198,6 +207,7 @@ impl App {
             cursor_pointer: false,
             last_hits: None,
             chrome_anim: chrome::ChromeAnimationState::default(),
+            tab_drag: None,
             clipboard: arboard::Clipboard::new().ok(),
             left_down: false,
             selecting: false,
@@ -759,14 +769,49 @@ impl App {
                 self.request_redraw();
             }
             Some(Hit::Close(i)) => self.close_tab(i),
-            Some(Hit::Switch(i)) => {
-                self.active = i;
-                self.rename = None;
-                self.mark_dirty();
-                self.request_redraw();
-            }
+            Some(Hit::Switch(i)) => self.switch_tab(i),
             None => {}
         }
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.active = index;
+        self.rename = None;
+        self.mark_dirty();
+        self.request_redraw();
+    }
+
+    fn reorder_tab(&mut self, from: usize, target: usize) {
+        if from >= self.tabs.len() {
+            return;
+        }
+        let target = target.min(self.tabs.len());
+        let insert_at = if target > from { target - 1 } else { target };
+        if insert_at == from {
+            self.active = from;
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(insert_at, tab);
+        self.active = insert_at;
+        self.rename = None;
+        self.mark_dirty();
+    }
+
+    fn tab_drag_indicator(&self) -> Option<chrome::DragIndicator> {
+        let drag = self.tab_drag.as_ref()?;
+        if !drag.active {
+            return None;
+        }
+        let target = drag.target.min(self.tabs.len());
+        let drop_index = (target != drag.from && target != drag.from + 1).then_some(target);
+        Some(chrome::DragIndicator {
+            source: drag.from,
+            drop_index,
+        })
     }
 
     fn layout(&self) -> Option<chrome::Layout> {
@@ -821,6 +866,19 @@ impl App {
         if self.palette.open {
             return;
         }
+        if let Some(tab) = self
+            .last_hits
+            .as_ref()
+            .and_then(|hits| hits.tab_body_at(px, py))
+        {
+            self.tab_drag = Some(TabDrag {
+                from: tab,
+                start: (px, py),
+                target: tab,
+                active: false,
+            });
+            return;
+        }
         if !self.point_in_viewport(px, py) {
             self.handle_click();
             return;
@@ -839,6 +897,14 @@ impl App {
 
     fn on_mouse_up(&mut self) {
         let (px, py) = self.cursor_pos;
+        if let Some(drag) = self.tab_drag.take() {
+            if drag.active {
+                self.finish_tab_drag(drag);
+            } else {
+                self.switch_tab(drag.from);
+            }
+            return;
+        }
         self.left_down = false;
         if self.selecting {
             self.selecting = false;
@@ -849,6 +915,9 @@ impl App {
 
     fn on_mouse_move(&mut self) {
         self.update_chrome_hover();
+        if self.update_tab_drag() {
+            return;
+        }
         if !self.left_down {
             return;
         }
@@ -870,8 +939,46 @@ impl App {
         }
     }
 
+    fn update_tab_drag(&mut self) -> bool {
+        let Some(drag) = self.tab_drag.as_ref() else {
+            return false;
+        };
+        let (px, py) = self.cursor_pos;
+        let dx = px - drag.start.0;
+        let dy = py - drag.start.1;
+        if !drag.active && dx * dx + dy * dy < TAB_DRAG_TOLERANCE_PX * TAB_DRAG_TOLERANCE_PX {
+            return true;
+        }
+        let target = self
+            .last_hits
+            .as_ref()
+            .map(|hits| hits.drop_index(px, py, self.horizontal()));
+        if let Some(drag) = self.tab_drag.as_mut() {
+            drag.active = true;
+            if let Some(target) = target {
+                drag.target = target;
+            }
+        }
+        self.set_pointer_cursor(true);
+        self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None);
+        self.request_redraw();
+        true
+    }
+
+    fn finish_tab_drag(&mut self, drag: TabDrag) {
+        self.reorder_tab(drag.from, drag.target);
+        self.request_redraw();
+    }
+
     fn update_chrome_hover(&mut self) {
         if !self.cursor_seen {
+            return;
+        }
+        if self.tab_drag.as_ref().is_some_and(|drag| drag.active) {
+            self.set_pointer_cursor(true);
+            if self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None) {
+                self.request_redraw();
+            }
             return;
         }
         let (px, py) = self.cursor_pos;
@@ -889,6 +996,7 @@ impl App {
 
     fn clear_chrome_hover(&mut self) {
         self.cursor_seen = false;
+        self.tab_drag = None;
         self.set_pointer_cursor(false);
         if self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None) {
             self.request_redraw();
@@ -1115,6 +1223,7 @@ impl App {
             self.apply_config_change();
         }
         self.sync_terminal_grid(false);
+        let drag_indicator = self.tab_drag_indicator();
 
         let (Some(gpu), Some(renderer)) = (self.gpu.as_mut(), self.renderer.as_mut()) else {
             return;
@@ -1134,6 +1243,15 @@ impl App {
         let chrome_animating = self.chrome_anim.advance(Instant::now(), titles.len());
 
         renderer.begin();
+        let terminal_pane = chrome::terminal_pane(&layout);
+        renderer.draw_terminal_backdrop(
+            &self.config.terminal_background,
+            self.config.terminal_background_opacity,
+            terminal_pane.x,
+            terminal_pane.y,
+            terminal_pane.w,
+            terminal_pane.h,
+        );
         let hits = chrome::draw_tab_bar(
             renderer,
             &gpu.queue,
@@ -1144,6 +1262,7 @@ impl App {
             self.rename.as_deref(),
             self.ui.settings_open(),
             &self.chrome_anim,
+            drag_indicator,
         );
         if let Some(tab) = self.tabs.get(self.active) {
             let snapshot = tab.core.snapshot();

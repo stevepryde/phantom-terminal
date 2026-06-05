@@ -71,8 +71,11 @@ local assets only. The selected backdrop is a separate validated setting from
 the UI color theme, surfaced directly below the UI theme dropdown in Appearance.
 Keep them dark, low-detail, and low-opacity; artwork should read as embossed
 texture behind text, not as an illustration competing with the terminal buffer.
-Image opacity is a separate bounded setting from `0` to `60`; disable the
-slider when the selected backdrop is `None`.
+Image opacity is a separate bounded setting from `0` to `60` and is applied as
+actual percent opacity by the native renderer. Disable the slider when the
+selected backdrop is `None`. Draw the backdrop across the full terminal pane
+behind the `8px` terminal text inset, with terminal cells, cursor, selection,
+IME, chrome, and overlays composited above it.
 
 | Backdrop | Rule |
 | --- | --- |
@@ -144,6 +147,7 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 | Back navigation | Detail screens should offer a clear back action near the title |
 | Editable rows | The primary row area should be clickable, with separate icon affordances for secondary actions |
 | Terminal tabs | Horizontal tabs fill the full space between vertical separators; selected tabs use only a bottom underline, while inactive tabs stay transparent except for temporary hover fill. Vertical tabs live in a left sidebar, use horizontal separators, and show selection with a right-aligned border. |
+| Tab reordering | Start drag-reorder only from the tab body after at least `8px` of movement. Close, new-tab, and Settings targets must not initiate reordering. While dragging, suppress ordinary tab and close hover fades, mark the source tab with an accent-tinted frame, and show a simple accent drop indicator at the insertion point. Do not add a ghost tab preview unless intentionally designed. |
 | Terminal pane | Use a consistent `8px` text inset on all sides while letting the backdrop fill edge-to-edge; keep emulator blank-row trimming separate from intentional layout padding |
 | Settings action | Keep the Settings action as an icon-only chrome button near the top-right of the active chrome area; route it through the same settings toggle path as the keyboard shortcut and command palette. Draw the icon with tintable chrome geometry rather than font or emoji glyphs. |
 | Chrome hover | Tabs and close buttons use brief background-opacity fades on hover. Hovering a close button also keeps its parent tab hovered. Close and Settings icons fade toward the current UI theme accent. Settings hover changes icon colour only, with no hover background or scale. Tab, close, and Settings hover targets use the pointer cursor. |
