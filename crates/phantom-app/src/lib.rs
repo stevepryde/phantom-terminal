@@ -36,7 +36,7 @@ use phantom_core::{
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
-    MouseProtocol, SelSide, VtCore,
+    MouseProtocol, ScrollState, SelSide, VtCore,
 };
 use phantom_gfx::Renderer;
 use tab::Tab;
@@ -51,6 +51,7 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_NOTICE_LEN: usize = 240;
 const TAB_DRAG_TOLERANCE_PX: f32 = 8.0;
+const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 
 /// PTY output delivered from a reader thread, tagged with the tab it belongs to.
 #[derive(Debug)]
@@ -122,6 +123,11 @@ struct TabDrag {
     active: bool,
 }
 
+struct ScrollDrag {
+    start_y: f32,
+    start_offset: usize,
+}
+
 pub struct App {
     outbox: Arc<dyn PtyOutbox>,
     config: AppConfig,
@@ -144,6 +150,8 @@ pub struct App {
     last_hits: Option<chrome::TabBarHits>,
     chrome_anim: chrome::ChromeAnimationState,
     tab_drag: Option<TabDrag>,
+    scroll_drag: Option<ScrollDrag>,
+    wheel_line_remainder: f32,
 
     clipboard: Option<arboard::Clipboard>,
     left_down: bool,
@@ -208,6 +216,8 @@ impl App {
             last_hits: None,
             chrome_anim: chrome::ChromeAnimationState::default(),
             tab_drag: None,
+            scroll_drag: None,
+            wheel_line_remainder: 0.0,
             clipboard: arboard::Clipboard::new().ok(),
             left_down: false,
             selecting: false,
@@ -861,10 +871,56 @@ impl App {
             })
     }
 
+    fn active_scroll_state(&self) -> Option<ScrollState> {
+        self.tabs.get(self.active).map(|t| t.core.scroll_state())
+    }
+
+    fn active_scrollbar_hit_thumb(&self) -> Option<chrome::Rect> {
+        let layout = self.layout()?;
+        chrome::terminal_scrollbar_hit_thumb(&layout, self.active_scroll_state()?)
+    }
+
+    fn active_scrollbar_track(&self) -> Option<chrome::Rect> {
+        let layout = self.layout()?;
+        let scroll = self.active_scroll_state()?;
+        scroll
+            .is_scrollable()
+            .then_some(chrome::terminal_scrollbar_hit_track(&layout))
+    }
+
     fn on_mouse_down(&mut self) {
         let (px, py) = self.cursor_pos;
         if self.palette.open {
             return;
+        }
+        if let (Some(track), Some(scroll)) =
+            (self.active_scrollbar_track(), self.active_scroll_state())
+        {
+            if track.contains(px, py) {
+                let Some(thumb) = self.active_scrollbar_hit_thumb() else {
+                    return;
+                };
+                if thumb.contains(px, py) {
+                    self.scroll_drag = Some(ScrollDrag {
+                        start_y: py,
+                        start_offset: scroll.offset,
+                    });
+                    self.set_pointer_cursor(true);
+                    return;
+                }
+                let page = scroll.viewport_rows.max(1);
+                let target = if py < thumb.y {
+                    scroll.offset.saturating_add(page).min(scroll.history)
+                } else {
+                    scroll.offset.saturating_sub(page)
+                };
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.core.scroll_to_offset(target);
+                }
+                self.set_pointer_cursor(true);
+                self.request_redraw();
+                return;
+            }
         }
         if let Some(tab) = self
             .last_hits
@@ -897,6 +953,9 @@ impl App {
 
     fn on_mouse_up(&mut self) {
         let (px, py) = self.cursor_pos;
+        if self.scroll_drag.take().is_some() {
+            return;
+        }
         if let Some(drag) = self.tab_drag.take() {
             if drag.active {
                 self.finish_tab_drag(drag);
@@ -915,6 +974,9 @@ impl App {
 
     fn on_mouse_move(&mut self) {
         self.update_chrome_hover();
+        if self.update_scroll_drag() {
+            return;
+        }
         if self.update_tab_drag() {
             return;
         }
@@ -937,6 +999,33 @@ impl App {
                 self.report_mouse(px, py, MouseEvent::Drag);
             }
         }
+    }
+
+    fn update_scroll_drag(&mut self) -> bool {
+        let Some(drag) = self.scroll_drag.as_ref() else {
+            return false;
+        };
+        let Some(track) = self.active_scrollbar_track() else {
+            return false;
+        };
+        let Some(scroll) = self.active_scroll_state() else {
+            return false;
+        };
+        let Some(thumb) = chrome::scrollbar_thumb(track, scroll) else {
+            return false;
+        };
+
+        let travel = (track.h - thumb.h).max(1.0);
+        let delta_offset =
+            ((self.cursor_pos.1 - drag.start_y) / travel * scroll.history as f32).round() as i32;
+        let target =
+            (drag.start_offset as i32 - delta_offset).clamp(0, scroll.history as i32) as usize;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.scroll_to_offset(target);
+        }
+        self.set_pointer_cursor(true);
+        self.request_redraw();
+        true
     }
 
     fn update_tab_drag(&mut self) -> bool {
@@ -982,6 +1071,17 @@ impl App {
             return;
         }
         let (px, py) = self.cursor_pos;
+        if self.scroll_drag.is_some()
+            || self
+                .active_scrollbar_track()
+                .is_some_and(|track| track.contains(px, py))
+        {
+            self.set_pointer_cursor(true);
+            if self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None) {
+                self.request_redraw();
+            }
+            return;
+        }
         let hover = self
             .last_hits
             .as_ref()
@@ -997,6 +1097,7 @@ impl App {
     fn clear_chrome_hover(&mut self) {
         self.cursor_seen = false;
         self.tab_drag = None;
+        self.scroll_drag = None;
         self.set_pointer_cursor(false);
         if self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None) {
             self.request_redraw();
@@ -1018,21 +1119,35 @@ impl App {
         }
     }
 
-    fn on_scroll(&mut self, lines: i32) {
+    fn on_scroll(&mut self, lines: f32) {
         let (px, py) = self.cursor_pos;
         if self.active_mouse_mode().reports() {
-            let event = if lines > 0 {
+            let ticks = lines.round() as i32;
+            if ticks == 0 {
+                return;
+            }
+            let event = if lines > 0.0 {
                 MouseEvent::WheelUp
             } else {
                 MouseEvent::WheelDown
             };
-            for _ in 0..lines.unsigned_abs() {
+            for _ in 0..ticks.unsigned_abs() {
                 self.report_mouse(px, py, event);
             }
         } else {
+            self.wheel_line_remainder += lines * WHEEL_LINES_PER_NOTCH;
+            let whole_lines = if self.wheel_line_remainder >= 0.0 {
+                self.wheel_line_remainder.floor()
+            } else {
+                self.wheel_line_remainder.ceil()
+            } as i32;
+            if whole_lines == 0 {
+                return;
+            }
+            self.wheel_line_remainder -= whole_lines as f32;
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 // Positive lines (wheel up) scroll back into history.
-                tab.core.scroll(lines * 3);
+                tab.core.scroll(whole_lines);
             }
             self.request_redraw();
         }
@@ -1273,6 +1388,17 @@ impl App {
                 layout.viewport.x,
                 layout.viewport.y,
             );
+            let scrollbar_active = self.scroll_drag.is_some()
+                || (snapshot.scroll.is_scrollable()
+                    && chrome::terminal_scrollbar_hit_track(&layout)
+                        .contains(self.cursor_pos.0, self.cursor_pos.1));
+            chrome::draw_terminal_scrollbar(
+                renderer,
+                &layout,
+                snapshot.scroll,
+                &colors,
+                scrollbar_active,
+            );
             // IME composition text, drawn at the cursor with an underline.
             if !self.preedit.is_empty() {
                 let (cw, ch) = renderer.cell_size();
@@ -1381,10 +1507,10 @@ fn translate(event: &WindowEvent, mods: Mods, cursor: (f32, f32)) -> Option<AppI
         },
         WindowEvent::MouseWheel { delta, .. } => {
             let lines = match delta {
-                MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
-                MouseScrollDelta::PixelDelta(p) => (p.y / 24.0) as i32,
+                MouseScrollDelta::LineDelta(_, y) => *y,
+                MouseScrollDelta::PixelDelta(p) => p.y as f32 / 24.0,
             };
-            if lines == 0 {
+            if lines.abs() < f32::EPSILON {
                 return None;
             }
             AppInput::Wheel { lines }

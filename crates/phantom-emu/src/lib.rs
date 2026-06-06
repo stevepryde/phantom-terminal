@@ -32,6 +32,10 @@ pub trait VtCore {
     /// Snapshot the visible viewport for rendering.
     fn snapshot(&self) -> Snapshot;
 
+    /// Current scrollback position. `offset = 0` means the viewport is at the
+    /// live prompt; larger offsets move back into history.
+    fn scroll_state(&self) -> ScrollState;
+
     /// Bytes the terminal has produced for the PTY (e.g. responses to device
     /// queries). Draining clears the internal buffer. Callers forward these to
     /// the PTY writer.
@@ -44,6 +48,9 @@ pub trait VtCore {
     /// Scroll the viewport by `delta` lines (positive scrolls back into
     /// history, negative toward the prompt).
     fn scroll(&mut self, delta: i32);
+
+    /// Move the viewport to an absolute scrollback offset.
+    fn scroll_to_offset(&mut self, offset: usize);
 
     /// Begin a text selection at the given viewport cell.
     fn selection_start(&mut self, row: usize, col: usize, side: SelSide);
@@ -194,6 +201,23 @@ pub struct CursorState {
     pub visible: bool,
 }
 
+/// Scrollbar-facing view of the terminal's scrollback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScrollState {
+    /// Lines the viewport is currently scrolled back from the live prompt.
+    pub offset: usize,
+    /// Total lines currently available above the live viewport.
+    pub history: usize,
+    /// Visible terminal rows.
+    pub viewport_rows: usize,
+}
+
+impl ScrollState {
+    pub fn is_scrollable(self) -> bool {
+        self.history > 0 && self.viewport_rows > 0
+    }
+}
+
 /// An immutable, renderer-facing view of the visible terminal viewport.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -202,6 +226,7 @@ pub struct Snapshot {
     /// Row-major `rows * cols` cells of the visible viewport.
     pub cells: Vec<SnapCell>,
     pub cursor: CursorState,
+    pub scroll: ScrollState,
 }
 
 impl Snapshot {

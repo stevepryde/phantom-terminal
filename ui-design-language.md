@@ -149,6 +149,7 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 | Terminal tabs | Horizontal tabs fill the full space between vertical separators; selected tabs use only a bottom underline, while inactive tabs stay transparent except for temporary hover fill. Vertical tabs live in a left sidebar, use horizontal separators, and show selection with a right-aligned border. |
 | Tab reordering | Start drag-reorder only from the tab body after at least `8px` of movement. Close, new-tab, and Settings targets must not initiate reordering. While dragging, suppress ordinary tab and close hover fades, mark the source tab with an accent-tinted frame, and show a simple accent drop indicator at the insertion point. Do not add a ghost tab preview unless intentionally designed. |
 | Terminal pane | Use a consistent `8px` text inset on all sides while letting the backdrop fill edge-to-edge; keep emulator blank-row trimming separate from intentional layout padding |
+| Terminal scrollbar | Draw a slim terminal scrollbar inside the pane's right inset using `phantom-gfx` primitives. It should track scrollback offset, support thumb dragging, use a forgiving hit corridor, expand visually when any part of that corridor is hovered or dragged, page-scroll on empty-track clicks, and never be implemented as an egui overlay or steal PTY grid columns. |
 | Settings action | Keep the Settings action as an icon-only chrome button near the top-right of the active chrome area; route it through the same settings toggle path as the keyboard shortcut and command palette. Draw the icon with tintable chrome geometry rather than font or emoji glyphs. |
 | Chrome hover | Tabs and close buttons use brief background-opacity fades on hover. Hovering a close button also keeps its parent tab hovered. Close and Settings icons fade toward the current UI theme accent. Settings hover changes icon colour only, with no hover background or scale. Tab, close, and Settings hover targets use the pointer cursor. |
 
@@ -177,7 +178,7 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Component | Rule |
 | --- | --- |
 | Native egui layer | Use for settings, contextual side panels, command details, inspectors, forms, sliders, steppers, color controls, and future right-side panels in `phantom-app` |
-| Terminal renderer | `phantom-gfx` owns terminal cells, glyph rendering, cursor, selection, and terminal backdrop only |
+| Terminal renderer | `phantom-gfx` owns terminal cells, glyph rendering, cursor, selection, terminal backdrop, and the terminal scrollbar |
 | `CustomDropdown` | The only dropdown/select primitive for app UI |
 | `IconButton` | Use for chrome-like icon-only actions |
 | Settings `Section` | Provides title, hint, and vertical rhythm |

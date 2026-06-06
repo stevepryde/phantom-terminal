@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use phantom_emu::ScrollState;
 use phantom_gfx::Renderer;
 
 const PAD: f32 = 8.0;
@@ -12,6 +13,11 @@ const SETTINGS_W: f32 = 34.0;
 const MAX_TAB_W: f32 = 220.0;
 const MIN_TAB_W: f32 = 70.0;
 const TERMINAL_MARGIN: f32 = 8.0;
+const SCROLLBAR_W: f32 = 4.0;
+const SCROLLBAR_HOVER_W: f32 = 10.0;
+const SCROLLBAR_HIT_W: f32 = 14.0;
+const SCROLLBAR_INSET: f32 = 4.0;
+const SCROLLBAR_MIN_THUMB_H: f32 = 24.0;
 const HOVER_FADE_SECONDS: f32 = 0.14;
 const HOVER_EPSILON: f32 = 0.01;
 
@@ -95,6 +101,99 @@ pub fn terminal_pane(layout: &Layout) -> Rect {
             h: layout.bar.h,
         }
     }
+}
+
+pub fn terminal_scrollbar_track(layout: &Layout) -> Rect {
+    let pane = terminal_pane(layout);
+    Rect {
+        x: pane.x + pane.w - SCROLLBAR_INSET - SCROLLBAR_W,
+        y: pane.y + SCROLLBAR_INSET,
+        w: SCROLLBAR_W,
+        h: (pane.h - SCROLLBAR_INSET * 2.0).max(0.0),
+    }
+}
+
+pub fn terminal_scrollbar_hit_track(layout: &Layout) -> Rect {
+    let track = terminal_scrollbar_track(layout);
+    Rect {
+        x: track.x + track.w - SCROLLBAR_HIT_W,
+        y: track.y,
+        w: SCROLLBAR_HIT_W,
+        h: track.h,
+    }
+}
+
+pub fn scrollbar_thumb(track: Rect, scroll: ScrollState) -> Option<Rect> {
+    if !scroll.is_scrollable() || track.h <= 0.0 {
+        return None;
+    }
+
+    let content_rows = scroll.history + scroll.viewport_rows;
+    let visible_fraction = scroll.viewport_rows as f32 / content_rows.max(1) as f32;
+    let thumb_h = (track.h * visible_fraction).clamp(SCROLLBAR_MIN_THUMB_H.min(track.h), track.h);
+    let travel = (track.h - thumb_h).max(0.0);
+    let from_top = if scroll.history == 0 {
+        0.0
+    } else {
+        (scroll.history.saturating_sub(scroll.offset) as f32 / scroll.history as f32) * travel
+    };
+
+    Some(Rect {
+        x: track.x,
+        y: track.y + from_top,
+        w: track.w,
+        h: thumb_h,
+    })
+}
+
+pub fn terminal_scrollbar_hit_thumb(layout: &Layout, scroll: ScrollState) -> Option<Rect> {
+    scrollbar_thumb(terminal_scrollbar_hit_track(layout), scroll)
+}
+
+pub fn draw_terminal_scrollbar(
+    r: &mut Renderer,
+    layout: &Layout,
+    scroll: ScrollState,
+    colors: &ChromeColors,
+    active: bool,
+) {
+    let track = if active {
+        terminal_scrollbar_hit_track(layout)
+    } else {
+        terminal_scrollbar_track(layout)
+    };
+    let Some(thumb) = scrollbar_thumb(track, scroll) else {
+        return;
+    };
+    let visual_w = if active {
+        SCROLLBAR_HOVER_W
+    } else {
+        SCROLLBAR_W
+    };
+    let track = Rect {
+        x: track.x + track.w - visual_w,
+        w: visual_w,
+        ..track
+    };
+    let thumb = Rect {
+        x: thumb.x + thumb.w - visual_w,
+        w: visual_w,
+        ..thumb
+    };
+    r.fill_rect(
+        track.x,
+        track.y,
+        track.w,
+        track.h,
+        with_alpha(colors.text, if active { 28 } else { 18 }),
+    );
+    r.fill_rect(
+        thumb.x,
+        thumb.y,
+        thumb.w,
+        thumb.h,
+        with_alpha(colors.text, if active { 132 } else { 96 }),
+    );
 }
 
 pub struct ChromeColors {
@@ -832,6 +931,69 @@ mod tests {
         assert!(r.contains(29.9, 29.9));
         assert!(!r.contains(30.0, 20.0));
         assert!(!r.contains(9.9, 20.0));
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_scroll_offset() {
+        let track = Rect {
+            x: 90.0,
+            y: 10.0,
+            w: 4.0,
+            h: 100.0,
+        };
+        let at_bottom = scrollbar_thumb(
+            track,
+            ScrollState {
+                offset: 0,
+                history: 100,
+                viewport_rows: 25,
+            },
+        )
+        .unwrap();
+        let at_top = scrollbar_thumb(
+            track,
+            ScrollState {
+                offset: 100,
+                history: 100,
+                viewport_rows: 25,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(at_bottom.y + at_bottom.h, track.y + track.h);
+        assert_eq!(at_top.y, track.y);
+        assert_eq!(at_bottom.h, at_top.h);
+    }
+
+    #[test]
+    fn scrollbar_thumb_is_hidden_without_history() {
+        let track = Rect {
+            x: 90.0,
+            y: 10.0,
+            w: 4.0,
+            h: 100.0,
+        };
+        assert!(scrollbar_thumb(
+            track,
+            ScrollState {
+                offset: 0,
+                history: 0,
+                viewport_rows: 25,
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn scrollbar_hit_track_is_wider_but_right_aligned() {
+        let layout = compute_layout(800.0, 600.0, 20.0, true);
+        let visual = terminal_scrollbar_track(&layout);
+        let hit = terminal_scrollbar_hit_track(&layout);
+
+        assert!(hit.w > visual.w);
+        assert_eq!(hit.x + hit.w, visual.x + visual.w);
+        assert_eq!(hit.y, visual.y);
+        assert_eq!(hit.h, visual.h);
     }
 
     #[test]

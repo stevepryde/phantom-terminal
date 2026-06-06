@@ -64,9 +64,9 @@ pub enum AppInput {
         x: f32,
         y: f32,
     },
-    /// Vertical wheel in lines (positive = up / back into history).
+    /// Vertical wheel in terminal-line units (positive = up / back into history).
     Wheel {
-        lines: i32,
+        lines: f32,
     },
     Resized {
         width: u32,

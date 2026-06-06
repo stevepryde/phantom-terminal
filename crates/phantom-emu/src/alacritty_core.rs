@@ -22,8 +22,8 @@ use alacritty_terminal::vte::ansi::{
 };
 
 use crate::{
-    CellAttrs, CellColor, CursorShape, CursorState, MouseMode, MouseProtocol, NamedColor, SelSide,
-    SnapCell, Snapshot, VtCore,
+    CellAttrs, CellColor, CursorShape, CursorState, MouseMode, MouseProtocol, NamedColor,
+    ScrollState, SelSide, SnapCell, Snapshot, VtCore,
 };
 
 /// Buffers bytes the terminal wants written back to the PTY. `send_event` takes
@@ -174,6 +174,16 @@ impl VtCore for AlacrittyCore {
             cols,
             cells,
             cursor,
+            scroll: self.scroll_state(),
+        }
+    }
+
+    fn scroll_state(&self) -> ScrollState {
+        let grid = self.term.grid();
+        ScrollState {
+            offset: grid.display_offset(),
+            history: grid.total_lines().saturating_sub(grid.screen_lines()),
+            viewport_rows: self.size.screen_lines,
         }
     }
 
@@ -186,6 +196,13 @@ impl VtCore for AlacrittyCore {
     }
 
     fn scroll(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+    }
+
+    fn scroll_to_offset(&mut self, offset: usize) {
+        let current = self.term.grid().display_offset();
+        let delta = offset as i64 - current as i64;
+        let delta = delta.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         self.term.scroll_display(Scroll::Delta(delta));
     }
 
@@ -435,6 +452,24 @@ mod tests {
         term.scroll(5);
         let scrolled = term.snapshot().row_text(0);
         assert_ne!(bottom, scrolled, "scrolling back should change the top row");
+    }
+
+    #[test]
+    fn scroll_state_reports_offset_and_history() {
+        let mut term = core(2, 10, 100);
+        for i in 0..20 {
+            term.advance(format!("line{i:02}\r\n").as_bytes());
+        }
+
+        let at_bottom = term.scroll_state();
+        assert_eq!(at_bottom.offset, 0);
+        assert!(at_bottom.history > 0);
+        assert_eq!(at_bottom.viewport_rows, 2);
+
+        term.scroll_to_offset(3);
+        let scrolled = term.scroll_state();
+        assert_eq!(scrolled.offset, 3);
+        assert_eq!(scrolled.history, at_bottom.history);
     }
 
     #[test]
