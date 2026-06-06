@@ -43,14 +43,31 @@ fn app() -> App {
 }
 
 fn app_with_store(store: SessionStore) -> App {
+    app_with_store_and_launch(store, launched())
+}
+
+fn app_with_store_and_launch(store: SessionStore, launch: LaunchContext) -> App {
     let mut app = App::new(
         Arc::new(TestOutbox::default()),
         AppConfig::default(),
         Some(store),
-        launched(),
+        launch,
     );
     app.start();
     app
+}
+
+fn record(id: &str, title: &str, cwd: &str, sort_order: i64, is_active: bool) -> TabRecord {
+    TabRecord {
+        id: Some(id.into()),
+        title: title.into(),
+        cwd: cwd.into(),
+        sort_order,
+        is_active,
+        shell_profile_id: None,
+        created_at: None,
+        updated_at: None,
+    }
 }
 
 /// The platform-primary accelerator modifier (Cmd on macOS, Ctrl elsewhere).
@@ -225,16 +242,7 @@ fn close_last_tab_requests_exit() {
 fn close_last_tab_clears_remembered_tabs() {
     let store = SessionStore::in_memory_for_tests().unwrap();
     store
-        .save_tabs(&[TabRecord {
-            id: Some("old".into()),
-            title: "old".into(),
-            cwd: "/old".into(),
-            sort_order: 0,
-            is_active: true,
-            shell_profile_id: None,
-            created_at: None,
-            updated_at: None,
-        }])
+        .save_tabs(&[record("old", "old", "/old", 0, true)])
         .unwrap();
     let mut app = app_with_store(store);
 
@@ -242,4 +250,71 @@ fn close_last_tab_clears_remembered_tabs() {
 
     assert!(app.exit_requested());
     assert_eq!(app.remembered_tab_count_for_tests(), Some(0));
+}
+
+#[test]
+fn normal_launch_restores_remembered_tabs() {
+    let cwd = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let store = SessionStore::in_memory_for_tests().unwrap();
+    store
+        .save_tabs(&[
+            record("one", "one", &cwd, 0, false),
+            record("two", "two", &cwd, 1, true),
+        ])
+        .unwrap();
+
+    let app = app_with_store(store);
+
+    assert_eq!(app.tab_count(), 2);
+    assert_eq!(app.active_index(), 1);
+    assert_eq!(app.active_title().as_deref(), Some("two"));
+}
+
+#[test]
+fn explicit_cwd_launch_skips_remembered_tabs() {
+    let cwd = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let store = SessionStore::in_memory_for_tests().unwrap();
+    store
+        .save_tabs(&[
+            record("one", "one", &cwd, 0, false),
+            record("two", "two", &cwd, 1, true),
+        ])
+        .unwrap();
+    let app = app_with_store_and_launch(
+        store,
+        LaunchContext {
+            cwd: Some(cwd),
+            remember_tabs: false,
+        },
+    );
+
+    assert_eq!(app.tab_count(), 1);
+    assert_eq!(app.active_index(), 0);
+}
+
+#[test]
+fn window_close_preserves_saved_tabs_after_pty_exit() {
+    let target = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let store = SessionStore::in_memory_for_tests().unwrap();
+    store
+        .save_tabs(&[record("one", "one", &target, 0, true)])
+        .unwrap();
+    let mut app = app_with_store(store);
+
+    app.handle_input(AppInput::CloseRequested);
+    app.on_pty_event(AppEvent::PtyExit { tab: 0 });
+
+    assert!(app.exit_requested());
+    let remembered = app.remembered_tabs_for_tests().expect("remembered tabs");
+    assert_eq!(remembered.len(), 1);
+    assert_eq!(remembered[0].cwd, target);
 }

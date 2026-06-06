@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
@@ -57,8 +57,9 @@ impl TabRecord {
     }
 }
 
+#[derive(Clone)]
 pub struct SessionStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SessionStore {
@@ -73,7 +74,7 @@ impl SessionStore {
         migrate(&conn)?;
         restrict_db_permissions(&path);
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
@@ -82,7 +83,7 @@ impl SessionStore {
         let conn = Connection::open_in_memory()?;
         migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
@@ -399,7 +400,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         SessionStore {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         }
     }
 
@@ -554,7 +555,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let store = SessionStore {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         };
         let loaded = store.load_tabs().unwrap();
         assert_eq!(loaded.len(), 1);

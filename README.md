@@ -50,9 +50,10 @@ phantom --cwd /path/to/project
 ```
 
 `--cwd` launches use your normal settings, but they do not restore remembered
-tabs and do not update remembered tab state. Without `--cwd`, Phantom also
-starts in non-remembering mode when it is launched from a non-home, non-root
-working directory. Use `--normal` to force the usual remembered-tabs launch:
+tabs and do not update remembered tab state. Without `--cwd`, Phantom restores
+remembered tabs when "Restore tabs on launch" is enabled. Use `--normal` to
+force the usual remembered-tabs launch even when another launcher supplies
+`--cwd`:
 
 ```sh
 phantom --normal

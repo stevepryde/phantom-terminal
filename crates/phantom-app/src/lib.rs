@@ -23,7 +23,8 @@ mod palette;
 mod tab;
 mod themes;
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use egui_ui::{EguiLayer, UiState};
@@ -79,6 +80,131 @@ impl PtyOutbox for ProxyOutbox {
     fn send(&self, event: AppEvent) -> bool {
         self.0.send_event(event).is_ok()
     }
+}
+
+enum PersistMsg {
+    SaveTabs(Vec<TabRecord>),
+    SaveConfig(Box<AppConfig>),
+    Flush(mpsc::Sender<()>),
+}
+
+struct Persistence {
+    store: Option<SessionStore>,
+    tx: Option<mpsc::Sender<PersistMsg>>,
+    error_rx: Option<mpsc::Receiver<String>>,
+}
+
+impl Persistence {
+    fn new(store: Option<SessionStore>) -> Self {
+        let Some(worker_store) = store.clone() else {
+            return Self {
+                store,
+                tx: None,
+                error_rx: None,
+            };
+        };
+        let (tx, rx) = mpsc::channel();
+        let (error_tx, error_rx) = mpsc::channel();
+        thread::spawn(move || persistence_worker(worker_store, rx, error_tx));
+        Self {
+            store,
+            tx: Some(tx),
+            error_rx: Some(error_rx),
+        }
+    }
+
+    fn save_tabs(&self, records: Vec<TabRecord>) -> Vec<String> {
+        self.send_or_sync(PersistMsg::SaveTabs(records))
+    }
+
+    fn save_config(&self, config: AppConfig) -> Vec<String> {
+        self.send_or_sync(PersistMsg::SaveConfig(Box::new(config)))
+    }
+
+    fn flush(&self) -> Vec<String> {
+        let (Some(_), Some(tx)) = (self.store.as_ref(), self.tx.as_ref()) else {
+            return Vec::new();
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if let Err(error) = tx.send(PersistMsg::Flush(reply_tx)) {
+            return vec![format!("persistence worker unavailable: {error}")];
+        }
+        if let Err(error) = reply_rx.recv() {
+            return vec![format!("persistence worker did not flush: {error}")];
+        }
+        self.drain_errors()
+    }
+
+    fn drain_errors(&self) -> Vec<String> {
+        self.error_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn send_or_sync(&self, msg: PersistMsg) -> Vec<String> {
+        let Some(store) = self.store.as_ref() else {
+            return Vec::new();
+        };
+        if let Some(tx) = self.tx.as_ref() {
+            match tx.send(msg) {
+                Ok(()) => return Vec::new(),
+                Err(error) => return Self::apply_sync(store, error.0),
+            }
+        }
+        Self::apply_sync(store, msg)
+    }
+
+    fn apply_sync(store: &SessionStore, msg: PersistMsg) -> Vec<String> {
+        match msg {
+            PersistMsg::SaveTabs(records) => persist_tabs(store, records)
+                .err()
+                .map(|error| vec![error])
+                .unwrap_or_default(),
+            PersistMsg::SaveConfig(config) => store
+                .save_config(&config)
+                .err()
+                .map(|error| vec![error.to_string()])
+                .unwrap_or_default(),
+            PersistMsg::Flush(reply) => {
+                let _ = reply.send(());
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn persistence_worker(
+    store: SessionStore,
+    rx: mpsc::Receiver<PersistMsg>,
+    error_tx: mpsc::Sender<String>,
+) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            PersistMsg::SaveTabs(records) => {
+                if let Err(error) = persist_tabs(&store, records) {
+                    let _ = error_tx.send(error);
+                }
+            }
+            PersistMsg::SaveConfig(config) => {
+                if let Err(error) = store.save_config(&config) {
+                    let _ = error_tx.send(error.to_string());
+                }
+            }
+            PersistMsg::Flush(reply) => {
+                let _ = reply.send(());
+            }
+        }
+    }
+}
+
+fn persist_tabs(store: &SessionStore, records: Vec<TabRecord>) -> Result<(), String> {
+    let result = if records.is_empty() {
+        store.clear_tabs()
+    } else {
+        store.save_tabs(&records)
+    };
+    result.map_err(|error| error.to_string())
 }
 
 /// Forwards one tab's PTY output to the outbox, tagged with the tab id. Lives on
@@ -147,6 +273,7 @@ pub struct App {
     config: AppConfig,
     pty: PtyManager,
     store: Option<SessionStore>,
+    persistence: Persistence,
     mods: Mods,
 
     gpu: Option<GpuContext>,
@@ -192,9 +319,8 @@ pub struct App {
     // Tab rename edit buffer (active tab) when in rename mode.
     rename: Option<String>,
 
-    // Debounced session save.
-    save_after: Option<Instant>,
-    config_save_after: Option<Instant>,
+    // Debounced renderer updates. Persistent config/tab metadata saves in the
+    // background as soon as the app state changes.
     renderer_rebuild_after: Option<Instant>,
     live_resize_until: Option<Instant>,
     terminal_resize_deadline: Option<Instant>,
@@ -221,11 +347,13 @@ impl App {
         let ephemeral = !launch.remember_tabs;
         let now = Instant::now();
         let ui = UiState::new(&config);
+        let persistence = Persistence::new(store.clone());
         Self {
             outbox,
             config,
             pty: PtyManager::new(),
             store,
+            persistence,
             mods: Mods::default(),
             gpu: None,
             renderer: None,
@@ -259,8 +387,6 @@ impl App {
             ephemeral,
             applied_window_chrome,
             rename: None,
-            save_after: None,
-            config_save_after: None,
             renderer_rebuild_after: None,
             live_resize_until: None,
             terminal_resize_deadline: None,
@@ -287,12 +413,7 @@ impl App {
             AppInput::Resized { width, height } => self.on_resize(width, height),
             AppInput::ScaleChanged => self.rebuild_renderer(),
             AppInput::CloseRequested => {
-                self.flush_config_save();
-                self.save_tabs();
-                for tab in &self.tabs {
-                    let _ = self.pty.kill(tab.pty_id);
-                }
-                self.exit_requested = true;
+                self.request_exit();
             }
             AppInput::ImeCommit(text) => self.commit_text(&text),
             AppInput::ImePreedit(text) => {
@@ -340,6 +461,9 @@ impl App {
                 self.request_redraw();
             }
             AppEvent::PtyExit { tab } => {
+                if self.exit_requested {
+                    return;
+                }
                 if let Some(index) = self.tabs.iter().position(|t| t.id == tab) {
                     self.close_tab(index);
                 }
@@ -385,10 +509,17 @@ impl App {
 
     #[doc(hidden)]
     pub fn remembered_tab_count_for_tests(&self) -> Option<usize> {
+        let _ = self.persistence.flush();
         self.store
             .as_ref()
             .and_then(|store| store.load_tabs().ok())
             .map(|tabs| tabs.len())
+    }
+
+    #[doc(hidden)]
+    pub fn remembered_tabs_for_tests(&self) -> Option<Vec<TabRecord>> {
+        let _ = self.persistence.flush();
+        self.store.as_ref().and_then(|store| store.load_tabs().ok())
     }
 
     // ── Internal logic ─────────────────────────────────────────────────────
@@ -462,13 +593,11 @@ impl App {
     }
 
     fn mark_dirty(&mut self) {
-        if !self.ephemeral && self.save_after.is_none() {
-            self.save_after = Some(Instant::now() + SAVE_DEBOUNCE);
-        }
+        self.save_tabs();
     }
 
     fn mark_config_dirty(&mut self) {
-        self.config_save_after = Some(Instant::now() + SAVE_DEBOUNCE);
+        self.save_config();
     }
 
     fn mark_renderer_dirty(&mut self) {
@@ -490,7 +619,11 @@ impl App {
             if !records.is_empty() {
                 let mut active = 0;
                 for (i, rec) in records.iter().enumerate() {
-                    self.spawn_tab(rec.shell_profile_id.clone(), Some(rec.cwd.clone()));
+                    self.spawn_tab_with_persistence(
+                        rec.shell_profile_id.clone(),
+                        Some(rec.cwd.clone()),
+                        false,
+                    );
                     if rec.title != basename(&rec.cwd) {
                         if let Some(tab) = self.tabs.last_mut() {
                             tab.custom_title = rec.title.clone();
@@ -509,6 +642,15 @@ impl App {
     }
 
     fn spawn_tab(&mut self, profile_id: Option<String>, cwd: Option<String>) {
+        self.spawn_tab_with_persistence(profile_id, cwd, true);
+    }
+
+    fn spawn_tab_with_persistence(
+        &mut self,
+        profile_id: Option<String>,
+        cwd: Option<String>,
+        persist: bool,
+    ) {
         let (rows, cols) = self.viewport_grid();
         let launch =
             match resolve_launch_opts(&self.config, profile_id.as_deref(), cwd.clone(), rows, cols)
@@ -548,7 +690,9 @@ impl App {
         self.tabs
             .push(Tab::new(tab_id, core, pty_id, start_cwd, profile_id));
         self.active = self.tabs.len() - 1;
-        self.mark_dirty();
+        if persist {
+            self.mark_dirty();
+        }
         self.request_redraw();
     }
 
@@ -559,9 +703,7 @@ impl App {
         let tab = self.tabs.remove(index);
         let _ = self.pty.kill(tab.pty_id);
         if self.tabs.is_empty() {
-            self.flush_config_save();
-            self.save_tabs();
-            self.exit_requested = true;
+            self.request_exit();
             return;
         }
         // Keep `active` pointing at the same tab: if a tab before it was removed,
@@ -629,20 +771,27 @@ impl App {
     }
 
     fn save_config(&mut self) {
-        let error = self
-            .store
-            .as_ref()
-            .and_then(|store| store.save_config(&self.config).err());
-        if let Some(e) = error {
-            eprintln!("failed to save config: {e}");
-            self.show_notice(format!("Could not save settings: {e}"));
-        }
+        let errors = self.persistence.save_config(self.config.clone());
+        self.report_persistence_errors(errors, "Could not save settings");
     }
 
-    fn flush_config_save(&mut self) {
-        if self.config_save_after.take().is_some() {
-            self.save_config();
+    fn flush_persistence(&mut self) {
+        let errors = self.persistence.flush();
+        self.report_persistence_errors(errors, "Could not save app state");
+    }
+
+    fn drain_persistence_errors(&mut self) {
+        let errors = self.persistence.drain_errors();
+        self.report_persistence_errors(errors, "Could not save app state");
+    }
+
+    fn report_persistence_errors(&mut self, errors: Vec<String>, notice: &str) {
+        if errors.is_empty() {
+            return;
         }
+        let joined = errors.join("; ");
+        eprintln!("persistence failed: {joined}");
+        self.show_notice(format!("{notice}: {joined}"));
     }
 
     /// Persist the (already-validated) config and rebuild the renderer so font,
@@ -876,12 +1025,7 @@ impl App {
 
     fn handle_window_control(&mut self, control: chrome::WindowControl) {
         if control == chrome::WindowControl::Close {
-            self.flush_config_save();
-            self.save_tabs();
-            for tab in &self.tabs {
-                let _ = self.pty.kill(tab.pty_id);
-            }
-            self.exit_requested = true;
+            self.request_exit();
             return;
         }
         let Some(gpu) = self.gpu.as_ref() else {
@@ -1247,9 +1391,7 @@ impl App {
 
     fn clear_chrome_hover(&mut self) {
         self.cursor_seen = false;
-        self.tab_drag = None;
-        self.scroll_drag = None;
-        self.set_pointer_cursor(false);
+        self.set_pointer_cursor(self.scroll_drag.is_some() || self.tab_drag.is_some());
         if self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None) {
             self.request_redraw();
         }
@@ -1488,13 +1630,19 @@ impl App {
         }
     }
 
+    fn request_exit(&mut self) {
+        self.save_tabs();
+        self.flush_persistence();
+        for tab in &self.tabs {
+            let _ = self.pty.kill(tab.pty_id);
+        }
+        self.exit_requested = true;
+    }
+
     fn save_tabs(&mut self) {
         if self.ephemeral {
             return;
         }
-        let Some(store) = self.store.as_ref() else {
-            return;
-        };
         let active = self.active;
         let records: Vec<TabRecord> = self
             .tabs
@@ -1518,15 +1666,8 @@ impl App {
                 }
             })
             .collect();
-        let result = if records.is_empty() {
-            store.clear_tabs()
-        } else {
-            store.save_tabs(&records)
-        };
-        if let Err(e) = result {
-            eprintln!("failed to save tabs: {e}");
-            self.show_notice(format!("Could not remember tabs: {e}"));
-        }
+        let errors = self.persistence.save_tabs(records);
+        self.report_persistence_errors(errors, "Could not remember tabs");
     }
 
     fn render(&mut self) {
@@ -1918,7 +2059,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         self.on_pty_event(event);
         if self.exit_requested {
-            self.flush_config_save();
+            self.flush_persistence();
             event_loop.exit();
         }
     }
@@ -1958,7 +2099,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
         if self.exit_requested {
-            self.flush_config_save();
+            self.flush_persistence();
             event_loop.exit();
         }
     }
@@ -1968,21 +2109,10 @@ impl ApplicationHandler<AppEvent> for App {
         if self.pump_blink() {
             self.request_redraw();
         }
+        self.drain_persistence_errors();
         if now >= self.cwd_deadline {
             self.poll_cwd();
             self.cwd_deadline = now + CWD_POLL_INTERVAL;
-        }
-        if let Some(deadline) = self.save_after {
-            if now >= deadline {
-                self.save_tabs();
-                self.save_after = None;
-            }
-        }
-        if let Some(deadline) = self.config_save_after {
-            if now >= deadline {
-                self.save_config();
-                self.config_save_after = None;
-            }
         }
         if let Some(deadline) = self.renderer_rebuild_after {
             if now >= deadline {
@@ -1999,7 +2129,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
         self.clear_expired_notice(now);
         if self.exit_requested {
-            self.flush_config_save();
+            self.flush_persistence();
             event_loop.exit();
             return;
         }
@@ -2015,12 +2145,6 @@ impl ApplicationHandler<AppEvent> for App {
         let mut next = self.cwd_deadline;
         if self.blink_enabled {
             next = next.min(self.next_toggle);
-        }
-        if let Some(deadline) = self.save_after {
-            next = next.min(deadline);
-        }
-        if let Some(deadline) = self.config_save_after {
-            next = next.min(deadline);
         }
         if let Some(deadline) = self.renderer_rebuild_after {
             next = next.min(deadline);
@@ -2166,6 +2290,35 @@ mod tests {
     }
 
     #[test]
+    fn cursor_leave_keeps_scrollbar_drag_active() {
+        let mut app = test_app();
+        app.cursor_seen = true;
+        app.cursor_pointer = true;
+        app.scroll_drag = Some(ScrollDrag {
+            start_y: 10.0,
+            start_offset: 3,
+        });
+
+        app.clear_chrome_hover();
+
+        assert!(app.scroll_drag.is_some());
+        assert!(app.cursor_pointer);
+        assert!(!app.cursor_seen);
+    }
+
+    #[test]
+    fn cursor_leave_without_drag_clears_pointer_cursor() {
+        let mut app = test_app();
+        app.cursor_seen = true;
+        app.cursor_pointer = true;
+
+        app.clear_chrome_hover();
+
+        assert!(!app.cursor_pointer);
+        assert!(!app.cursor_seen);
+    }
+
+    #[test]
     fn terminal_grid_resize_is_debounced_without_force() {
         let mut app = test_app();
         app.tabs.push(Tab::new(
@@ -2263,8 +2416,8 @@ mod tests {
             app.config.terminal_background_opacity.saturating_add(1);
         app.apply_config_change();
 
-        assert!(app.config_save_after.is_some());
         assert!(app.renderer_rebuild_after.is_none());
+        assert_eq!(app.notice_text(), None);
     }
 
     #[test]
