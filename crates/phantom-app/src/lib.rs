@@ -1054,7 +1054,7 @@ impl App {
             .is_some_and(|hits| hits.titlebar_drag_region_contains(px, py))
         {
             if let Some(gpu) = self.gpu.as_ref() {
-                let _ = gpu.window.drag_window();
+                drag_window_from_custom_titlebar(&gpu.window);
             }
             return;
         }
@@ -1817,11 +1817,58 @@ fn custom_window_attributes(attrs: WindowAttributes) -> WindowAttributes {
         .with_titlebar_transparent(true)
         .with_title_hidden(true)
         .with_fullsize_content_view(true)
+        .with_movable_by_window_background(false)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn custom_window_attributes(attrs: WindowAttributes) -> WindowAttributes {
     attrs.with_decorations(false).with_transparent(true)
+}
+
+#[cfg(target_os = "macos")]
+fn configure_custom_window_drag(window: &Window, custom_window_chrome: bool) {
+    if custom_window_chrome {
+        set_macos_window_movable(window, false);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_custom_window_drag(_window: &Window, _custom_window_chrome: bool) {}
+
+#[cfg(target_os = "macos")]
+fn drag_window_from_custom_titlebar(window: &Window) {
+    set_macos_window_movable(window, true);
+    let _ = window.drag_window();
+    set_macos_window_movable(window, false);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn drag_window_from_custom_titlebar(window: &Window) {
+    let _ = window.drag_window();
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_window_movable(window: &Window, movable: bool) {
+    let Some(ns_window) = macos_ns_window(window) else {
+        return;
+    };
+    ns_window.setMovableByWindowBackground(false);
+    ns_window.setMovable(movable);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ns_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+    use objc2_app_kit::NSView;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = window.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::AppKit(handle) => {
+            let ns_view = unsafe { handle.ns_view.as_ptr().cast::<NSView>().as_ref()? };
+            ns_view.window()
+        }
+        _ => None,
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -1847,6 +1894,7 @@ impl ApplicationHandler<AppEvent> for App {
                 return;
             }
         };
+        configure_custom_window_drag(&gpu.window, custom_window_chrome);
         gpu.window.set_ime_allowed(true);
         let renderer = Renderer::new(
             &gpu.device,

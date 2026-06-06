@@ -21,6 +21,7 @@ const CUSTOM_TITLEBAR_H: f32 = 32.0;
 const MAC_TRAFFIC_LIGHT_SPACE: f32 = 76.0;
 const LINUX_WINDOW_BUTTON_W: f32 = 42.0;
 const WINDOW_BORDER_W: f32 = 1.0;
+const CUSTOM_TAB_DRAG_HANDLE_W: f32 = 12.0;
 const SCROLLBAR_W: f32 = 4.0;
 const SCROLLBAR_HOVER_W: f32 = 10.0;
 const SCROLLBAR_HIT_W: f32 = 14.0;
@@ -308,9 +309,13 @@ pub struct TabBarHits {
     pub tabs: Vec<TabHit>,
     pub new_tab: Rect,
     pub settings: Rect,
-    pub ephemeral_indicator: Option<Rect>,
     pub titlebar: Option<Rect>,
     pub window_controls: Vec<WindowControlHit>,
+}
+
+struct HorizontalTabLayout {
+    rects: Vec<Rect>,
+    new_tab: Rect,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -443,12 +448,7 @@ impl TabBarHits {
         if !titlebar.contains(px, py) {
             return false;
         }
-        if self.new_tab.contains(px, py)
-            || self.settings.contains(px, py)
-            || self
-                .ephemeral_indicator
-                .is_some_and(|rect| rect.contains(px, py))
-        {
+        if self.new_tab.contains(px, py) || self.settings.contains(px, py) {
             return false;
         }
         if self
@@ -513,7 +513,6 @@ pub fn draw_tab_bar(
     let window_controls = window_control_hits(layout);
 
     if layout.horizontal {
-        let left_reserved = custom_left_reserved(layout);
         let right_reserved = custom_right_reserved(layout);
         let settings = Rect {
             x: bar.x + (bar.w - right_reserved - SETTINGS_W).max(0.0),
@@ -522,11 +521,8 @@ pub fn draw_tab_bar(
             h: bar.h,
         };
         let ephemeral_indicator = ephemeral.then_some(ephemeral_indicator_rect(settings));
-        let tab_start = bar.x + left_reserved;
-        let status_w = if ephemeral { EPHEMERAL_W } else { 0.0 };
-        let tab_limit = (settings.x - status_w - NEW_TAB_W).max(tab_start);
-        let tab_h = bar.h;
-        let rects = horizontal_tab_rects(titles.len(), tab_start, tab_limit, bar.y, tab_h);
+        let HorizontalTabLayout { rects, new_tab } =
+            horizontal_tab_layout(layout, settings, titles.len(), ephemeral);
         let mut tabs = Vec::with_capacity(rects.len());
         for (i, rect) in rects.iter().copied().enumerate() {
             let title = &titles[i];
@@ -568,12 +564,6 @@ pub fn draw_tab_bar(
                 close,
             });
         }
-        let new_tab = Rect {
-            x: horizontal_new_tab_x(rects.last().copied(), tab_limit).max(bar.x),
-            y: bar.y,
-            w: NEW_TAB_W,
-            h: tab_h,
-        };
         draw_new_tab_button(r, queue, new_tab, colors);
         if let Some(rect) = ephemeral_indicator {
             draw_ephemeral_indicator(r, rect, colors);
@@ -584,7 +574,6 @@ pub fn draw_tab_bar(
             tabs,
             new_tab,
             settings,
-            ephemeral_indicator,
             titlebar,
             window_controls,
         };
@@ -698,7 +687,6 @@ pub fn draw_tab_bar(
             tabs,
             new_tab,
             settings,
-            ephemeral_indicator,
             titlebar,
             window_controls,
         };
@@ -733,7 +721,7 @@ fn horizontal_tab_rects(
     let mut tabs = Vec::with_capacity(tab_count);
     let mut x = tab_start;
     for _ in 0..tab_count {
-        if x >= tab_limit {
+        if x + tab_w > tab_limit + f32::EPSILON {
             break;
         }
         tabs.push(Rect { x, y, w: tab_w, h });
@@ -742,11 +730,47 @@ fn horizontal_tab_rects(
     tabs
 }
 
-fn horizontal_new_tab_x(last_tab: Option<Rect>, tab_limit: f32) -> f32 {
-    last_tab
+fn horizontal_tab_layout(
+    layout: &Layout,
+    settings: Rect,
+    tab_count: usize,
+    ephemeral: bool,
+) -> HorizontalTabLayout {
+    let bar = layout.bar;
+    let drag_handle_w = custom_tab_drag_handle_w(layout);
+    let tab_start = bar.x + custom_left_reserved(layout) + drag_handle_w;
+    let status_w = horizontal_status_slot_w(layout, ephemeral);
+    let new_tab_limit = (settings.x - status_w - NEW_TAB_W).max(tab_start);
+    let tab_limit = new_tab_limit;
+    let rects = horizontal_tab_rects(tab_count, tab_start, tab_limit, bar.y, bar.h);
+    let tab_end = rects
+        .last()
         .map(|rect| rect.x + rect.w)
-        .unwrap_or(tab_limit)
-        .min(tab_limit)
+        .unwrap_or(tab_start);
+    let new_tab = Rect {
+        x: tab_end.min(new_tab_limit).max(bar.x),
+        y: bar.y,
+        w: NEW_TAB_W,
+        h: bar.h,
+    };
+
+    HorizontalTabLayout { rects, new_tab }
+}
+
+fn custom_tab_drag_handle_w(layout: &Layout) -> f32 {
+    if layout.custom_chrome {
+        CUSTOM_TAB_DRAG_HANDLE_W
+    } else {
+        0.0
+    }
+}
+
+fn horizontal_status_slot_w(layout: &Layout, ephemeral: bool) -> f32 {
+    if layout.custom_chrome || ephemeral {
+        EPHEMERAL_W
+    } else {
+        0.0
+    }
 }
 
 fn draw_drop_indicator(
@@ -1357,7 +1381,6 @@ mod tests {
                 w: 30.0,
                 h: 30.0,
             },
-            ephemeral_indicator: None,
             titlebar: None,
             window_controls: Vec::new(),
         }
@@ -1382,7 +1405,6 @@ mod tests {
                 w: 100.0,
                 h: 30.0,
             },
-            ephemeral_indicator: None,
             titlebar: None,
             window_controls: Vec::new(),
         }
@@ -1487,7 +1509,6 @@ mod tests {
                 h: layout.bar.h,
             },
             settings: titlebar_settings_rect(layout.titlebar.unwrap(), &layout),
-            ephemeral_indicator: None,
             titlebar: layout.titlebar,
             window_controls: controls,
         };
@@ -1500,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_indicator_sits_next_to_settings_and_is_not_drag_region() {
+    fn ephemeral_indicator_sits_next_to_settings_and_is_drag_region() {
         let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
         let settings = titlebar_settings_rect(layout.titlebar.unwrap(), &layout);
         let indicator = ephemeral_indicator_rect(settings);
@@ -1513,13 +1534,84 @@ mod tests {
                 h: layout.bar.h,
             },
             settings,
-            ephemeral_indicator: Some(indicator),
             titlebar: layout.titlebar,
             window_controls: window_control_hits(&layout),
         };
 
         assert_eq!(indicator.x + indicator.w, settings.x);
-        assert!(!hits.titlebar_drag_region_contains(indicator.x + 1.0, indicator.y + 1.0));
+        assert!(hits.titlebar_drag_region_contains(indicator.x + 1.0, indicator.y + 1.0));
+    }
+
+    #[test]
+    fn custom_titlebar_excludes_tab_body_from_drag_region() {
+        let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
+        let tab = tab_hit(0, 96.0, layout.bar.y);
+        let tab_body_x = tab.rect.x + 12.0;
+        let tab_body_y = tab.rect.y + 12.0;
+        let hits = TabBarHits {
+            tabs: vec![tab],
+            new_tab: Rect {
+                x: 220.0,
+                y: layout.bar.y,
+                w: 30.0,
+                h: layout.bar.h,
+            },
+            settings: titlebar_settings_rect(layout.titlebar.unwrap(), &layout),
+            titlebar: layout.titlebar,
+            window_controls: window_control_hits(&layout),
+        };
+
+        assert_eq!(hits.tab_body_at(tab_body_x, tab_body_y), Some(0));
+        assert!(!hits.titlebar_drag_region_contains(tab_body_x, tab_body_y));
+    }
+
+    #[test]
+    fn custom_horizontal_tabs_use_status_slot_drag_handle_when_crowded() {
+        let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
+        let settings = titlebar_settings_rect(layout.titlebar.unwrap(), &layout);
+        let normal_strip = horizontal_tab_layout(&layout, settings, 50, false);
+        let ephemeral_strip = horizontal_tab_layout(&layout, settings, 50, true);
+        assert_eq!(normal_strip.new_tab, ephemeral_strip.new_tab);
+
+        let strip = normal_strip;
+        let first_tab = strip.rects.first().copied().expect("visible tab");
+        let last_tab = strip.rects.last().copied().expect("visible tab");
+        let tabs = strip
+            .rects
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, rect)| TabHit {
+                index,
+                rect,
+                close: Rect {
+                    x: rect.x + rect.w - CLOSE_W - PAD * 0.5,
+                    y: rect.y,
+                    w: CLOSE_W,
+                    h: rect.h,
+                },
+            })
+            .collect();
+        let hits = TabBarHits {
+            tabs,
+            new_tab: strip.new_tab,
+            settings,
+            titlebar: layout.titlebar,
+            window_controls: window_control_hits(&layout),
+        };
+        let y = layout.bar.y + layout.bar.h * 0.5;
+        let left_handle_x = first_tab.x - CUSTOM_TAB_DRAG_HANDLE_W * 0.5;
+        let status_slot_x = strip.new_tab.x + strip.new_tab.w + EPHEMERAL_W * 0.5;
+
+        assert!(
+            first_tab.x - layout.bar.x >= custom_left_reserved(&layout) + CUSTOM_TAB_DRAG_HANDLE_W
+        );
+        assert_eq!(strip.new_tab.x, last_tab.x + last_tab.w);
+        assert!(settings.x - (strip.new_tab.x + strip.new_tab.w) >= EPHEMERAL_W);
+        assert!(hits.titlebar_drag_region_contains(left_handle_x, y));
+        assert!(hits.titlebar_drag_region_contains(status_slot_x, y));
+        assert!(!hits.titlebar_drag_region_contains(first_tab.x + 1.0, y));
+        assert!(!hits.titlebar_drag_region_contains(strip.new_tab.x + 1.0, y));
     }
 
     #[test]
@@ -1615,7 +1707,6 @@ mod tests {
                 w: 30.0,
                 h: 30.0,
             },
-            ephemeral_indicator: None,
             titlebar: None,
             window_controls: Vec::new(),
         };
