@@ -4,9 +4,10 @@
 //! contextual side panels, forms, sliders, colour controls, and future inspector
 //! surfaces.
 
-use egui::{Button, Color32, ComboBox, Context, Panel, RichText, Slider, TextEdit, Ui, ViewportId};
+use egui::{Button, Color32, ComboBox, Context, Panel, RichText, Slider, Ui, ViewportId};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use phantom_core::{AppConfig, Theme};
+use phantom_gfx::available_terminal_font_families;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
@@ -65,7 +66,7 @@ pub struct UiState {
     active_panel: Option<PanelKind>,
     settings_tab: SettingsTab,
     panel_width_px: f32,
-    font_family_edit: String,
+    font_families: Vec<String>,
     notice: Option<String>,
 }
 
@@ -75,14 +76,14 @@ impl UiState {
             active_panel: None,
             settings_tab: SettingsTab::Appearance,
             panel_width_px: 0.0,
-            font_family_edit: config.font_family.clone(),
+            font_families: font_families_with_current(&config.font_family),
             notice: None,
         }
     }
 
     pub fn open_settings(&mut self, config: &AppConfig) {
         self.active_panel = Some(PanelKind::Settings);
-        self.font_family_edit = config.font_family.clone();
+        self.font_families = font_families_with_current(&config.font_family);
         self.notice = None;
     }
 
@@ -190,7 +191,7 @@ impl UiState {
             .show(ui, |ui| match self.settings_tab {
                 SettingsTab::Appearance => {
                     section(ui, "Font");
-                    changed |= self.font_family(ui, config);
+                    changed |= self.font_family_selector(ui, config);
                     changed |= slider_u16(ui, "Font size", &mut config.font_size, 8..=48);
                     changed |= slider_f32(ui, "Line height", &mut config.line_height, 1.0..=2.5);
 
@@ -243,28 +244,44 @@ impl UiState {
         changed
     }
 
-    fn font_family(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
+    fn font_family_selector(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
         ui.label(label("Font family"));
-        let changed = ui
-            .add(TextEdit::singleline(&mut self.font_family_edit).desired_width(f32::INFINITY))
-            .changed();
-        if !changed {
-            return false;
+        if !self
+            .font_families
+            .iter()
+            .any(|family| family == &config.font_family)
+        {
+            self.font_families = font_families_with_current(&config.font_family);
         }
-        let mut next = config.clone();
-        next.font_family = self.font_family_edit.trim().to_string();
-        match next.validate() {
-            Ok(()) => {
-                config.font_family = next.font_family;
-                self.notice = None;
-                true
-            }
-            Err(error) => {
-                self.notice = Some(error.to_string());
-                false
-            }
+
+        let before = config.font_family.clone();
+        let mut selected = before.clone();
+        ComboBox::from_id_salt("font_family")
+            .selected_text(selected.as_str())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for family in &self.font_families {
+                    ui.selectable_value(&mut selected, family.clone(), family.as_str());
+                }
+            });
+
+        if selected == before {
+            false
+        } else {
+            config.font_family = selected;
+            self.notice = None;
+            true
         }
     }
+}
+
+fn font_families_with_current(current: &str) -> Vec<String> {
+    let current = current.trim();
+    let mut families = available_terminal_font_families();
+    if !current.is_empty() && !families.iter().any(|family| family == current) {
+        families.insert(0, current.to_string());
+    }
+    families
 }
 
 pub struct EguiLayer {
@@ -606,5 +623,12 @@ mod tests {
         state.open_settings(&config);
 
         assert_eq!(state.settings_tab, SettingsTab::Terminal);
+    }
+
+    #[test]
+    fn font_selector_keeps_current_unknown_family_available() {
+        let families = font_families_with_current("Custom Mono");
+
+        assert_eq!(families.first().map(String::as_str), Some("Custom Mono"));
     }
 }

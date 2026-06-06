@@ -6,7 +6,7 @@
 //! with `swash`. Cell metrics are derived from the primary regular face so the
 //! grid is sized to the user's text font, not a fallback symbol face.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
@@ -45,6 +45,16 @@ const SYMBOL_FONT_FALLBACKS: &[&str] = &[
     "Apple Symbols",
     "DejaVu Sans",
 ];
+
+/// Return installed families that are suitable primary terminal fonts.
+///
+/// The generic `monospace` choice stays first because it lets the platform pick
+/// a sensible terminal face and keeps old configs valid on every machine.
+pub fn available_terminal_font_families() -> Vec<String> {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    available_terminal_font_families_from_db(&db)
+}
 
 /// Pick the face slot for a cell's bold/italic attributes.
 pub fn face_slot(bold: bool, italic: bool) -> usize {
@@ -416,6 +426,41 @@ fn is_generic_monospace(family: &str) -> bool {
         || family.eq_ignore_ascii_case("mono")
 }
 
+fn available_terminal_font_families_from_db(db: &fontdb::Database) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut families = Vec::new();
+    push_family(&mut families, &mut seen, "monospace");
+
+    for name in TERMINAL_FONT_FALLBACKS {
+        let query = [fontdb::Family::Name(name)];
+        if query_face(db, &query, fontdb::Weight::NORMAL, fontdb::Style::Normal).is_some() {
+            push_family(&mut families, &mut seen, name);
+        }
+    }
+
+    let mut installed = db
+        .faces()
+        .filter(|face| face.monospaced)
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
+        .collect::<Vec<_>>();
+    installed.sort_by_key(|name| name.to_ascii_lowercase());
+    for name in installed {
+        push_family(&mut families, &mut seen, name);
+    }
+
+    families
+}
+
+fn push_family(families: &mut Vec<String>, seen: &mut HashSet<String>, family: &str) {
+    let family = family.trim();
+    if family.is_empty() {
+        return;
+    }
+    if seen.insert(family.to_ascii_lowercase()) {
+        families.push(family.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +503,27 @@ mod tests {
         for (ch, glyph) in resolved {
             assert_ne!(glyph.glyph_id, 0, "resolved {ch:?} to .notdef");
         }
+    }
+
+    #[test]
+    fn terminal_font_choices_always_include_generic_monospace_first() {
+        let db = fontdb::Database::new();
+        let families = available_terminal_font_families_from_db(&db);
+
+        assert_eq!(families.first().map(String::as_str), Some("monospace"));
+    }
+
+    #[test]
+    fn terminal_font_choices_are_case_insensitively_deduplicated() {
+        let mut db = fontdb::Database::new();
+        db.load_fonts_dir("/definitely/not/a/font/dir");
+
+        let families = available_terminal_font_families_from_db(&db);
+        let unique = families
+            .iter()
+            .map(|family| family.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(families.len(), unique.len());
     }
 }

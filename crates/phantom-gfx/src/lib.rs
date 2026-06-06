@@ -24,6 +24,7 @@ use phantom_emu::{CursorShape, Snapshot};
 
 use atlas::{GlyphAtlas, GlyphKey};
 use backdrop::BackdropRenderer;
+pub use font::available_terminal_font_families;
 use font::{face_slot, FontSet, REGULAR};
 use palette::{Palette, Rgba};
 
