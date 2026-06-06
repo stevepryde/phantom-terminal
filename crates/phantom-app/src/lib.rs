@@ -319,7 +319,7 @@ impl App {
             AppEvent::PtyBytes { tab, bytes } => {
                 let mut response = None;
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
-                    t.core.advance(&bytes);
+                    t.advance_pty(&bytes);
                     let out = t.core.take_pty_output();
                     if !out.is_empty() {
                         response = Some((t.pty_id, out));
