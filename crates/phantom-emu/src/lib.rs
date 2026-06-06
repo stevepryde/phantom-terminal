@@ -52,8 +52,14 @@ pub trait VtCore {
     /// Move the viewport to an absolute scrollback offset.
     fn scroll_to_offset(&mut self, offset: usize);
 
-    /// Begin a text selection at the given viewport cell.
-    fn selection_start(&mut self, row: usize, col: usize, side: SelSide);
+    /// Begin a simple text selection at the given viewport cell.
+    fn selection_start(&mut self, row: usize, col: usize, side: SelSide) {
+        self.selection_start_kind(row, col, side, SelectionKind::Simple);
+    }
+
+    /// Begin a text selection at the given viewport cell with the requested
+    /// expansion behavior.
+    fn selection_start_kind(&mut self, row: usize, col: usize, side: SelSide, kind: SelectionKind);
 
     /// Extend the active selection to the given viewport cell.
     fn selection_update(&mut self, row: usize, col: usize, side: SelSide);
@@ -154,6 +160,17 @@ impl Default for SnapCell {
 pub enum SelSide {
     Left,
     Right,
+}
+
+/// How a new selection should expand from its anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionKind {
+    /// Select exactly the dragged cell span.
+    Simple,
+    /// Expand to semantic word boundaries.
+    Semantic,
+    /// Expand to full logical lines.
+    Lines,
 }
 
 /// The mouse-reporting protocol the running application has requested.

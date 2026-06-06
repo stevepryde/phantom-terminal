@@ -23,8 +23,10 @@ use alacritty_terminal::vte::ansi::{
 
 use crate::{
     CellAttrs, CellColor, CursorShape, CursorState, MouseMode, MouseProtocol, NamedColor,
-    ScrollState, SelSide, SnapCell, Snapshot, VtCore,
+    ScrollState, SelSide, SelectionKind, SnapCell, Snapshot, VtCore,
 };
+
+const PHANTOM_SEMANTIC_ESCAPE_CHARS: &str = "\t !\"#$%&'()*+,./:;<=>?@[\\]^`{|}~│";
 
 /// Buffers bytes the terminal wants written back to the PTY. `send_event` takes
 /// `&self`, so interior mutability is required; `Rc<RefCell<…>>` is fine because
@@ -86,6 +88,7 @@ impl AlacrittyCore {
 
         let config = Config {
             scrolling_history: scrollback_lines as usize,
+            semantic_escape_chars: PHANTOM_SEMANTIC_ESCAPE_CHARS.to_string(),
             default_cursor_style: AnsiCursorStyle {
                 shape: to_ansi_cursor_shape(default_cursor),
                 blinking: false,
@@ -206,9 +209,13 @@ impl VtCore for AlacrittyCore {
         self.term.scroll_display(Scroll::Delta(delta));
     }
 
-    fn selection_start(&mut self, row: usize, col: usize, side: SelSide) {
+    fn selection_start_kind(&mut self, row: usize, col: usize, side: SelSide, kind: SelectionKind) {
         let point = self.viewport_point(row, col);
-        self.term.selection = Some(Selection::new(SelectionType::Simple, point, map_side(side)));
+        self.term.selection = Some(Selection::new(
+            map_selection_kind(kind),
+            point,
+            map_side(side),
+        ));
     }
 
     fn selection_update(&mut self, row: usize, col: usize, side: SelSide) {
@@ -262,6 +269,14 @@ fn map_side(side: SelSide) -> Side {
     match side {
         SelSide::Left => Side::Left,
         SelSide::Right => Side::Right,
+    }
+}
+
+fn map_selection_kind(kind: SelectionKind) -> SelectionType {
+    match kind {
+        SelectionKind::Simple => SelectionType::Simple,
+        SelectionKind::Semantic => SelectionType::Semantic,
+        SelectionKind::Lines => SelectionType::Lines,
     }
 }
 
@@ -440,6 +455,28 @@ mod tests {
         term.selection_clear();
         assert!(term.selection_text().is_none());
         assert!(!term.snapshot().cell(0, 0).unwrap().selected);
+    }
+
+    #[test]
+    fn semantic_selection_keeps_dash_and_underscore_inside_words() {
+        let mut term = core(4, 30, 100);
+        term.advance(b"foo-bar_baz.qux");
+
+        term.selection_start_kind(0, 4, SelSide::Left, SelectionKind::Semantic);
+        assert_eq!(term.selection_text().as_deref(), Some("foo-bar_baz"));
+
+        term.selection_start_kind(0, 12, SelSide::Left, SelectionKind::Semantic);
+        assert_eq!(term.selection_text().as_deref(), Some("qux"));
+    }
+
+    #[test]
+    fn line_selection_selects_the_whole_line() {
+        let mut term = core(4, 20, 100);
+        term.advance(b"first\r\nsecond line");
+
+        term.selection_start_kind(1, 4, SelSide::Left, SelectionKind::Lines);
+
+        assert_eq!(term.selection_text().as_deref(), Some("second line\n"));
     }
 
     #[test]

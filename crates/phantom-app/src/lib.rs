@@ -36,7 +36,7 @@ use phantom_core::{
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
-    MouseProtocol, ScrollState, SelSide, VtCore,
+    MouseProtocol, ScrollState, SelSide, SelectionKind, VtCore,
 };
 use phantom_gfx::Renderer;
 use tab::Tab;
@@ -51,6 +51,7 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_NOTICE_LEN: usize = 240;
 const TAB_DRAG_TOLERANCE_PX: f32 = 8.0;
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 
 /// PTY output delivered from a reader thread, tagged with the tab it belongs to.
@@ -128,6 +129,14 @@ struct ScrollDrag {
     start_offset: usize,
 }
 
+#[derive(Clone, Copy)]
+struct LastClick {
+    row: usize,
+    col: usize,
+    at: Instant,
+    count: u8,
+}
+
 pub struct App {
     outbox: Arc<dyn PtyOutbox>,
     config: AppConfig,
@@ -156,6 +165,7 @@ pub struct App {
     clipboard: Option<arboard::Clipboard>,
     left_down: bool,
     selecting: bool,
+    last_click: Option<LastClick>,
     redraw_queued: bool,
     /// In-progress IME composition text (shown at the cursor).
     preedit: String,
@@ -221,6 +231,7 @@ impl App {
             clipboard: arboard::Clipboard::new().ok(),
             left_down: false,
             selecting: false,
+            last_click: None,
             redraw_queued: false,
             preedit: String::new(),
             fullscreen: false,
@@ -936,6 +947,7 @@ impl App {
             return;
         }
         if !self.point_in_viewport(px, py) {
+            self.last_click = None;
             self.handle_click();
             return;
         }
@@ -943,12 +955,39 @@ impl App {
         if self.active_mouse_mode().reports() {
             self.report_mouse(px, py, MouseEvent::Press);
         } else if let Some((row, col, side)) = self.viewport_cell(px, py) {
+            let click_count = self.terminal_click_count(row, col);
+            let kind = match click_count {
+                1 => SelectionKind::Simple,
+                2 => SelectionKind::Semantic,
+                _ => SelectionKind::Lines,
+            };
             self.selecting = true;
             if let Some(tab) = self.tabs.get_mut(self.active) {
-                tab.core.selection_start(row, col, side);
+                tab.core.selection_start_kind(row, col, side, kind);
             }
             self.request_redraw();
         }
+    }
+
+    fn terminal_click_count(&mut self, row: usize, col: usize) -> u8 {
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some(last)
+                if last.row == row
+                    && last.col == col
+                    && now.duration_since(last.at) <= MULTI_CLICK_INTERVAL =>
+            {
+                last.count.saturating_add(1).min(3)
+            }
+            _ => 1,
+        };
+        self.last_click = Some(LastClick {
+            row,
+            col,
+            at: now,
+            count,
+        });
+        count
     }
 
     fn on_mouse_up(&mut self) {
@@ -1733,11 +1772,42 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    struct NoopOutbox;
+
+    impl PtyOutbox for NoopOutbox {
+        fn send(&self, _event: AppEvent) -> bool {
+            true
+        }
+    }
+
+    fn test_app() -> App {
+        App::new(
+            Arc::new(NoopOutbox),
+            AppConfig::default(),
+            None,
+            LaunchContext {
+                cwd: None,
+                remember_tabs: false,
+            },
+        )
+    }
+
     #[test]
     fn keyboard_events_bypass_egui_only_when_terminal_owns_input() {
         assert!(terminal_owns_keyboard(false, false, false));
         assert!(!terminal_owns_keyboard(true, false, false));
         assert!(!terminal_owns_keyboard(false, true, false));
         assert!(!terminal_owns_keyboard(false, false, true));
+    }
+
+    #[test]
+    fn repeated_clicks_on_same_cell_count_to_triple_click() {
+        let mut app = test_app();
+
+        assert_eq!(app.terminal_click_count(1, 2), 1);
+        assert_eq!(app.terminal_click_count(1, 2), 2);
+        assert_eq!(app.terminal_click_count(1, 2), 3);
+        assert_eq!(app.terminal_click_count(1, 2), 3);
+        assert_eq!(app.terminal_click_count(1, 3), 1);
     }
 }
