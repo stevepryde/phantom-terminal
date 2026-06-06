@@ -194,6 +194,7 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Pattern | Rule |
 | --- | --- |
 | Control plane | egui is the default UI for all non-terminal native surfaces |
+| Command palette | Render as a centered egui foreground overlay with a dimmed terminal backdrop, search input, keyboard selection, and clickable command rows. Keep command execution in app state; the terminal renderer should not own palette widgets. |
 | Panel placement | Prefer a wide right overlay panel for contextual tools and settings. Settings should float above the terminal instead of resizing the terminal grid; reserve terminal-resizing panels for explicit future workflow surfaces. |
 | Panel navigation | Multi-section panels use a fixed vertical tab rail at the left of the panel. Keep the rail wide enough for readable labels and keep the active tab visually selected. |
 | Styling | Use Phantom dark surfaces, compact spacing, low rounding, and cyan accent focus/selection states via egui `Visuals` and `Style`. Settings panels may be subtly translucent, but stay near-opaque enough for form readability. |

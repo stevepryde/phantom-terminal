@@ -640,6 +640,7 @@ impl App {
     /// theme, and layout changes take effect.
     fn apply_config_change(&mut self) {
         self.apply_window_chrome();
+        self.keymap = Keymap::from_config(&self.config.keybindings);
         self.mark_config_dirty();
         self.blink_enabled = self.config.cursor_blink;
         let next_signature = renderer_signature(&self.config);
@@ -1471,12 +1472,20 @@ impl App {
 
     fn render(&mut self) {
         self.redraw_queued = false;
-        let config_changed = match (self.gpu.as_ref(), self.egui.as_mut()) {
-            (Some(gpu), Some(egui)) => egui.run(&gpu.window, &mut self.ui, &mut self.config),
-            _ => false,
+        let ui_outcome = match (self.gpu.as_ref(), self.egui.as_mut()) {
+            (Some(gpu), Some(egui)) => egui.run(
+                &gpu.window,
+                &mut self.ui,
+                &mut self.config,
+                &mut self.palette,
+            ),
+            _ => Default::default(),
         };
-        if config_changed {
+        if ui_outcome.config_changed {
             self.apply_config_change();
+        }
+        if let Some(action) = ui_outcome.palette_action {
+            self.dispatch_palette(action);
         }
         self.sync_terminal_grid(false);
         let drag_indicator = self.tab_drag_indicator();
@@ -1554,11 +1563,6 @@ impl App {
                 renderer.text(&gpu.queue, px, py, &self.preedit, colors.text);
                 renderer.fill_rect(px, py + ch - 2.0, width, 2.0, colors.accent);
             }
-        }
-        if self.palette.open {
-            renderer.begin_overlay();
-            self.palette
-                .draw(renderer, &gpu.queue, w as f32, h as f32, &colors);
         }
         if let Some(notice) = self.notice.as_ref() {
             renderer.begin_overlay();
@@ -1677,6 +1681,16 @@ fn translate(event: &WindowEvent, mods: Mods, cursor: (f32, f32)) -> Option<AppI
 
 fn terminal_owns_keyboard(palette_open: bool, renaming: bool, settings_open: bool) -> bool {
     !palette_open && !renaming && !settings_open
+}
+
+fn app_input_bypasses_egui_overlay(input: &AppInput) -> bool {
+    matches!(
+        input,
+        AppInput::Resized { .. }
+            | AppInput::ScaleChanged
+            | AppInput::ModifiersChanged(_)
+            | AppInput::CloseRequested
+    )
 }
 
 fn is_keyboard_event(event: &WindowEvent) -> bool {
@@ -1816,8 +1830,9 @@ impl ApplicationHandler<AppEvent> for App {
         let consumed = egui_response.is_some_and(|response| response.consumed);
         let input = translate(&event, self.mods, self.cursor_pos);
 
-        if !consumed {
-            if let Some(input) = input {
+        if let Some(input) = input {
+            let palette_owns_input = self.palette.open && self.egui.is_some();
+            if app_input_bypasses_egui_overlay(&input) || (!consumed && !palette_owns_input) {
                 self.handle_input(input);
             }
         }
@@ -1986,6 +2001,23 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_inputs_bypass_egui_overlays() {
+        assert!(app_input_bypasses_egui_overlay(
+            &AppInput::ModifiersChanged(Mods::default())
+        ));
+        assert!(app_input_bypasses_egui_overlay(&AppInput::Resized {
+            width: 800,
+            height: 600,
+        }));
+        assert!(app_input_bypasses_egui_overlay(&AppInput::CloseRequested));
+        assert!(!app_input_bypasses_egui_overlay(&AppInput::Key {
+            key: Key::Char('x'),
+            text: Some("x".to_string()),
+            mods: Mods::default(),
+        }));
+    }
+
+    #[test]
     fn repeated_clicks_on_same_cell_count_to_triple_click() {
         let mut app = test_app();
 
@@ -2018,5 +2050,29 @@ mod tests {
 
         assert!(app.config_save_after.is_some());
         assert!(app.renderer_rebuild_after.is_none());
+    }
+
+    #[test]
+    fn keybinding_config_changes_refresh_runtime_keymap() {
+        let mut app = test_app();
+        let mut mods = Mods::default();
+        if cfg!(target_os = "macos") {
+            mods.sup = true;
+        } else {
+            mods.ctrl = true;
+        }
+
+        app.config.keybindings = vec![phantom_core::Keybinding {
+            id: "new-tab".to_string(),
+            action: "tab.new".to_string(),
+            keys: "CmdOrCtrl+N".to_string(),
+        }];
+        app.apply_config_change();
+
+        assert_eq!(app.keymap.lookup(Key::Char('t'), mods), None);
+        assert_eq!(
+            app.keymap.lookup(Key::Char('n'), mods),
+            Some(Action::NewTab)
+        );
     }
 }

@@ -4,20 +4,26 @@
 //! contextual side panels, forms, sliders, colour controls, and future inspector
 //! surfaces.
 
-use egui::{Button, Color32, ComboBox, Context, Panel, RichText, Slider, Ui, ViewportId};
+use egui::{
+    Area, Button, Color32, ComboBox, Context, Frame, Id, Key as EguiKey, LayerId, Margin, Order,
+    Panel, RichText, Slider, TextEdit, Ui, ViewportId,
+};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
-use phantom_core::{AppConfig, Theme};
+use phantom_core::{AppConfig, Keybinding, Theme};
 use phantom_gfx::available_terminal_font_families;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::gpu::FrameOverlay;
+use crate::keybindings::parse_combo;
+use crate::palette::{PaletteAction, PaletteState};
 use crate::themes;
 
 const PANEL_WIDTH_POINTS: f32 = 560.0;
 const PANEL_MIN_WIDTH_POINTS: f32 = 460.0;
 const PANEL_MAX_WIDTH_POINTS: f32 = 760.0;
 const SETTINGS_NAV_WIDTH_POINTS: f32 = 168.0;
+const PALETTE_WIDTH_POINTS: f32 = 640.0;
 const BACKGROUNDS: &[&str] = &["none", "phantom", "dragon"];
 const CURSOR_STYLES: &[&str] = &["block", "bar", "underline"];
 const LAYOUTS: &[&str] = &["horizontal", "vertical"];
@@ -34,14 +40,16 @@ enum SettingsTab {
     Terminal,
     Session,
     Colours,
+    Keybindings,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Appearance,
         Self::Terminal,
         Self::Session,
         Self::Colours,
+        Self::Keybindings,
     ];
 
     fn id(self) -> &'static str {
@@ -50,6 +58,7 @@ impl SettingsTab {
             Self::Terminal => "terminal",
             Self::Session => "session",
             Self::Colours => "colours",
+            Self::Keybindings => "keybindings",
         }
     }
 
@@ -59,8 +68,15 @@ impl SettingsTab {
             Self::Terminal => "Terminal",
             Self::Session => "Session",
             Self::Colours => "Colours",
+            Self::Keybindings => "Keybindings",
         }
     }
+}
+
+#[derive(Default)]
+pub struct UiOutcome {
+    pub config_changed: bool,
+    pub palette_action: Option<PaletteAction>,
 }
 
 pub struct UiState {
@@ -106,12 +122,17 @@ impl UiState {
         self.active_panel == Some(PanelKind::Settings)
     }
 
-    fn draw(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
-        if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+    fn draw(
+        &mut self,
+        ui: &mut Ui,
+        config: &mut AppConfig,
+        palette: &mut PaletteState,
+    ) -> UiOutcome {
+        let mut outcome = UiOutcome::default();
+        if !palette.open && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
             self.close_panel();
         }
 
-        let mut changed = false;
         if self.active_panel == Some(PanelKind::Settings) {
             Panel::right("phantom_settings_panel")
                 .default_size(PANEL_WIDTH_POINTS)
@@ -120,12 +141,13 @@ impl UiState {
                 .frame(panel_frame())
                 .show_inside(ui, |ui| {
                     self.panel_width_px = ui.max_rect().width() * ui.ctx().pixels_per_point();
-                    changed |= self.settings_panel(ui, config);
+                    outcome.config_changed |= self.settings_panel(ui, config);
                 });
         } else {
             self.panel_width_px = 0.0;
         }
-        changed
+        outcome.palette_action = command_palette_overlay(ui.ctx(), palette);
+        outcome
     }
 
     fn settings_panel(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
@@ -247,6 +269,15 @@ impl UiState {
                     section(ui, "Theme Colours");
                     changed |= theme_colors(ui, &mut config.theme);
                 }
+                SettingsTab::Keybindings => {
+                    section(ui, "Configured shortcuts");
+                    changed |= keybindings_editor(ui, &mut config.keybindings);
+                    ui.add_space(8.0);
+                    if ui.button("Reset keybindings").clicked() {
+                        config.keybindings = AppConfig::default().keybindings;
+                        changed = true;
+                    }
+                }
             });
         changed
     }
@@ -334,11 +365,17 @@ impl EguiLayer {
         self.state.on_window_event(window, event)
     }
 
-    pub fn run(&mut self, window: &Window, ui_state: &mut UiState, config: &mut AppConfig) -> bool {
+    pub fn run(
+        &mut self,
+        window: &Window,
+        ui_state: &mut UiState,
+        config: &mut AppConfig,
+        palette: &mut PaletteState,
+    ) -> UiOutcome {
         let raw_input = self.state.take_egui_input(window);
-        let mut config_changed = false;
+        let mut outcome = UiOutcome::default();
         let full_output = self.ctx.run_ui(raw_input, |ui| {
-            config_changed = ui_state.draw(ui, config);
+            outcome = ui_state.draw(ui, config, palette);
         });
         self.state
             .handle_platform_output(window, full_output.platform_output);
@@ -351,7 +388,7 @@ impl EguiLayer {
             .ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
         self.textures_delta.append(full_output.textures_delta);
-        config_changed
+        outcome
     }
 
     fn prepare_inner(
@@ -508,6 +545,150 @@ fn combo(ui: &mut Ui, label_text: &str, value: &mut String, options: &[&str]) ->
             }
         });
     changed
+}
+
+fn keybindings_editor(ui: &mut Ui, keybindings: &mut [Keybinding]) -> bool {
+    let mut changed = false;
+    for keybinding in keybindings {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(action_label(&keybinding.action)).size(13.0));
+                ui.label(
+                    RichText::new(keybinding.action.as_str())
+                        .size(11.0)
+                        .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let response = ui.add_sized(
+                    egui::vec2(180.0, 28.0),
+                    TextEdit::singleline(&mut keybinding.keys)
+                        .font(egui::TextStyle::Monospace)
+                        .clip_text(false),
+                );
+                changed |= response.changed();
+                if parse_combo(&keybinding.keys).is_none() {
+                    ui.colored_label(Color32::from_rgb(248, 113, 113), "Invalid");
+                }
+            });
+        });
+        ui.separator();
+    }
+    changed
+}
+
+fn action_label(action: &str) -> String {
+    match action {
+        "tab.new" => "New Tab".to_string(),
+        "tab.close" => "Close Tab".to_string(),
+        "tab.rename" => "Rename Tab".to_string(),
+        "palette.toggle" => "Command Palette".to_string(),
+        "settings.toggle" => "Settings".to_string(),
+        other => display_name(other),
+    }
+}
+
+fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState) -> Option<PaletteAction> {
+    if !palette.open {
+        return None;
+    }
+
+    let mut action = None;
+    let mut close = false;
+    ctx.input(|input| {
+        if input.key_pressed(EguiKey::Escape)
+            || (input.modifiers.command && input.key_pressed(EguiKey::K))
+        {
+            close = true;
+        }
+        if input.key_pressed(EguiKey::ArrowDown) {
+            palette.move_selection(1);
+        }
+        if input.key_pressed(EguiKey::ArrowUp) {
+            palette.move_selection(-1);
+        }
+        if input.key_pressed(EguiKey::Enter) {
+            action = palette.execute_selected();
+        }
+    });
+    if close {
+        palette.close();
+        return None;
+    }
+
+    let screen = ctx.content_rect();
+    let backdrop = ctx.layer_painter(LayerId::new(
+        Order::Foreground,
+        Id::new("phantom_command_palette_backdrop"),
+    ));
+    backdrop.rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+
+    let width = PALETTE_WIDTH_POINTS.min((screen.width() - 32.0).max(320.0));
+    let x = screen.center().x - width / 2.0;
+    let y = (screen.top() + screen.height() * 0.12).max(screen.top() + 20.0);
+    Area::new(Id::new("phantom_command_palette"))
+        .order(Order::Foreground)
+        .fixed_pos(egui::pos2(x, y))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(17, 17, 22, 246))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 35),
+                ))
+                .inner_margin(Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            ui.min_rect().min,
+                            egui::vec2(ui.available_width(), 2.0),
+                        ),
+                        0.0,
+                        Color32::from_rgb(56, 189, 248),
+                    );
+                    ui.add_space(8.0);
+
+                    let mut query = palette.query().to_string();
+                    let response = ui.add_sized(
+                        egui::vec2(ui.available_width(), 34.0),
+                        TextEdit::singleline(&mut query)
+                            .hint_text("Run command")
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if palette.take_focus_request() {
+                        response.request_focus();
+                    }
+                    if response.changed() {
+                        palette.set_query(query);
+                    }
+                    ui.add_space(8.0);
+
+                    let rows = palette.rows();
+                    if rows.is_empty() {
+                        ui.label(
+                            RichText::new("No commands")
+                                .size(13.0)
+                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 120)),
+                        );
+                        return;
+                    }
+                    for row in rows {
+                        let text = RichText::new(row.label).size(13.0);
+                        let button = Button::selectable(row.selected, text)
+                            .min_size(egui::vec2(ui.available_width(), 32.0));
+                        if ui.add(button).clicked() {
+                            action = palette.execute_filtered(row.filtered_index);
+                        }
+                    }
+                });
+        });
+
+    if action.is_some() {
+        palette.close();
+    }
+    action
 }
 
 fn theme_colors(ui: &mut Ui, theme: &mut Theme) -> bool {

@@ -1,11 +1,12 @@
-//! Command palette overlay: fuzzy-filter a list of actions and execute one.
-//! Drawn on the renderer's overlay layer; keys are captured while open.
+//! Command palette state: fuzzy-filter a list of actions and execute one.
+//!
+//! Production rendering is owned by the egui control plane. The key handling
+//! methods stay here so headless app-logic tests can drive the same command
+//! model without a window.
 
 use phantom_core::AppConfig;
 use phantom_emu::Key;
-use phantom_gfx::Renderer;
 
-use crate::chrome::ChromeColors;
 use crate::themes;
 
 const MAX_ROWS: usize = 10;
@@ -38,6 +39,7 @@ pub struct PaletteState {
     selected: usize,
     commands: Vec<Command>,
     filtered: Vec<usize>,
+    focus_requested: bool,
 }
 
 impl PaletteState {
@@ -47,11 +49,69 @@ impl PaletteState {
         self.query.clear();
         self.selected = 0;
         self.open = true;
+        self.focus_requested = true;
         self.refilter();
     }
 
     pub fn close(&mut self) {
         self.open = false;
+        self.focus_requested = false;
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn set_query(&mut self, query: String) {
+        if self.query == query {
+            return;
+        }
+        self.query = query;
+        self.selected = 0;
+        self.refilter();
+    }
+
+    pub fn take_focus_request(&mut self) -> bool {
+        let requested = self.focus_requested;
+        self.focus_requested = false;
+        requested
+    }
+
+    pub fn move_selection(&mut self, delta: i32) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        if delta < 0 {
+            self.selected = self.selected.saturating_sub(delta.unsigned_abs() as usize);
+        } else {
+            self.selected = (self.selected + delta as usize).min(self.filtered.len() - 1);
+        }
+    }
+
+    pub fn rows(&self) -> Vec<PaletteRow> {
+        let start = self.selected.saturating_sub(MAX_ROWS - 1);
+        self.filtered
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(MAX_ROWS)
+            .map(|(filtered_index, &command_index)| PaletteRow {
+                filtered_index,
+                label: self.commands[command_index].label.clone(),
+                selected: filtered_index == self.selected,
+            })
+            .collect()
+    }
+
+    pub fn execute_selected(&self) -> Option<PaletteAction> {
+        let command_index = *self.filtered.get(self.selected)?;
+        Some(self.commands[command_index].action.clone())
+    }
+
+    pub fn execute_filtered(&self, filtered_index: usize) -> Option<PaletteAction> {
+        let command_index = *self.filtered.get(filtered_index)?;
+        Some(self.commands[command_index].action.clone())
     }
 
     pub fn handle_key(&mut self, key: Key, text: Option<&str>) -> PaletteOutcome {
@@ -110,54 +170,12 @@ impl PaletteState {
             self.selected = self.filtered.len().saturating_sub(1);
         }
     }
+}
 
-    pub fn draw(
-        &self,
-        r: &mut Renderer,
-        queue: &wgpu::Queue,
-        win_w: f32,
-        win_h: f32,
-        colors: &ChromeColors,
-    ) {
-        let cell_h = r.cell_size().1;
-        let pad = 12.0;
-        let row_h = cell_h + 6.0;
-
-        // Dim backdrop.
-        r.fill_rect(0.0, 0.0, win_w, win_h, [0, 0, 0, 150]);
-
-        let panel_w = (win_w * 0.6).clamp(360.0, 760.0);
-        let rows = self.filtered.len().min(MAX_ROWS);
-        let panel_h = pad * 2.0 + cell_h + pad + (rows.max(1) as f32) * row_h;
-        let px = ((win_w - panel_w) / 2.0).max(0.0);
-        let py = (win_h * 0.12).max(20.0);
-
-        r.fill_rect(px, py, panel_w, panel_h, colors.bar_bg);
-        r.fill_rect(px, py, panel_w, 2.0, colors.accent);
-
-        // Query line.
-        let qy = py + pad;
-        let prompt = format!("> {}\u{258f}", self.query);
-        r.text(queue, px + pad, qy, &prompt, colors.text);
-
-        // Results, scrolled so the selection stays visible.
-        let start = self.selected.saturating_sub(MAX_ROWS - 1);
-        let mut y = qy + cell_h + pad;
-        let highlight = [colors.accent[0], colors.accent[1], colors.accent[2], 70];
-        for (row, &ci) in self.filtered.iter().enumerate().skip(start).take(MAX_ROWS) {
-            let selected = row == self.selected;
-            if selected {
-                r.fill_rect(px, y, panel_w, row_h, highlight);
-            }
-            let color = if selected {
-                colors.text
-            } else {
-                colors.dim_text
-            };
-            r.text(queue, px + pad, y + 3.0, &self.commands[ci].label, color);
-            y += row_h;
-        }
-    }
+pub struct PaletteRow {
+    pub filtered_index: usize,
+    pub label: String,
+    pub selected: bool,
 }
 
 fn build_commands(config: &AppConfig) -> Vec<Command> {
