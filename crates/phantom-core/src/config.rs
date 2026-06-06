@@ -25,6 +25,12 @@ const DEFAULT_TERMINAL_BACKGROUND: &str = "phantom";
 const MAX_TERMINAL_BACKGROUND_OPACITY: u8 = 60;
 const DEFAULT_TERMINAL_BACKGROUND_OPACITY: u8 = 24;
 const DEFAULT_WINDOW_CHROME: &str = "system";
+/// Panel opacity is a percentage. Below 100 the egui panels are translucent and
+/// the renderer blurs whatever shows through behind them. The floor keeps panels
+/// legible; 100 is fully opaque and disables the backdrop blur entirely.
+const MIN_PANEL_OPACITY: u8 = 50;
+const MAX_PANEL_OPACITY: u8 = 100;
+const DEFAULT_PANEL_OPACITY: u8 = 85;
 
 /// Full 16-color ANSI palette plus the special UI colors. Keys are snake_case on
 /// the wire; the frontend maps them onto ghostty-web's camelCase Terminal theme.
@@ -178,6 +184,9 @@ pub struct AppConfig {
     pub ui_theme: String,
     pub terminal_background: String,
     pub terminal_background_opacity: u8,
+    /// Opacity (percent) of the egui control panels. Below 100 the panels are
+    /// translucent and the backdrop behind them is blurred.
+    pub panel_opacity: u8,
     pub theme: Theme,
     pub shell_profiles: Vec<ShellProfile>,
     pub default_shell_profile_id: String,
@@ -201,6 +210,7 @@ impl Default for AppConfig {
             ui_theme: DEFAULT_UI_THEME.to_string(),
             terminal_background: DEFAULT_TERMINAL_BACKGROUND.to_string(),
             terminal_background_opacity: DEFAULT_TERMINAL_BACKGROUND_OPACITY,
+            panel_opacity: DEFAULT_PANEL_OPACITY,
             theme: Theme::default(),
             shell_profiles: vec![ShellProfile {
                 id: "default".to_string(),
@@ -267,6 +277,11 @@ impl AppConfig {
         if self.terminal_background_opacity > MAX_TERMINAL_BACKGROUND_OPACITY {
             return Err(AppError::InvalidConfig(format!(
                 "terminal background opacity must be between 0 and {MAX_TERMINAL_BACKGROUND_OPACITY}"
+            )));
+        }
+        if !(MIN_PANEL_OPACITY..=MAX_PANEL_OPACITY).contains(&self.panel_opacity) {
+            return Err(AppError::InvalidConfig(format!(
+                "panel opacity must be between {MIN_PANEL_OPACITY} and {MAX_PANEL_OPACITY}"
             )));
         }
         if self.scrollback_lines > MAX_SCROLLBACK_LINES {
@@ -500,6 +515,24 @@ mod tests {
     fn rejects_invalid_terminal_background_opacity() {
         let config = AppConfig {
             terminal_background_opacity: MAX_TERMINAL_BACKGROUND_OPACITY + 1,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_panel_opacity_below_floor() {
+        let config = AppConfig {
+            panel_opacity: MIN_PANEL_OPACITY - 1,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_panel_opacity_above_ceiling() {
+        let config = AppConfig {
+            panel_opacity: MAX_PANEL_OPACITY + 1,
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());

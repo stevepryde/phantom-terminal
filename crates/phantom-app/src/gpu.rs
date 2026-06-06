@@ -14,6 +14,19 @@ use wgpu::{
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+use crate::blur::BlurPass;
+
+/// A rectangle (physical pixels, top-left origin) whose backdrop should be
+/// blurred before the overlay paints over it. Emitted by translucent panels so
+/// the renderer can frost whatever shows through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlurRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub trait FrameOverlay {
     fn prepare(
         &mut self,
@@ -23,6 +36,12 @@ pub trait FrameOverlay {
     );
 
     fn paint(&mut self, pass: &mut wgpu::RenderPass<'static>);
+
+    /// Regions whose backdrop should be blurred before `paint`. Empty (the
+    /// default) means no backdrop blur this frame.
+    fn blur_regions(&self) -> &[BlurRegion] {
+        &[]
+    }
 
     fn after_submit(&mut self) {}
 }
@@ -34,6 +53,7 @@ pub struct GpuContext {
     instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     surface_config: SurfaceConfiguration,
+    blur: BlurPass,
 }
 
 impl GpuContext {
@@ -76,7 +96,8 @@ impl GpuContext {
             CompositeAlphaMode::Opaque
         };
         let surface_config = SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC lets the backdrop-blur pass snapshot the rendered frame.
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
             format: TextureFormat::Bgra8UnormSrgb,
             width: physical.width.max(1),
             height: physical.height.max(1),
@@ -87,6 +108,8 @@ impl GpuContext {
         };
         surface.configure(&device, &surface_config);
 
+        let blur = BlurPass::new(&device, surface_config.format);
+
         Ok(Self {
             window,
             device,
@@ -94,6 +117,7 @@ impl GpuContext {
             instance,
             surface,
             surface_config,
+            blur,
         })
     }
 
@@ -161,6 +185,15 @@ impl GpuContext {
         if let Some(overlay) = overlay.as_deref_mut() {
             overlay.prepare(&self.device, &self.queue, &mut encoder);
         }
+
+        // Translucent panels ask for their backdrop to be frosted. When present,
+        // the terminal pass and the overlay paint are split so the blur can run
+        // in between, reading the rendered frame and writing it back.
+        let blur_regions: Vec<_> = overlay
+            .as_deref()
+            .map(|overlay| overlay.blur_regions().to_vec())
+            .unwrap_or_default();
+
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("phantom-frame"),
@@ -183,7 +216,45 @@ impl GpuContext {
                 multiview_mask: None,
             });
             renderer.render(&mut pass);
-            let mut pass = pass.forget_lifetime();
+            if blur_regions.is_empty() {
+                // No frosted panels: paint the overlay in the same pass.
+                let mut pass = pass.forget_lifetime();
+                if let Some(overlay) = overlay.as_deref_mut() {
+                    overlay.paint(&mut pass);
+                }
+            }
+        }
+
+        if !blur_regions.is_empty() {
+            let (width, height) = (self.surface_config.width, self.surface_config.height);
+            self.blur.run(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &frame.texture,
+                &view,
+                &blur_regions,
+                width,
+                height,
+            );
+            let mut pass = encoder
+                .begin_render_pass(&RenderPassDescriptor {
+                    label: Some("phantom-overlay"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
             if let Some(overlay) = overlay.as_deref_mut() {
                 overlay.paint(&mut pass);
             }

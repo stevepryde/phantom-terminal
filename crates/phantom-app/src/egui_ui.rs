@@ -14,7 +14,7 @@ use phantom_gfx::available_terminal_font_families;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
-use crate::gpu::FrameOverlay;
+use crate::gpu::{BlurRegion, FrameOverlay};
 use crate::keybindings::parse_combo;
 use crate::palette::{PaletteAction, PaletteState};
 use crate::themes;
@@ -85,6 +85,9 @@ pub struct UiState {
     panel_width_px: f32,
     font_families: Vec<String>,
     notice: Option<String>,
+    /// Rects (egui points) of panels drawn translucent this frame, whose
+    /// backdrop should be frosted. Rebuilt every `draw`.
+    blur_regions: Vec<egui::Rect>,
 }
 
 impl UiState {
@@ -95,7 +98,12 @@ impl UiState {
             panel_width_px: 0.0,
             font_families: font_families_with_current(&config.font_family),
             notice: None,
+            blur_regions: Vec::new(),
         }
+    }
+
+    fn blur_regions(&self) -> &[egui::Rect] {
+        &self.blur_regions
     }
 
     pub fn open_settings(&mut self, config: &AppConfig) {
@@ -129,24 +137,36 @@ impl UiState {
         palette: &mut PaletteState,
     ) -> UiOutcome {
         let mut outcome = UiOutcome::default();
+        self.blur_regions.clear();
+        let alpha = panel_alpha(config.panel_opacity);
+        let transparent = config.panel_opacity < 100;
         if !palette.open && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
             self.close_panel();
         }
 
         if self.active_panel == Some(PanelKind::Settings) {
-            Panel::right("phantom_settings_panel")
+            let response = Panel::right("phantom_settings_panel")
                 .default_size(PANEL_WIDTH_POINTS)
                 .size_range(PANEL_MIN_WIDTH_POINTS..=PANEL_MAX_WIDTH_POINTS)
                 .resizable(true)
-                .frame(panel_frame())
+                .frame(panel_frame(alpha))
                 .show_inside(ui, |ui| {
                     self.panel_width_px = ui.max_rect().width() * ui.ctx().pixels_per_point();
                     outcome.config_changed |= self.settings_panel(ui, config);
                 });
+            if transparent {
+                self.blur_regions.push(response.response.rect);
+            }
         } else {
             self.panel_width_px = 0.0;
         }
-        outcome.palette_action = command_palette_overlay(ui.ctx(), palette);
+        let palette = command_palette_overlay(ui.ctx(), palette, alpha);
+        outcome.palette_action = palette.action;
+        if transparent {
+            if let Some(rect) = palette.rect {
+                self.blur_regions.push(rect);
+            }
+        }
         outcome
     }
 
@@ -206,79 +226,99 @@ impl UiState {
 
     fn settings_content(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
         let mut changed = false;
-        ui.heading(self.settings_tab.label());
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical()
-            .id_salt(self.settings_tab.id())
-            .auto_shrink([false, false])
-            .show(ui, |ui| match self.settings_tab {
-                SettingsTab::Appearance => {
-                    section(ui, "Font");
-                    changed |= self.font_family_selector(ui, config);
-                    changed |= slider_u16(ui, "Font size", &mut config.font_size, 8..=48);
-                    changed |= slider_f32(ui, "Line height", &mut config.line_height, 1.0..=2.5);
+        // Anchor every tab's widgets under a distinct parent id. Each tab fills
+        // the same on-screen rects, so without a per-tab parent egui sees the
+        // widget at a given rect "change id" when tabs swap and, in debug builds,
+        // outlines the affected widgets in red for a frame (`warn_if_rect_changes_id`).
+        ui.push_id(self.settings_tab.id(), |ui| {
+            ui.heading(self.settings_tab.label());
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt(self.settings_tab.id())
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.settings_tab {
+                    SettingsTab::Appearance => {
+                        section(ui, "Font");
+                        changed |= self.font_family_selector(ui, config);
+                        changed |= slider_u16(ui, "Font size", &mut config.font_size, 8..=48);
+                        changed |=
+                            slider_f32(ui, "Line height", &mut config.line_height, 1.0..=2.5);
 
-                    section(ui, "Cursor");
-                    changed |= combo(ui, "Cursor style", &mut config.cursor_style, CURSOR_STYLES);
-                    changed |= ui
-                        .checkbox(&mut config.cursor_blink, "Cursor blink")
-                        .changed();
+                        section(ui, "Cursor");
+                        changed |=
+                            combo(ui, "Cursor style", &mut config.cursor_style, CURSOR_STYLES);
+                        changed |= ui
+                            .checkbox(&mut config.cursor_blink, "Cursor blink")
+                            .changed();
 
-                    section(ui, "Backdrop");
-                    changed |= combo(ui, "UI theme", &mut config.ui_theme, themes::UI_THEMES);
-                    changed |= combo(
-                        ui,
-                        "Terminal background",
-                        &mut config.terminal_background,
-                        BACKGROUNDS,
-                    );
-                    ui.add_enabled_ui(config.terminal_background != "none", |ui| {
-                        changed |= slider_u8(
+                        section(ui, "Backdrop");
+                        changed |= combo(ui, "UI theme", &mut config.ui_theme, themes::UI_THEMES);
+                        changed |= combo(
                             ui,
-                            "Background opacity",
-                            &mut config.terminal_background_opacity,
-                            0..=60,
+                            "Terminal background",
+                            &mut config.terminal_background,
+                            BACKGROUNDS,
                         );
-                    });
-                }
-                SettingsTab::Terminal => {
-                    section(ui, "Layout");
-                    changed |= combo(ui, "Tab layout", &mut config.tab_layout, LAYOUTS);
-                    changed |= combo(
-                        ui,
-                        "Window chrome",
-                        &mut config.window_chrome,
-                        WINDOW_CHROME,
-                    );
+                        ui.add_enabled_ui(config.terminal_background != "none", |ui| {
+                            changed |= slider_u8(
+                                ui,
+                                "Background opacity",
+                                &mut config.terminal_background_opacity,
+                                0..=60,
+                            );
+                        });
 
-                    section(ui, "History");
-                    changed |= slider_u32(
-                        ui,
-                        "Scrollback lines",
-                        &mut config.scrollback_lines,
-                        0..=1_000_000,
-                    );
-                }
-                SettingsTab::Session => {
-                    section(ui, "Launch");
-                    changed |= ui
-                        .checkbox(&mut config.restore_on_launch, "Restore tabs on launch")
-                        .changed();
-                }
-                SettingsTab::Colours => {
-                    section(ui, "Theme Colours");
-                    changed |= theme_colors(ui, &mut config.theme);
-                }
-                SettingsTab::Keybindings => {
-                    section(ui, "Configured shortcuts");
-                    changed |= keybindings_editor(ui, &mut config.keybindings);
-                    ui.add_space(8.0);
-                    if ui.button("Reset keybindings").clicked() {
-                        config.keybindings = AppConfig::default().keybindings;
-                        changed = true;
+                        section(ui, "Panels");
+                        changed |=
+                            slider_u8(ui, "Panel opacity", &mut config.panel_opacity, 50..=100);
+                        ui.label(
+                            RichText::new(
+                                "Below 100% the settings and command panels are translucent and \
+                             their backdrop is blurred.",
+                            )
+                            .size(11.0)
+                            .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+                        );
                     }
-                }
-            });
+                    SettingsTab::Terminal => {
+                        section(ui, "Layout");
+                        changed |= combo(ui, "Tab layout", &mut config.tab_layout, LAYOUTS);
+                        changed |= combo(
+                            ui,
+                            "Window chrome",
+                            &mut config.window_chrome,
+                            WINDOW_CHROME,
+                        );
+
+                        section(ui, "History");
+                        changed |= slider_u32(
+                            ui,
+                            "Scrollback lines",
+                            &mut config.scrollback_lines,
+                            0..=1_000_000,
+                        );
+                    }
+                    SettingsTab::Session => {
+                        section(ui, "Launch");
+                        changed |= ui
+                            .checkbox(&mut config.restore_on_launch, "Restore tabs on launch")
+                            .changed();
+                    }
+                    SettingsTab::Colours => {
+                        section(ui, "Theme Colours");
+                        changed |= theme_colors(ui, &mut config.theme);
+                    }
+                    SettingsTab::Keybindings => {
+                        section(ui, "Configured shortcuts");
+                        changed |= keybindings_editor(ui, &mut config.keybindings);
+                        ui.add_space(8.0);
+                        if ui.button("Reset keybindings").clicked() {
+                            config.keybindings = AppConfig::default().keybindings;
+                            changed = true;
+                        }
+                    }
+                });
+        });
         changed
     }
 
@@ -329,6 +369,7 @@ pub struct EguiLayer {
     paint_jobs: Vec<egui::ClippedPrimitive>,
     textures_delta: egui::TexturesDelta,
     screen: ScreenDescriptor,
+    blur_regions: Vec<BlurRegion>,
 }
 
 impl EguiLayer {
@@ -354,6 +395,7 @@ impl EguiLayer {
                 size_in_pixels: [1, 1],
                 pixels_per_point: window.scale_factor() as f32,
             },
+            blur_regions: Vec::new(),
         }
     }
 
@@ -384,6 +426,12 @@ impl EguiLayer {
             size_in_pixels: [size.width.max(1), size.height.max(1)],
             pixels_per_point: full_output.pixels_per_point,
         };
+        let ppp = full_output.pixels_per_point;
+        self.blur_regions = ui_state
+            .blur_regions()
+            .iter()
+            .filter_map(|rect| rect_to_region(rect, ppp, size.width, size.height))
+            .collect();
         self.paint_jobs = self
             .ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -432,9 +480,34 @@ impl FrameOverlay for EguiLayer {
         self.paint_inner(pass);
     }
 
+    fn blur_regions(&self) -> &[BlurRegion] {
+        &self.blur_regions
+    }
+
     fn after_submit(&mut self) {
         self.free_textures();
     }
+}
+
+/// Convert an egui rect (points) to a physical-pixel [`BlurRegion`], clamped to
+/// the surface. Returns `None` for empty/off-screen rects.
+fn rect_to_region(rect: &egui::Rect, ppp: f32, width: u32, height: u32) -> Option<BlurRegion> {
+    if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+    let left = (rect.min.x * ppp).floor().max(0.0) as u32;
+    let top = (rect.min.y * ppp).floor().max(0.0) as u32;
+    let right = ((rect.max.x * ppp).ceil() as u32).min(width);
+    let bottom = ((rect.max.y * ppp).ceil() as u32).min(height);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(BlurRegion {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 fn configure_style(ctx: &Context) {
@@ -458,9 +531,16 @@ fn configure_style(ctx: &Context) {
     ctx.set_global_style(style);
 }
 
-fn panel_frame() -> egui::Frame {
+/// Map a panel opacity percentage (50..=100) onto an 8-bit alpha. The renderer
+/// blurs whatever shows through whenever this is below fully opaque.
+fn panel_alpha(opacity_percent: u8) -> u8 {
+    let percent = opacity_percent.clamp(0, 100) as f32 / 100.0;
+    (percent * 255.0).round() as u8
+}
+
+fn panel_frame(alpha: u8) -> egui::Frame {
     egui::Frame::side_top_panel(&egui::Style::default())
-        .fill(Color32::from_rgba_unmultiplied(17, 17, 22, 238))
+        .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
         .stroke(egui::Stroke::new(
             1.0,
             Color32::from_rgba_unmultiplied(255, 255, 255, 32),
@@ -589,9 +669,17 @@ fn action_label(action: &str) -> String {
     }
 }
 
-fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState) -> Option<PaletteAction> {
+/// Outcome of drawing the command palette: the action to run (if any) and the
+/// palette frame's rect (in points) when it is translucent enough to frost.
+#[derive(Default)]
+struct PaletteOverlay {
+    action: Option<PaletteAction>,
+    rect: Option<egui::Rect>,
+}
+
+fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState, alpha: u8) -> PaletteOverlay {
     if !palette.open {
-        return None;
+        return PaletteOverlay::default();
     }
 
     let mut action = None;
@@ -614,7 +702,7 @@ fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState) -> Option<
     });
     if close {
         palette.close();
-        return None;
+        return PaletteOverlay::default();
     }
 
     let screen = ctx.content_rect();
@@ -627,12 +715,12 @@ fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState) -> Option<
     let width = PALETTE_WIDTH_POINTS.min((screen.width() - 32.0).max(320.0));
     let x = screen.center().x - width / 2.0;
     let y = (screen.top() + screen.height() * 0.12).max(screen.top() + 20.0);
-    Area::new(Id::new("phantom_command_palette"))
+    let area = Area::new(Id::new("phantom_command_palette"))
         .order(Order::Foreground)
         .fixed_pos(egui::pos2(x, y))
         .show(ctx, |ui| {
-            Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(17, 17, 22, 246))
+            let frame = Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
                 .stroke(egui::Stroke::new(
                     1.0,
                     Color32::from_rgba_unmultiplied(255, 255, 255, 35),
@@ -683,12 +771,16 @@ fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState) -> Option<
                         }
                     }
                 });
+            frame.response.rect
         });
 
     if action.is_some() {
         palette.close();
     }
-    action
+    PaletteOverlay {
+        action,
+        rect: Some(area.inner),
+    }
 }
 
 fn theme_colors(ui: &mut Ui, theme: &mut Theme) -> bool {
@@ -780,6 +872,74 @@ fn display_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::palette::PaletteState;
+
+    /// Recursively count pure-red strokes in egui's emitted shapes. egui's
+    /// debug diagnostics (`warn_if_rect_changes_id`, id-clash) outline offending
+    /// widgets with a red stroke; a stable UI must emit none.
+    fn red_stroke_count(shape: &egui::Shape) -> usize {
+        match shape {
+            egui::Shape::Rect(rect) => usize::from(rect.stroke.color == Color32::RED),
+            egui::Shape::Vec(shapes) => shapes.iter().map(red_stroke_count).sum(),
+            _ => 0,
+        }
+    }
+
+    fn run_settings_frame(
+        ctx: &Context,
+        state: &mut UiState,
+        config: &mut AppConfig,
+        palette: &mut PaletteState,
+    ) -> usize {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(raw_input, |ui| {
+            state.draw(ui, config, palette);
+        });
+        output
+            .shapes
+            .iter()
+            .map(|s| red_stroke_count(&s.shape))
+            .sum()
+    }
+
+    #[test]
+    fn switching_settings_tabs_does_not_destabilize_widget_ids() {
+        let ctx = Context::default();
+        // This debug diagnostic is on by default in debug builds; force it on so
+        // the regression is caught regardless of build profile.
+        ctx.global_style_mut(|style| style.debug.warn_if_rect_changes_id = true);
+
+        let mut config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+
+        // Warm up so egui has a previous pass to compare against.
+        run_settings_frame(&ctx, &mut state, &mut config, &mut palette);
+
+        // Cycle through every tab (and back). Each tab reuses the same on-screen
+        // rects, so without a per-tab parent id egui flags the swapped widgets in
+        // red on the frame after the switch.
+        let mut red = 0;
+        for tab in SettingsTab::ALL
+            .into_iter()
+            .chain([SettingsTab::Appearance])
+        {
+            state.settings_tab = tab;
+            red += run_settings_frame(&ctx, &mut state, &mut config, &mut palette);
+        }
+
+        assert_eq!(
+            red, 0,
+            "settings panel emitted {red} red id-instability outline(s) while switching tabs"
+        );
+    }
 
     #[test]
     fn color_round_trip_preserves_alpha_when_allowed() {

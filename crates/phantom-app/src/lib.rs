@@ -13,6 +13,7 @@
 
 pub mod event;
 
+mod blur;
 mod chrome;
 mod egui_ui;
 mod gpu;
