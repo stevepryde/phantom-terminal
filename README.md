@@ -5,7 +5,7 @@ It is a native Rust app: a `winit` window with a hand-rolled `wgpu` renderer for
 the terminal grid, `egui` for settings and panels, and `alacritty_terminal` as
 the VT core. No webview, no web stack.
 
-![Phantom Terminal preview](docs/assets/phantom-terminal-preview-2026-06-06.webp)
+![Phantom Terminal preview](docs/assets/phantom-terminal-preview-2026-06-06-1705.webp)
 
 ## Features
 
