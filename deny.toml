@@ -70,6 +70,11 @@ allow = [
   "CC0-1.0",
   "Unicode-3.0",
   "Unicode-DFS-2016",
+  # egui's bundled UI fonts (epaint_default_fonts). Keep these explicit so
+  # adding non-font crates under these licenses still shows up in dependency
+  # review.
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
   # Boost Software License — clipboard-win / error-code (arboard's Windows
   # clipboard backend; permissive, OSI-approved). Windows-only at runtime, but
   # present in the all-platform lockfile.
