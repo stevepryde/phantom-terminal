@@ -1,7 +1,7 @@
 [package]
 name = "phantom-app"
 version = "0.1.2"
-description = "Phantom Terminal native app: winit window + wgpu/glyphon renderer over the VT core"
+description = "Phantom Terminal native app: winit window + egui UI over the VT core and phantom-gfx renderer"
 authors = ["Steve Pryde"]
 license = "MIT"
 edition = "2021"
@@ -13,17 +13,17 @@ path = "src/main.rs"
 # Native shell: winit window + PTY wiring, drawing the VT snapshot through the
 # hand-rolled phantom-gfx renderer.
 [dependencies]
-arboard = "3"
-egui = "0.34.3"
-egui-wgpu = "0.34.3"
-egui-winit = { version = "0.34.3", default-features = false }
-phantom-core = { version = "0.1.2", path = "../phantom-core" }
-phantom-emu = { version = "0.1.2", path = "../phantom-emu" }
-phantom-gfx = { version = "0.1.2", path = "../phantom-gfx" }
-pollster = "0.4.0"
-wgpu = "29"
-winit = "0.30"
+arboard = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+phantom-core = { workspace = true }
+phantom-emu = { workspace = true }
+phantom-gfx = { workspace = true }
+pollster = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSResponder", "NSView", "NSWindow"] }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }

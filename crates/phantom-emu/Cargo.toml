@@ -12,4 +12,4 @@ edition = "2021"
 # touching `phantom-gfx`/`phantom-app`. Pinned exactly because the crate makes
 # no API-stability guarantee.
 [dependencies]
-alacritty_terminal = "=0.26.0"
+alacritty_terminal = { workspace = true }

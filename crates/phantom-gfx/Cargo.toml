@@ -11,15 +11,15 @@ edition = "2021"
 # instanced pipelines: solid quads (backgrounds, cursor, underline/strike) and
 # textured glyph quads (alpha-mask tinted by fg, plus colour-emoji passthrough).
 [dependencies]
-wgpu = "29"
-swash = "0.2"
-fontdb = "0.23"
-bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25.10", default-features = false, features = ["webp"] }
-phantom-core = { version = "0.1.2", path = "../phantom-core" }
-phantom-emu = { version = "0.1.2", path = "../phantom-emu" }
+wgpu = { workspace = true }
+swash = { workspace = true }
+fontdb = { workspace = true }
+bytemuck = { workspace = true }
+image = { workspace = true }
+phantom-core = { workspace = true }
+phantom-emu = { workspace = true }
 # Only used by the optional headless offscreen-render harness; not in the app.
-pollster = { version = "0.4", optional = true }
+pollster = { workspace = true, optional = true }
 
 [features]
 # Offscreen render-to-image harness (`phantom_gfx::headless`) for pixel tests and
@@ -28,7 +28,7 @@ headless = ["dep:pollster"]
 
 [dev-dependencies]
 # PNG encoding for the `snapshot` example's image dump.
-png = "0.17"
+png = { workspace = true }
 
 [[example]]
 name = "snapshot"
