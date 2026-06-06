@@ -46,7 +46,10 @@ struct Uniforms {
 struct SolidInstance {
     pos: [f32; 2],
     size: [f32; 2],
-    color: [f32; 4],
+    color_tl: [f32; 4],
+    color_tr: [f32; 4],
+    color_bl: [f32; 4],
+    color_br: [f32; 4],
 }
 
 #[repr(C)]
@@ -320,6 +323,11 @@ impl Renderer {
         self.solids[self.target].push(solid(x, y, w, h, color));
     }
 
+    /// Fill an axis-aligned rectangle with smoothly interpolated corner colours.
+    pub fn fill_rect_gradient(&mut self, x: f32, y: f32, w: f32, h: f32, corners: [Rgba; 4]) {
+        self.solids[self.target].push(gradient(x, y, w, h, corners));
+    }
+
     /// Draw the selected local terminal backdrop behind terminal cells.
     pub fn draw_terminal_backdrop(
         &mut self,
@@ -546,10 +554,18 @@ impl Renderer {
 }
 
 fn solid(x: f32, y: f32, w: f32, h: f32, color: Rgba) -> SolidInstance {
+    gradient(x, y, w, h, [color, color, color, color])
+}
+
+fn gradient(x: f32, y: f32, w: f32, h: f32, corners: [Rgba; 4]) -> SolidInstance {
+    let [top_left, top_right, bottom_left, bottom_right] = corners;
     SolidInstance {
         pos: [x, y],
         size: [w, h],
-        color: to_linear(color),
+        color_tl: to_linear(top_left),
+        color_tr: to_linear(top_right),
+        color_bl: to_linear(bottom_left),
+        color_br: to_linear(bottom_right),
     }
 }
 
@@ -634,10 +650,13 @@ fn build_pipeline(
 }
 
 fn solid_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-    const ATTRS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+    const ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
         0 => Float32x2, // pos
         1 => Float32x2, // size
-        2 => Float32x4, // color
+        2 => Float32x4, // color_tl
+        3 => Float32x4, // color_tr
+        4 => Float32x4, // color_bl
+        5 => Float32x4, // color_br
     ];
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<SolidInstance>() as u64,

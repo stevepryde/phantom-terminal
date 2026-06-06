@@ -11,7 +11,10 @@ struct Uniforms {
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) size: vec2<f32>,
-    @location(2) color: vec4<f32>,
+    @location(2) color_tl: vec4<f32>,
+    @location(3) color_tr: vec4<f32>,
+    @location(4) color_bl: vec4<f32>,
+    @location(5) color_br: vec4<f32>,
 };
 
 struct VsOut {
@@ -33,7 +36,11 @@ fn vs(@builtin(vertex_index) vi: u32, in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip = vec4<f32>(ndc, 0.0, 1.0);
-    out.color = in.color;
+    out.color = mix(
+        mix(in.color_tl, in.color_tr, corner.x),
+        mix(in.color_bl, in.color_br, corner.x),
+        corner.y,
+    );
     return out;
 }
 

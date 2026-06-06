@@ -824,7 +824,7 @@ pub fn draw_window_backfill(
 
 fn draw_chrome_surfaces(r: &mut Renderer, layout: &Layout, colors: &ChromeColors) {
     if let Some(titlebar) = layout.titlebar {
-        draw_gradient_rect(r, titlebar, colors.bar_bg, with_alpha(colors.accent, 40));
+        draw_titlebar_gradient(r, titlebar, colors);
         if cfg!(target_os = "linux") {
             draw_linux_border(r, layout, colors);
         }
@@ -882,20 +882,19 @@ fn draw_linux_border(r: &mut Renderer, layout: &Layout, colors: &ChromeColors) {
     );
 }
 
-fn draw_gradient_rect(r: &mut Renderer, rect: Rect, left: [u8; 4], right: [u8; 4]) {
-    let strips = 24;
-    let strip_w = (rect.w / strips as f32).max(1.0);
-    for i in 0..strips {
-        let t = i as f32 / (strips - 1) as f32;
-        let color = mix(left, right, t * 0.65);
-        let x = rect.x + i as f32 * strip_w;
-        let w = if i == strips - 1 {
-            rect.x + rect.w - x
-        } else {
-            strip_w + 0.75
-        };
-        r.fill_rect(x, rect.y, w.max(0.0), rect.h, color);
-    }
+fn draw_titlebar_gradient(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
+    let glow = mix(colors.bar_bg, colors.accent, 0.42);
+    let top_left = mix(colors.bar_bg, colors.accent, 0.14);
+    let top_right = mix(glow, colors.text, 0.05);
+    let bottom_left = shade(mix(colors.bar_bg, colors.accent, 0.08), 0.9);
+    let bottom_right = shade(mix(colors.bar_bg, colors.accent, 0.28), 0.92);
+    r.fill_rect_gradient(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        [top_left, top_right, bottom_left, bottom_right],
+    );
 }
 
 #[derive(Clone, Copy)]
