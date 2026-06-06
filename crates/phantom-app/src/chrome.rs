@@ -1500,6 +1500,8 @@ mod tests {
             .iter()
             .find(|hit| hit.control == WindowControl::Close)
             .expect("close hit");
+        let close_probe_x = close.rect.x + 1.0;
+        let close_probe_y = close.rect.y + 1.0;
         let hits = TabBarHits {
             tabs: Vec::new(),
             new_tab: Rect {
@@ -1514,10 +1516,10 @@ mod tests {
         };
 
         assert_eq!(
-            hits.window_control_at(close.rect.x + 1.0, close.rect.y + 1.0),
+            hits.window_control_at(close_probe_x, close_probe_y),
             Some(WindowControl::Close)
         );
-        assert!(!hits.titlebar_drag_region_contains(close.rect.x + 1.0, close.rect.y + 1.0));
+        assert!(!hits.titlebar_drag_region_contains(close_probe_x, close_probe_y));
     }
 
     #[test]
