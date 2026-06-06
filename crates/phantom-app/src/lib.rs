@@ -50,6 +50,8 @@ use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(400);
+const LIVE_RESIZE_REDRAW_GRACE: Duration = Duration::from_millis(120);
+const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_NOTICE_LEN: usize = 240;
@@ -194,6 +196,9 @@ pub struct App {
     save_after: Option<Instant>,
     config_save_after: Option<Instant>,
     renderer_rebuild_after: Option<Instant>,
+    live_resize_until: Option<Instant>,
+    terminal_resize_deadline: Option<Instant>,
+    pending_terminal_grid: Option<(u16, u16)>,
     cwd_deadline: Instant,
     last_terminal_grid: Option<(u16, u16)>,
 
@@ -257,6 +262,9 @@ impl App {
             save_after: None,
             config_save_after: None,
             renderer_rebuild_after: None,
+            live_resize_until: None,
+            terminal_resize_deadline: None,
+            pending_terminal_grid: None,
             cwd_deadline: now + CWD_POLL_INTERVAL,
             last_terminal_grid: None,
             blink_enabled,
@@ -1394,11 +1402,19 @@ impl App {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.resize(width, height);
         }
-        if let (Some(renderer), Some(gpu)) = (self.renderer.as_ref(), self.gpu.as_ref()) {
-            renderer.resize(&gpu.queue, width, height);
-        }
-        self.sync_terminal_grid(true);
+        self.live_resize_until = Some(Instant::now() + LIVE_RESIZE_REDRAW_GRACE);
+        self.schedule_terminal_grid_resize(false);
         self.request_redraw();
+    }
+
+    fn sync_surface_to_window_size(&mut self) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        if gpu.sync_to_window_size() {
+            self.live_resize_until = Some(Instant::now() + LIVE_RESIZE_REDRAW_GRACE);
+            self.schedule_terminal_grid_resize(false);
+        }
     }
 
     fn sync_terminal_grid(&mut self, force: bool) {
@@ -1407,11 +1423,53 @@ impl App {
         if !force && self.last_terminal_grid == Some(grid) {
             return;
         }
+        self.pending_terminal_grid = None;
+        self.terminal_resize_deadline = None;
+        self.apply_terminal_grid(rows, cols);
+    }
+
+    fn schedule_terminal_grid_resize(&mut self, force: bool) {
+        let (rows, cols) = self.viewport_grid();
+        let grid = (rows, cols);
+        if !force {
+            if self.last_terminal_grid == Some(grid) {
+                self.pending_terminal_grid = None;
+                self.terminal_resize_deadline = None;
+                return;
+            }
+            if self.pending_terminal_grid == Some(grid) {
+                self.terminal_resize_deadline = Some(Instant::now() + TERMINAL_RESIZE_DEBOUNCE);
+                return;
+            }
+        }
+        if self.tabs.is_empty() {
+            self.pending_terminal_grid = None;
+            self.terminal_resize_deadline = None;
+            self.last_terminal_grid = Some(grid);
+            return;
+        }
+        self.pending_terminal_grid = Some(grid);
+        self.terminal_resize_deadline = Some(Instant::now() + TERMINAL_RESIZE_DEBOUNCE);
+    }
+
+    fn apply_terminal_grid(&mut self, rows: u16, cols: u16) {
         for tab in &mut self.tabs {
             tab.core.resize(rows, cols);
-            let _ = self.pty.resize(tab.pty_id, rows, cols);
+            if self.pty.resize(tab.pty_id, rows, cols).is_ok() {
+                tab.expect_prompt_repaint();
+            }
         }
-        self.last_terminal_grid = Some(grid);
+        self.last_terminal_grid = Some((rows, cols));
+    }
+
+    fn flush_pending_terminal_resize(&mut self) {
+        let Some((rows, cols)) = self.pending_terminal_grid.take() else {
+            self.terminal_resize_deadline = None;
+            return;
+        };
+        self.apply_terminal_grid(rows, cols);
+        self.terminal_resize_deadline = None;
+        self.request_redraw();
     }
 
     /// Poll the active tab's shell cwd; update its title and persist on change.
@@ -1473,6 +1531,7 @@ impl App {
 
     fn render(&mut self) {
         self.redraw_queued = false;
+        self.sync_surface_to_window_size();
         let ui_outcome = match (self.gpu.as_ref(), self.egui.as_mut()) {
             (Some(gpu), Some(egui)) => egui.run(
                 &gpu.window,
@@ -1488,7 +1547,9 @@ impl App {
         if let Some(action) = ui_outcome.palette_action {
             self.dispatch_palette(action);
         }
-        self.sync_terminal_grid(false);
+        if self.pending_terminal_grid.is_none() {
+            self.sync_terminal_grid(false);
+        }
         let drag_indicator = self.tab_drag_indicator();
         let custom_window_chrome = self.custom_window_chrome();
 
@@ -1536,13 +1597,24 @@ impl App {
         );
         if let Some(tab) = self.tabs.get(self.active) {
             let snapshot = tab.core.snapshot();
-            renderer.draw_terminal(
-                &gpu.queue,
-                &snapshot,
-                self.cursor_on,
-                layout.viewport.x,
-                layout.viewport.y,
-            );
+            if let Some((rows, cols)) = self.pending_terminal_grid {
+                renderer.draw_terminal_clipped(
+                    &gpu.queue,
+                    &snapshot,
+                    self.cursor_on,
+                    layout.viewport.x,
+                    layout.viewport.y,
+                    (rows as usize, cols as usize),
+                );
+            } else {
+                renderer.draw_terminal(
+                    &gpu.queue,
+                    &snapshot,
+                    self.cursor_on,
+                    layout.viewport.x,
+                    layout.viewport.y,
+                );
+            }
             let scrollbar_active = self.scroll_drag.is_some()
                 || (snapshot.scroll.is_scrollable()
                     && chrome::terminal_scrollbar_hit_track(&layout)
@@ -1872,11 +1944,24 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
         }
+        if let Some(deadline) = self.terminal_resize_deadline {
+            if now >= deadline {
+                self.flush_pending_terminal_resize();
+            }
+        }
         self.clear_expired_notice(now);
         if self.exit_requested {
             self.flush_config_save();
             event_loop.exit();
             return;
+        }
+        if let Some(until) = self.live_resize_until {
+            if now < until {
+                self.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Poll);
+                return;
+            }
+            self.live_resize_until = None;
         }
 
         let mut next = self.cwd_deadline;
@@ -1890,6 +1975,9 @@ impl ApplicationHandler<AppEvent> for App {
             next = next.min(deadline);
         }
         if let Some(deadline) = self.renderer_rebuild_after {
+            next = next.min(deadline);
+        }
+        if let Some(deadline) = self.terminal_resize_deadline {
             next = next.min(deadline);
         }
         if let Some(notice) = self.notice.as_ref() {
@@ -2027,6 +2115,84 @@ mod tests {
         assert_eq!(app.terminal_click_count(1, 2), 3);
         assert_eq!(app.terminal_click_count(1, 2), 3);
         assert_eq!(app.terminal_click_count(1, 3), 1);
+    }
+
+    #[test]
+    fn terminal_grid_resize_is_debounced_without_force() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(2, 20, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.last_terminal_grid = Some((24, 80));
+
+        app.schedule_terminal_grid_resize(false);
+        assert_eq!(app.tabs[0].core.size(), (2, 20));
+        assert_eq!(app.pending_terminal_grid, None);
+
+        app.schedule_terminal_grid_resize(true);
+        assert_eq!(app.tabs[0].core.size(), (2, 20));
+        assert_eq!(app.pending_terminal_grid, Some((24, 80)));
+
+        app.flush_pending_terminal_resize();
+        assert_eq!(app.tabs[0].core.size(), (24, 80));
+        assert_eq!(app.pending_terminal_grid, None);
+        assert_eq!(app.terminal_resize_deadline, None);
+    }
+
+    #[test]
+    fn forced_terminal_grid_sync_applies_immediately() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(2, 20, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.last_terminal_grid = Some((24, 80));
+
+        app.sync_terminal_grid(true);
+        assert_eq!(app.tabs[0].core.size(), (24, 80));
+        assert_eq!(app.pending_terminal_grid, None);
+        assert_eq!(app.terminal_resize_deadline, None);
+    }
+
+    #[test]
+    fn debounced_terminal_grid_resize_cancels_when_grid_returns_to_applied_size() {
+        let mut app = test_app();
+        app.last_terminal_grid = Some((24, 80));
+        app.pending_terminal_grid = Some((24, 40));
+        app.terminal_resize_deadline = Some(Instant::now());
+
+        app.schedule_terminal_grid_resize(false);
+
+        assert_eq!(app.pending_terminal_grid, None);
+        assert_eq!(app.terminal_resize_deadline, None);
+    }
+
+    #[test]
+    fn repeated_resize_event_for_same_pending_grid_extends_deadline() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(2, 20, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.last_terminal_grid = Some((10, 10));
+        app.pending_terminal_grid = Some((24, 80));
+        let old_deadline = Instant::now() + Duration::from_millis(1);
+        app.terminal_resize_deadline = Some(old_deadline);
+
+        app.schedule_terminal_grid_resize(false);
+
+        assert_eq!(app.pending_terminal_grid, Some((24, 80)));
+        assert!(app.terminal_resize_deadline.unwrap() > old_deadline);
     }
 
     #[test]

@@ -393,6 +393,65 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_prompt_survives_repeated_width_resizes_without_duplication() {
+        let prompt = b"phantom-terminal via v1.96.0 on main (abcdef) [!]\r\n> ";
+        let mut term = core(8, 52, 100);
+        term.advance(prompt);
+
+        for cols in [18, 36, 14, 52] {
+            term.resize(8, cols);
+        }
+
+        let snap = term.snapshot();
+        let visible = (0..snap.rows as usize)
+            .map(|row| snap.row_text(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(visible.matches("phantom-terminal").count(), 1);
+        assert_eq!(visible.matches("v1.96.0").count(), 1);
+        assert!(visible.contains('>'));
+    }
+
+    #[test]
+    fn height_only_resize_keeps_viewport_top_stable() {
+        let mut term = core(6, 20, 100);
+        term.advance(b"one\r\ntwo\r\nthree");
+        assert_eq!(term.snapshot().row_text(0), "one");
+
+        term.resize(10, 20);
+        assert_eq!(term.snapshot().row_text(0), "one");
+
+        term.resize(4, 20);
+        assert_eq!(term.snapshot().row_text(0), "one");
+    }
+
+    #[test]
+    fn wrapped_prompt_stays_at_top_after_mixed_resizes() {
+        let prompt = b"phantom-terminal via v1.96.0 on main (abcdef) [!]\r\n> ";
+        let mut term = core(5, 52, 100);
+        term.advance(prompt);
+
+        for (rows, cols) in [(12, 18), (9, 14), (5, 52)] {
+            term.resize(rows, cols);
+        }
+
+        let snap = term.snapshot();
+        let visible = (0..snap.rows as usize)
+            .map(|row| snap.row_text(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            snap.row_text(0),
+            "phantom-terminal via v1.96.0 on main (abcdef) [!]"
+        );
+        assert_eq!(visible.matches("phantom-terminal").count(), 1);
+        assert_eq!(visible.matches("v1.96.0").count(), 1);
+        assert!(visible.contains('>'));
+    }
+
+    #[test]
     fn resize_updates_reported_dimensions() {
         let mut term = core(10, 20, 100);
         term.resize(30, 100);

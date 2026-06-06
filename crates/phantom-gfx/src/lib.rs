@@ -344,15 +344,16 @@ impl Renderer {
     /// Draw monospace `s` with its top-left at `(x, y)` in the current layer.
     /// Returns the advance width.
     pub fn text(&mut self, queue: &wgpu::Queue, x: f32, y: f32, s: &str, color: Rgba) -> f32 {
-        let baseline = y + self.ascent;
-        let mut pen = x;
+        let start = x.round();
+        let baseline = y.round() + self.ascent;
+        let mut pen = start;
         for ch in s.chars() {
             if ch != ' ' {
                 self.emit_glyph(queue, REGULAR, ch, pen, baseline, color);
             }
             pen += self.cell_w;
         }
-        pen - x
+        pen - start
     }
 
     /// Draw the terminal grid with its top-left at `(ox, oy)`. `cursor_on` is the
@@ -365,15 +366,40 @@ impl Renderer {
         ox: f32,
         oy: f32,
     ) {
+        self.draw_terminal_clipped(
+            queue,
+            snap,
+            cursor_on,
+            ox,
+            oy,
+            (snap.rows as usize, snap.cols as usize),
+        );
+    }
+
+    /// Draw the top-left portion of the terminal grid. Extra cells are clipped
+    /// from the right/bottom, never centered into the available space.
+    pub fn draw_terminal_clipped(
+        &mut self,
+        queue: &wgpu::Queue,
+        snap: &Snapshot,
+        cursor_on: bool,
+        ox: f32,
+        oy: f32,
+        max_grid: (usize, usize),
+    ) {
+        let ox = ox.round();
+        let oy = oy.round();
         let (cw, ch) = (self.cell_w, self.cell_h);
         let default_bg = self.palette.background();
         let cursor_color = self.palette.cursor();
         let selection_color = self.palette.selection();
         let cursor = snap.cursor;
         let show_cursor = cursor.visible && cursor_on;
+        let rows = (snap.rows as usize).min(max_grid.0);
+        let cols = (snap.cols as usize).min(max_grid.1);
 
-        for row in 0..snap.rows as usize {
-            for col in 0..snap.cols as usize {
+        for row in 0..rows {
+            for col in 0..cols {
                 let Some(cell) = snap.cell(row, col) else {
                     continue;
                 };
@@ -469,8 +495,8 @@ impl Renderer {
         };
         if let Some(entry) = entry {
             if !entry.empty {
-                let gx = pen_x + entry.left as f32;
-                let gy = baseline_y - entry.top as f32;
+                let gx = (pen_x + entry.left as f32).round();
+                let gy = (baseline_y - entry.top as f32).round();
                 self.glyphs[self.target].push(glyph(
                     gx,
                     gy,

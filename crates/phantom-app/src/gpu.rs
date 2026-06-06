@@ -104,7 +104,7 @@ impl GpuContext {
             present_mode: PresentMode::Fifo,
             alpha_mode,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
 
@@ -138,6 +138,17 @@ impl GpuContext {
         self.surface_config.width = width.max(1);
         self.surface_config.height = height.max(1);
         self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    pub fn sync_to_window_size(&mut self) -> bool {
+        let size = self.window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+        if self.surface_config.width == width && self.surface_config.height == height {
+            return false;
+        }
+        self.resize(width, height);
+        true
     }
 
     /// Acquire the next frame, clear it, and let `renderer` draw the prepared
@@ -177,6 +188,9 @@ impl GpuContext {
                 return false;
             }
         };
+
+        let frame_size = frame.texture.size();
+        renderer.resize(&self.queue, frame_size.width, frame_size.height);
 
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let mut encoder = self

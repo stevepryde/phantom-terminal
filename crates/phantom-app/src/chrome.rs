@@ -11,8 +11,10 @@ const CLOSE_W: f32 = 16.0;
 const NEW_TAB_W: f32 = 30.0;
 const SETTINGS_W: f32 = 34.0;
 const EPHEMERAL_W: f32 = 24.0;
-const MAX_TAB_W: f32 = 220.0;
+const TAB_W: f32 = 220.0;
 const MIN_TAB_W: f32 = 70.0;
+const VERTICAL_BAR_W: f32 = 220.0;
+const MIN_VERTICAL_VIEWPORT_W: f32 = 80.0;
 const TERMINAL_MARGIN: f32 = 8.0;
 const CUSTOM_EDGE_INSET: f32 = 1.0;
 const CUSTOM_TITLEBAR_H: f32 = 32.0;
@@ -120,7 +122,8 @@ pub fn compute_layout(
             custom_chrome,
         }
     } else {
-        let bar_w = (w * 0.32).clamp(120.0, 240.0);
+        let max_bar_w = (w - TERMINAL_MARGIN * 2.0 - MIN_VERTICAL_VIEWPORT_W).max(0.0);
+        let bar_w = max_bar_w.min(VERTICAL_BAR_W);
         Layout {
             titlebar: custom_chrome.then_some(Rect {
                 x: edge,
@@ -506,7 +509,6 @@ pub fn draw_tab_bar(
     draw_chrome_surfaces(r, layout, colors);
 
     let cell_w = r.text_width("M").max(1.0);
-    let n = titles.len().max(1);
     let titlebar = layout.titlebar;
     let window_controls = window_control_hits(layout);
 
@@ -522,24 +524,12 @@ pub fn draw_tab_bar(
         let ephemeral_indicator = ephemeral.then_some(ephemeral_indicator_rect(settings));
         let tab_start = bar.x + left_reserved;
         let status_w = if ephemeral { EPHEMERAL_W } else { 0.0 };
-        let avail =
-            (bar.w - left_reserved - right_reserved - NEW_TAB_W - SETTINGS_W - status_w).max(0.0);
-        let ideal_tab_w = avail / n as f32;
-        let tab_w = if ideal_tab_w < MIN_TAB_W {
-            ideal_tab_w.max(32.0)
-        } else {
-            ideal_tab_w.min(MAX_TAB_W)
-        };
+        let tab_limit = (settings.x - status_w - NEW_TAB_W).max(tab_start);
         let tab_h = bar.h;
-        let mut tabs = Vec::with_capacity(titles.len());
-        let mut x = tab_start;
-        for (i, title) in titles.iter().enumerate() {
-            let rect = Rect {
-                x,
-                y: bar.y,
-                w: tab_w,
-                h: tab_h,
-            };
+        let rects = horizontal_tab_rects(titles.len(), tab_start, tab_limit, bar.y, tab_h);
+        let mut tabs = Vec::with_capacity(rects.len());
+        for (i, rect) in rects.iter().copied().enumerate() {
+            let title = &titles[i];
             let editing = if i == active { rename } else { None };
             let dragging = drag_indicator.is_some_and(|drag| drag.source == i);
             let hover = if drag_indicator.is_some() {
@@ -577,10 +567,9 @@ pub fn draw_tab_bar(
                 rect,
                 close,
             });
-            x += tab_w;
         }
         let new_tab = Rect {
-            x: x.min(settings.x - status_w - NEW_TAB_W).max(bar.x),
+            x: horizontal_new_tab_x(rects.last().copied(), tab_limit).max(bar.x),
             y: bar.y,
             w: NEW_TAB_W,
             h: tab_h,
@@ -722,6 +711,42 @@ pub fn draw_tab_bar(
         );
         hits
     }
+}
+
+fn horizontal_tab_rects(
+    tab_count: usize,
+    tab_start: f32,
+    tab_limit: f32,
+    y: f32,
+    h: f32,
+) -> Vec<Rect> {
+    if tab_count == 0 {
+        return Vec::new();
+    }
+    let available = (tab_limit - tab_start).max(0.0);
+    let default_total = TAB_W * tab_count as f32;
+    let tab_w = if default_total <= available {
+        TAB_W
+    } else {
+        (available / tab_count as f32).clamp(MIN_TAB_W, TAB_W)
+    };
+    let mut tabs = Vec::with_capacity(tab_count);
+    let mut x = tab_start;
+    for _ in 0..tab_count {
+        if x >= tab_limit {
+            break;
+        }
+        tabs.push(Rect { x, y, w: tab_w, h });
+        x += tab_w;
+    }
+    tabs
+}
+
+fn horizontal_new_tab_x(last_tab: Option<Rect>, tab_limit: f32) -> f32 {
+    last_tab
+        .map(|rect| rect.x + rect.w)
+        .unwrap_or(tab_limit)
+        .min(tab_limit)
 }
 
 fn draw_drop_indicator(
@@ -1017,8 +1042,7 @@ fn draw_titlebar_controls(
         return;
     }
     let text = "Phantom Terminal";
-    let width = r.text_width(text);
-    let x = titlebar.x + ((titlebar.w - width) * 0.5).max(MAC_TRAFFIC_LIGHT_SPACE);
+    let x = titlebar.x + MAC_TRAFFIC_LIGHT_SPACE;
     let y = titlebar.y + (titlebar.h - r.cell_size().1) * 0.5;
     r.text(queue, x, y, text, with_alpha(colors.dim_text, 160));
 }
@@ -1385,6 +1409,23 @@ mod tests {
     }
 
     #[test]
+    fn vertical_tab_bar_keeps_default_width_when_there_is_room() {
+        let wide = compute_layout(1000.0, 600.0, 20.0, false, WindowChrome::System);
+        let wider = compute_layout(1200.0, 600.0, 20.0, false, WindowChrome::System);
+
+        assert_eq!(wide.bar.w, VERTICAL_BAR_W);
+        assert_eq!(wider.bar.w, VERTICAL_BAR_W);
+    }
+
+    #[test]
+    fn vertical_tab_bar_shrinks_only_when_crowded() {
+        let l = compute_layout(280.0, 600.0, 20.0, false, WindowChrome::System);
+
+        assert!(l.bar.w < VERTICAL_BAR_W);
+        assert_eq!(l.viewport.w, MIN_VERTICAL_VIEWPORT_W);
+    }
+
+    #[test]
     fn horizontal_terminal_pane_wraps_viewport_inset_below_tab_bar() {
         let l = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::System);
         let pane = terminal_pane(&l);
@@ -1601,6 +1642,31 @@ mod tests {
         assert_eq!(hits.drop_index(51.0, 10.0, true), 1);
         assert_eq!(hits.drop_index(151.0, 10.0, true), 2);
         assert_eq!(hits.drop_index(299.0, 10.0, true), 3);
+    }
+
+    #[test]
+    fn horizontal_tabs_keep_default_width_when_there_is_room() {
+        let tabs = horizontal_tab_rects(3, 80.0, 80.0 + TAB_W * 3.0 + 100.0, 0.0, 32.0);
+
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs[0].x, 80.0);
+        assert_eq!(tabs[0].w, TAB_W);
+        assert_eq!(tabs[1].x, 80.0 + TAB_W);
+        assert_eq!(tabs[1].w, TAB_W);
+        assert_eq!(tabs[2].x, 80.0 + TAB_W * 2.0);
+        assert_eq!(tabs[2].w, TAB_W);
+    }
+
+    #[test]
+    fn horizontal_tabs_shrink_only_when_crowded() {
+        let tabs = horizontal_tab_rects(3, 80.0, 80.0 + 300.0, 0.0, 32.0);
+
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs[0].w, 100.0);
+        assert_eq!(tabs[1].x, 180.0);
+        assert_eq!(tabs[1].w, 100.0);
+        assert_eq!(tabs[2].x, 280.0);
+        assert_eq!(tabs[2].w, 100.0);
     }
 
     #[test]

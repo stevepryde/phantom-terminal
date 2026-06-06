@@ -44,6 +44,10 @@ impl Tab {
         }
     }
 
+    pub fn expect_prompt_repaint(&mut self) {
+        self.startup_blank_line.arm();
+    }
+
     /// The label shown on the tab: the custom title if set, else the cwd
     /// basename, else a default.
     pub fn title(&self) -> String {
@@ -77,9 +81,14 @@ impl StartupBlankLineFilter {
         }
     }
 
+    fn arm(&mut self) {
+        self.done = false;
+        self.pending.clear();
+    }
+
     fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
         if self.done {
-            return bytes.to_vec();
+            return strip_repaint_blank_line(bytes);
         }
 
         self.pending.extend_from_slice(bytes);
@@ -97,6 +106,45 @@ impl StartupBlankLineFilter {
             }
         }
     }
+}
+
+fn strip_repaint_blank_line(bytes: &[u8]) -> Vec<u8> {
+    let mut index = 0;
+    let mut saw_erase = false;
+    let mut saw_visible_since_erase = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\n' if saw_erase && !saw_visible_since_erase => {
+                let mut out = bytes.to_vec();
+                out.remove(index);
+                return out;
+            }
+            b'\n' => {
+                saw_erase = false;
+                saw_visible_since_erase = false;
+                index += 1;
+            }
+            0x1b => match skip_escape(bytes, index) {
+                Some(escape) => {
+                    if escape.erases_visible_content {
+                        saw_erase = true;
+                        saw_visible_since_erase = false;
+                    }
+                    index = escape.next;
+                }
+                None => return bytes.to_vec(),
+            },
+            b' ' | b'\t' | b'\r' => index += 1,
+            0x00..=0x1f | 0x7f => index += 1,
+            _ => {
+                if saw_erase {
+                    saw_visible_since_erase = true;
+                }
+                index += 1;
+            }
+        }
+    }
+    bytes.to_vec()
 }
 
 enum StartupScan {
@@ -283,5 +331,31 @@ mod tests {
         tab.core.scroll_to_offset(100);
 
         assert_ne!(tab.core.snapshot().row_text(0), "");
+    }
+
+    #[test]
+    fn resize_rearms_filter_for_starship_prompt_repaint() {
+        let core = AlacrittyCore::new(4, 40, 100, CursorShape::Block);
+        let mut tab = Tab::new(1, core, 7, "/tmp".to_string(), None);
+
+        tab.advance_pty(b"\nphantom-terminal");
+        assert_eq!(tab.core.snapshot().row_text(0), "phantom-terminal");
+
+        tab.expect_prompt_repaint();
+        tab.advance_pty(b"\r\x1b[J\r\nphantom-terminal");
+        assert_eq!(tab.core.snapshot().row_text(0), "phantom-terminal");
+    }
+
+    #[test]
+    fn resize_rearm_keeps_visible_output_before_newline() {
+        let core = AlacrittyCore::new(4, 40, 100, CursorShape::Block);
+        let mut tab = Tab::new(1, core, 7, "/tmp".to_string(), None);
+
+        tab.advance_pty(b"\nprompt");
+        tab.expect_prompt_repaint();
+        tab.advance_pty(b"build output\r\nnext");
+
+        assert_eq!(tab.core.snapshot().row_text(0), "promptbuild output");
+        assert_eq!(tab.core.snapshot().row_text(1), "next");
     }
 }
