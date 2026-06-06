@@ -212,7 +212,7 @@ impl App {
         let blink_enabled = config.cursor_blink;
         let applied_window_chrome = config.window_chrome.clone();
         let renderer_signature = renderer_signature(&config);
-        let ephemeral = launch.cwd.is_some();
+        let ephemeral = !launch.remember_tabs;
         let now = Instant::now();
         let ui = UiState::new(&config);
         Self {
@@ -1520,6 +1520,7 @@ impl App {
             &colors,
             self.rename.as_deref(),
             self.ui.settings_open(),
+            self.ephemeral,
             &self.chrome_anim,
             drag_indicator,
         );
@@ -1971,7 +1972,7 @@ mod tests {
             None,
             LaunchContext {
                 cwd: None,
-                remember_tabs: false,
+                remember_tabs: true,
             },
         )
     }

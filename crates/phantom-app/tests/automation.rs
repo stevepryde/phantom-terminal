@@ -27,7 +27,7 @@ impl PtyOutbox for TestOutbox {
 fn launched() -> LaunchContext {
     LaunchContext {
         cwd: None,
-        remember_tabs: false,
+        remember_tabs: true,
     }
 }
 

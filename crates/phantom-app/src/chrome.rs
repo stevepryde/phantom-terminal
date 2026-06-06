@@ -10,6 +10,7 @@ const PAD: f32 = 8.0;
 const CLOSE_W: f32 = 16.0;
 const NEW_TAB_W: f32 = 30.0;
 const SETTINGS_W: f32 = 34.0;
+const EPHEMERAL_W: f32 = 24.0;
 const MAX_TAB_W: f32 = 220.0;
 const MIN_TAB_W: f32 = 70.0;
 const TERMINAL_MARGIN: f32 = 8.0;
@@ -304,8 +305,16 @@ pub struct TabBarHits {
     pub tabs: Vec<TabHit>,
     pub new_tab: Rect,
     pub settings: Rect,
+    pub ephemeral_indicator: Option<Rect>,
     pub titlebar: Option<Rect>,
     pub window_controls: Vec<WindowControlHit>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TitlebarControlState {
+    settings_open: bool,
+    ephemeral: bool,
+    settings_hover: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,7 +440,12 @@ impl TabBarHits {
         if !titlebar.contains(px, py) {
             return false;
         }
-        if self.new_tab.contains(px, py) || self.settings.contains(px, py) {
+        if self.new_tab.contains(px, py)
+            || self.settings.contains(px, py)
+            || self
+                .ephemeral_indicator
+                .is_some_and(|rect| rect.contains(px, py))
+        {
             return false;
         }
         if self
@@ -484,6 +498,7 @@ pub fn draw_tab_bar(
     colors: &ChromeColors,
     rename: Option<&str>,
     settings_open: bool,
+    ephemeral: bool,
     animations: &ChromeAnimationState,
     drag_indicator: Option<DragIndicator>,
 ) -> TabBarHits {
@@ -504,8 +519,11 @@ pub fn draw_tab_bar(
             w: SETTINGS_W,
             h: bar.h,
         };
+        let ephemeral_indicator = ephemeral.then_some(ephemeral_indicator_rect(settings));
         let tab_start = bar.x + left_reserved;
-        let avail = (bar.w - left_reserved - right_reserved - NEW_TAB_W - SETTINGS_W).max(0.0);
+        let status_w = if ephemeral { EPHEMERAL_W } else { 0.0 };
+        let avail =
+            (bar.w - left_reserved - right_reserved - NEW_TAB_W - SETTINGS_W - status_w).max(0.0);
         let ideal_tab_w = avail / n as f32;
         let tab_w = if ideal_tab_w < MIN_TAB_W {
             ideal_tab_w.max(32.0)
@@ -562,18 +580,22 @@ pub fn draw_tab_bar(
             x += tab_w;
         }
         let new_tab = Rect {
-            x: x.min(settings.x - NEW_TAB_W).max(bar.x),
+            x: x.min(settings.x - status_w - NEW_TAB_W).max(bar.x),
             y: bar.y,
             w: NEW_TAB_W,
             h: tab_h,
         };
         draw_new_tab_button(r, queue, new_tab, colors);
+        if let Some(rect) = ephemeral_indicator {
+            draw_ephemeral_indicator(r, rect, colors);
+        }
         draw_settings_button(r, settings, colors, settings_open, animations.settings());
         draw_window_controls(r, queue, window_controls.as_slice(), colors);
         let hits = TabBarHits {
             tabs,
             new_tab,
             settings,
+            ephemeral_indicator,
             titlebar,
             window_controls,
         };
@@ -600,6 +622,7 @@ pub fn draw_tab_bar(
         } else {
             sidebar_settings
         };
+        let ephemeral_indicator = ephemeral.then_some(ephemeral_indicator_rect(settings));
         if let Some(titlebar) = titlebar {
             draw_titlebar_controls(
                 r,
@@ -607,8 +630,11 @@ pub fn draw_tab_bar(
                 titlebar,
                 layout,
                 colors,
-                settings_open,
-                animations.settings(),
+                TitlebarControlState {
+                    settings_open,
+                    ephemeral,
+                    settings_hover: animations.settings(),
+                },
             );
             draw_window_controls(r, queue, window_controls.as_slice(), colors);
         }
@@ -674,12 +700,16 @@ pub fn draw_tab_bar(
             colors.dim_text,
         );
         if !layout.custom_chrome {
+            if let Some(rect) = ephemeral_indicator {
+                draw_ephemeral_indicator(r, rect, colors);
+            }
             draw_settings_button(r, settings, colors, settings_open, animations.settings());
         }
         let hits = TabBarHits {
             tabs,
             new_tab,
             settings,
+            ephemeral_indicator,
             titlebar,
             window_controls,
         };
@@ -929,6 +959,15 @@ fn titlebar_settings_rect(titlebar: Rect, layout: &Layout) -> Rect {
     }
 }
 
+fn ephemeral_indicator_rect(settings: Rect) -> Rect {
+    Rect {
+        x: (settings.x - EPHEMERAL_W).max(0.0),
+        y: settings.y,
+        w: EPHEMERAL_W,
+        h: settings.h,
+    }
+}
+
 fn window_control_hits(layout: &Layout) -> Vec<WindowControlHit> {
     if !layout.custom_chrome || cfg!(target_os = "macos") {
         return Vec::new();
@@ -962,11 +1001,19 @@ fn draw_titlebar_controls(
     titlebar: Rect,
     layout: &Layout,
     colors: &ChromeColors,
-    settings_open: bool,
-    settings_hover: f32,
+    state: TitlebarControlState,
 ) {
     let settings = titlebar_settings_rect(titlebar, layout);
-    draw_settings_button(r, settings, colors, settings_open, settings_hover);
+    if state.ephemeral {
+        draw_ephemeral_indicator(r, ephemeral_indicator_rect(settings), colors);
+    }
+    draw_settings_button(
+        r,
+        settings,
+        colors,
+        state.settings_open,
+        state.settings_hover,
+    );
     if !cfg!(target_os = "macos") {
         return;
     }
@@ -1044,6 +1091,25 @@ fn draw_settings_button(
         cell_h,
         color,
     );
+}
+
+fn draw_ephemeral_indicator(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
+    let accent = [251, 191, 36, 255];
+    let size = 10.0;
+    let x = rect.x + (rect.w - size) * 0.5;
+    let y = rect.y + (rect.h - size) * 0.5;
+    r.fill_rect(
+        x - 3.0,
+        y - 3.0,
+        size + 6.0,
+        size + 6.0,
+        with_alpha(accent, 28),
+    );
+    r.fill_rect(x, y, size, 2.0, accent);
+    r.fill_rect(x, y + size - 2.0, size, 2.0, accent);
+    r.fill_rect(x, y, 2.0, size, accent);
+    r.fill_rect(x + size - 2.0, y, 2.0, size, accent);
+    r.fill_rect(x + 4.0, y + 4.0, 2.0, 2.0, mix(accent, colors.text, 0.35));
 }
 
 fn draw_settings_icon(r: &mut Renderer, x: f32, y: f32, w: f32, h: f32, color: [u8; 4]) {
@@ -1268,6 +1334,7 @@ mod tests {
                 w: 30.0,
                 h: 30.0,
             },
+            ephemeral_indicator: None,
             titlebar: None,
             window_controls: Vec::new(),
         }
@@ -1292,6 +1359,7 @@ mod tests {
                 w: 100.0,
                 h: 30.0,
             },
+            ephemeral_indicator: None,
             titlebar: None,
             window_controls: Vec::new(),
         }
@@ -1379,6 +1447,7 @@ mod tests {
                 h: layout.bar.h,
             },
             settings: titlebar_settings_rect(layout.titlebar.unwrap(), &layout),
+            ephemeral_indicator: None,
             titlebar: layout.titlebar,
             window_controls: controls,
         };
@@ -1388,6 +1457,29 @@ mod tests {
             Some(WindowControl::Close)
         );
         assert!(!hits.titlebar_drag_region_contains(close.rect.x + 1.0, close.rect.y + 1.0));
+    }
+
+    #[test]
+    fn ephemeral_indicator_sits_next_to_settings_and_is_not_drag_region() {
+        let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
+        let settings = titlebar_settings_rect(layout.titlebar.unwrap(), &layout);
+        let indicator = ephemeral_indicator_rect(settings);
+        let hits = TabBarHits {
+            tabs: Vec::new(),
+            new_tab: Rect {
+                x: 120.0,
+                y: layout.bar.y,
+                w: 30.0,
+                h: layout.bar.h,
+            },
+            settings,
+            ephemeral_indicator: Some(indicator),
+            titlebar: layout.titlebar,
+            window_controls: window_control_hits(&layout),
+        };
+
+        assert_eq!(indicator.x + indicator.w, settings.x);
+        assert!(!hits.titlebar_drag_region_contains(indicator.x + 1.0, indicator.y + 1.0));
     }
 
     #[test]
@@ -1483,6 +1575,7 @@ mod tests {
                 w: 30.0,
                 h: 30.0,
             },
+            ephemeral_indicator: None,
             titlebar: None,
             window_controls: Vec::new(),
         };
