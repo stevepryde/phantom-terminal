@@ -1,10 +1,8 @@
-//! Spawn orchestration shared by every front-end.
+//! Spawn orchestration.
 //!
 //! This is the trust boundary for launching shells: callers pass a *profile id*
 //! and an optional working directory, never a command line. The command/args
-//! come exclusively from a stored, validated [`ShellProfile`]. Keeping this in
-//! `phantom-core` means the native app and the Tauri build enforce identical
-//! rules.
+//! come exclusively from a stored, validated [`ShellProfile`].
 
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};

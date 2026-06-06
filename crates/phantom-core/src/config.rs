@@ -231,7 +231,8 @@ impl Default for AppConfig {
 
 impl AppConfig {
     /// Validate user-controlled config before it is stored or used to spawn a
-    /// process. This keeps the webview IPC boundary small and explicit.
+    /// process. Config is read from disk, so this is the trust point even though
+    /// there is no separate front-end process.
     pub fn validate(&self) -> AppResult<()> {
         validate_nonempty("font family", &self.font_family)?;
         validate_len("font family", &self.font_family, MAX_NAME_LEN)?;

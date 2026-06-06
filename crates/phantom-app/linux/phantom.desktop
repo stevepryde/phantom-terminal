@@ -1,11 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name={{name}}
-Comment={{comment}}
-Exec={{exec}}
-Icon={{icon}}
+Name=Phantom Terminal
+Comment=A terminal that remembers your tabs and sessions
+Exec=phantom
+Icon=phantom
 Terminal=false
 Categories=System;TerminalEmulator;Utility;
 Keywords=terminal;shell;command;prompt;
 StartupNotify=true
+StartupWMClass=phantom
 X-TerminalArgDir=--cwd

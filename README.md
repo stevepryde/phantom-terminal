@@ -1,8 +1,9 @@
 # Phantom Terminal
 
 Phantom Terminal is a minimal desktop terminal that remembers your tabs.
-It is built with Tauri 2, Rust, React 19, TypeScript, Vite, and Bun.
-It's basically a wrapper around ghostty-web.
+It is a native Rust app: a `winit` window with a hand-rolled `wgpu` renderer for
+the terminal grid, `egui` for settings and panels, and `alacritty_terminal` as
+the VT core. No webview, no web stack.
 
 ![Phantom Terminal preview](docs/assets/phantom-terminal-preview.webp)
 
@@ -19,35 +20,33 @@ I wanted a simple terminal that remembers tabs and the CWD of each tab.
 
 ## Requirements
 
-- [Bun](https://bun.sh) 1.3.9 or newer.
 - A stable Rust toolchain with `cargo`.
-- Tauri platform dependencies. See the
-  [Tauri prerequisites](https://tauri.app/start/prerequisites/).
+- On Linux, the usual `winit` build dependencies (X11/Wayland/xkbcommon client
+  headers), e.g. on Debian/Ubuntu:
 
-Install JavaScript dependencies:
-
-```sh
-bun install
-```
+  ```sh
+  sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+    libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev
+  ```
 
 ## Development
 
-Run the hot-reloading desktop app:
+Run the app:
 
 ```sh
-bun run tauri dev
+cargo run -p phantom-app
 ```
 
 Launch a fresh, non-remembering window in a specific directory:
 
 ```sh
-bun run tauri dev -- --cwd /path/to/project
+cargo run -p phantom-app -- --cwd /path/to/project
 ```
 
 Installed builds accept the same `--cwd` launch mode:
 
 ```sh
-phantom-terminal --cwd /path/to/project
+phantom --cwd /path/to/project
 ```
 
 `--cwd` launches use your normal settings, but they do not restore remembered
@@ -56,42 +55,50 @@ starts in non-remembering mode when it is launched from a non-home, non-root
 working directory. Use `--normal` to force the usual remembered-tabs launch:
 
 ```sh
-phantom-terminal --normal
+phantom --normal
 ```
 
-Build the frontend:
-
-```sh
-bun run build
-```
-
-## Update Local Install
+## Build & Install Locally
 
 Phantom Terminal does not include a network auto-updater. To update an installed
-copy, pull or switch to the source you want, then build and install that checkout:
+copy, pull or switch to the source you want, then build and install that
+checkout with one OS-detecting script (no Bun, no Node — just `cargo` and the OS
+tools):
 
 ```sh
 git pull
-bun run update
+./scripts/install-native.sh
 ```
+
+- **macOS** — assembles `Phantom Terminal.app` around the `phantom` binary, gives
+  it the app icon, ad-hoc signs it, and installs it to
+  `/Applications/Phantom Terminal.app`. It also writes a drag-to-Applications
+  `.dmg` to `target/native-bundle/` for archiving. Ad-hoc signing is all a
+  personal, locally-built app needs — no Apple Developer ID and no notarization.
+- **Linux** — installs the `phantom` binary, the icon (into the hicolor theme),
+  and a `.desktop` entry under `~/.local`. The committed entry is
+  [`crates/phantom-app/linux/phantom.desktop`](crates/phantom-app/linux/phantom.desktop).
+  Desktop environments that use `xdg-terminal-exec` can select it with the
+  desktop id `phantom.desktop`; its `X-TerminalArgDir=--cwd` metadata is used for
+  cwd-specific, ephemeral launches.
 
 Useful variants:
 
 ```sh
-bun run update -- --no-install
-INSTALL_DIR="$HOME/Applications" bun run update
+./scripts/install-native.sh --no-install   # build only, leave artifacts in target/
+./scripts/install-native.sh --no-dmg       # macOS: skip the .dmg
+INSTALL_DIR="$HOME/Applications" ./scripts/install-native.sh   # install elsewhere
 ```
 
-On macOS, the local install script ad-hoc signs the app and removes the
-quarantine flag for the rebuilt bundle.
+## Checks
 
-On Linux, the local install script also writes
-`~/.local/share/applications/com.phantom.terminal.desktop` with terminal-emulator
-metadata. Desktop environments that use `xdg-terminal-exec` can select it with
-the desktop id `com.phantom.terminal.desktop`. The desktop launcher's `Exec`
-line intentionally starts Phantom in normal remembered-tabs mode; only
-`xdg-terminal-exec` uses the `X-TerminalArgDir=--cwd` metadata for cwd-specific,
-ephemeral launches.
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --workspace --locked
+cargo test --workspace --locked
+bash scripts/check-no-network.sh
+```
 
 ## License
 

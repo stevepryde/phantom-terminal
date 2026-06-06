@@ -6,8 +6,8 @@ authors = ["Steve Pryde"]
 license = "MIT"
 edition = "2021"
 
-# UI-agnostic backend shared by the Tauri build (during the native pivot) and the
-# native winit/wgpu app. No GUI, IPC, or rendering dependencies belong here.
+# UI-agnostic backend for the native winit/wgpu app. No GUI or rendering
+# dependencies belong here.
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

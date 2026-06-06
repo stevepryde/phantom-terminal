@@ -67,8 +67,8 @@ colors or reduce terminal text contrast.
 Theme presets should remain a validated enum in Rust. Do not allow arbitrary CSS
 strings, external images, or remote background URLs through config.
 
-Terminal backdrop images live under `public/backgrounds/` and are referenced as
-local assets only. The selected backdrop is a separate validated setting from
+Terminal backdrop images live under `crates/phantom-gfx/assets/backgrounds/` and
+are compiled into the renderer as local assets only. The selected backdrop is a separate validated setting from
 the UI color theme, surfaced directly below the UI theme dropdown in Appearance.
 Keep them dark, low-detail, and low-opacity; artwork should read as embossed
 texture behind text, not as an illustration competing with the terminal buffer.
@@ -187,7 +187,7 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Settings `Field` | Provides consistent label placement |
 | Profile rows | Clickable list items with aligned metadata, an edit icon, and a star action for default selection |
 | Ephemeral indicator | A small status icon in the titlebar near Settings when launch mode will not restore or save tabs |
-| `WindowResizeHandles` | Linux-only invisible edge handles for the decorationless Tauri window; keep them thin enough to avoid terminal scrollbar conflicts |
+| `WindowResizeHandles` | Linux-only invisible edge handles for the decorationless native window; keep them thin enough to avoid terminal scrollbar conflicts |
 
 ## Native App Egui Rules
 

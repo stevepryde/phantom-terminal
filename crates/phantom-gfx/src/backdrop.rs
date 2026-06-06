@@ -3,10 +3,8 @@ use std::borrow::Cow;
 use bytemuck::{Pod, Zeroable};
 use image::GenericImageView;
 
-const PHANTOM_BYTES: &[u8] =
-    include_bytes!("../../../public/backgrounds/phantom-terminal-phantom.webp");
-const DRAGON_BYTES: &[u8] =
-    include_bytes!("../../../public/backgrounds/phantom-terminal-dragon.webp");
+const PHANTOM_BYTES: &[u8] = include_bytes!("../assets/backgrounds/phantom-terminal-phantom.webp");
+const DRAGON_BYTES: &[u8] = include_bytes!("../assets/backgrounds/phantom-terminal-dragon.webp");
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

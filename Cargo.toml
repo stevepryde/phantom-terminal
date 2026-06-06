@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/phantom-core", "crates/phantom-emu", "crates/phantom-gfx", "crates/phantom-app", "src-tauri"]
+members = ["crates/phantom-core", "crates/phantom-emu", "crates/phantom-gfx", "crates/phantom-app"]
 resolver = "2"
 
 # Shared dependency versions for every workspace member. Members opt in with

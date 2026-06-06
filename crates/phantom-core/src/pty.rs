@@ -18,8 +18,8 @@ const MAX_LIVE_PTY_SESSIONS: usize = 256;
 /// The reader thread owns the sink and calls [`on_bytes`](PtySink::on_bytes) for
 /// each chunk read from the PTY master, then [`on_eof`](PtySink::on_eof) exactly
 /// once when the shell exits or the pipe closes. This keeps `phantom-core`
-/// UI-agnostic: the Tauri build forwards bytes over an IPC channel, while the
-/// native app feeds them straight into the terminal emulator in-process.
+/// UI-agnostic: the native app feeds the bytes straight into the terminal
+/// emulator in-process via this sink.
 pub trait PtySink: Send + 'static {
     /// Handle a chunk of PTY output. Return `false` to stop the reader (e.g. the
     /// consumer has gone away); returning `true` continues reading.

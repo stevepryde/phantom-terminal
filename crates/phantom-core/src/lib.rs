@@ -1,9 +1,8 @@
 //! Phantom Terminal core.
 //!
 //! UI-agnostic backend: PTY lifecycle, configuration + validation, the SQLite
-//! session store, and launch-argument parsing. This crate has no GUI, IPC, or
-//! rendering dependencies so it can be shared by the Tauri build (during the
-//! native pivot) and the native winit/wgpu app.
+//! session store, and launch-argument parsing. This crate has no GUI or
+//! rendering dependencies; the native winit/wgpu app builds on top of it.
 //!
 //! Security note: every user-controlled config field is bounds-checked in
 //! [`AppConfig::validate`], and process spawning only ever resolves a stored,
