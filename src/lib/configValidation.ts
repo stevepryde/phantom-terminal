@@ -36,6 +36,7 @@ export function validateAppConfig(config: AppConfig): string | null {
     ) ??
     validateScrollback(config.scrollback_lines) ??
     validateTabLayout(config.tab_layout) ??
+    validateWindowChrome(config.window_chrome) ??
     validateTheme(config.theme) ??
     validateProfiles(config.shell_profiles, config.default_shell_profile_id) ??
     validateKeybindings(config.keybindings)
@@ -174,6 +175,10 @@ function validateTabLayout(value: string): string | null {
   return value === "horizontal" || value === "vertical"
     ? null
     : "tab layout must be horizontal or vertical";
+}
+
+function validateWindowChrome(value: string): string | null {
+  return value === "system" || value === "custom" ? null : "window chrome must be system or custom";
 }
 
 function validateScrollback(value: number): string | null {

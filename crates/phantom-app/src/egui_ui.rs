@@ -21,6 +21,7 @@ const SETTINGS_NAV_WIDTH_POINTS: f32 = 168.0;
 const BACKGROUNDS: &[&str] = &["none", "phantom", "dragon"];
 const CURSOR_STYLES: &[&str] = &["block", "bar", "underline"];
 const LAYOUTS: &[&str] = &["horizontal", "vertical"];
+const WINDOW_CHROME: &[&str] = &["system", "custom"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelKind {
@@ -221,6 +222,12 @@ impl UiState {
                 SettingsTab::Terminal => {
                     section(ui, "Layout");
                     changed |= combo(ui, "Tab layout", &mut config.tab_layout, LAYOUTS);
+                    changed |= combo(
+                        ui,
+                        "Window chrome",
+                        &mut config.window_chrome,
+                        WINDOW_CHROME,
+                    );
 
                     section(ui, "History");
                     changed |= slider_u32(

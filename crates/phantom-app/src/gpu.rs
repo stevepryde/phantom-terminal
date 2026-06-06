@@ -37,7 +37,11 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
-    pub async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Result<Self, String> {
+    pub async fn new(
+        window: Arc<Window>,
+        event_loop: &ActiveEventLoop,
+        transparent: bool,
+    ) -> Result<Self, String> {
         let physical = window.inner_size();
 
         let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
@@ -55,13 +59,29 @@ impl GpuContext {
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("failed to create surface: {e}"))?;
+        let capabilities = surface.get_capabilities(&adapter);
+        let alpha_mode = if transparent {
+            capabilities
+                .alpha_modes
+                .iter()
+                .copied()
+                .find(|mode| {
+                    matches!(
+                        mode,
+                        CompositeAlphaMode::PreMultiplied | CompositeAlphaMode::PostMultiplied
+                    )
+                })
+                .unwrap_or(CompositeAlphaMode::Opaque)
+        } else {
+            CompositeAlphaMode::Opaque
+        };
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: TextureFormat::Bgra8UnormSrgb,
             width: physical.width.max(1),
             height: physical.height.max(1),
             present_mode: PresentMode::Fifo,
-            alpha_mode: CompositeAlphaMode::Opaque,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -99,13 +119,14 @@ impl GpuContext {
     /// Acquire the next frame, clear it, and let `renderer` draw the prepared
     /// instances. Transient surface states trigger a redraw rather than a panic.
     pub fn present(&mut self, renderer: &Renderer) -> bool {
-        self.present_with_overlay(renderer, None)
+        self.present_with_overlay(renderer, None, false)
     }
 
     pub fn present_with_overlay(
         &mut self,
         renderer: &Renderer,
         mut overlay: Option<&mut dyn FrameOverlay>,
+        transparent_clear: bool,
     ) -> bool {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -148,7 +169,11 @@ impl GpuContext {
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(renderer.clear_color()),
+                        load: LoadOp::Clear(if transparent_clear {
+                            wgpu::Color::TRANSPARENT
+                        } else {
+                            renderer.clear_color()
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

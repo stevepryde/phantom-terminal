@@ -65,6 +65,7 @@ export interface Keybinding {
 }
 
 export type TabLayout = "horizontal" | "vertical";
+export type WindowChrome = "system" | "custom";
 export type UiThemeId =
   | "phantom"
   | "aurora"
@@ -97,6 +98,7 @@ export interface AppConfig {
   keybindings: Keybinding[];
   restore_on_launch: boolean;
   tab_layout: TabLayout;
+  window_chrome: WindowChrome;
   /** In-memory scrollback lines per terminal; never persisted to disk. */
   scrollback_lines: number;
 }

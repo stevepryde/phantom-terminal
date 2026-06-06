@@ -255,6 +255,17 @@ function AppearanceSection({ config, onChange }: Props) {
         />
       </Field>
 
+      <Field label="Window chrome">
+        <CustomDropdown
+          value={config.window_chrome}
+          options={[
+            { value: "system", label: "System managed" },
+            { value: "custom", label: "Custom chrome" },
+          ]}
+          onChange={(value) => onChange({ window_chrome: value as AppConfig["window_chrome"] })}
+        />
+      </Field>
+
       <div className="grid grid-cols-2 gap-3">
         <Field label="Cursor style">
           <CustomDropdown

@@ -43,7 +43,9 @@ use tab::Tab;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
+use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -146,6 +148,7 @@ pub struct App {
 
     gpu: Option<GpuContext>,
     renderer: Option<Renderer>,
+    renderer_signature: String,
     egui: Option<EguiLayer>,
 
     keymap: Keymap,
@@ -181,12 +184,15 @@ pub struct App {
     launch_cwd: Option<String>,
     remember_tabs: bool,
     ephemeral: bool,
+    applied_window_chrome: String,
 
     // Tab rename edit buffer (active tab) when in rename mode.
     rename: Option<String>,
 
     // Debounced session save.
     save_after: Option<Instant>,
+    config_save_after: Option<Instant>,
+    renderer_rebuild_after: Option<Instant>,
     cwd_deadline: Instant,
     last_terminal_grid: Option<(u16, u16)>,
 
@@ -204,6 +210,8 @@ impl App {
     ) -> Self {
         let keymap = Keymap::from_config(&config.keybindings);
         let blink_enabled = config.cursor_blink;
+        let applied_window_chrome = config.window_chrome.clone();
+        let renderer_signature = renderer_signature(&config);
         let ephemeral = launch.cwd.is_some();
         let now = Instant::now();
         let ui = UiState::new(&config);
@@ -215,6 +223,7 @@ impl App {
             mods: Mods::default(),
             gpu: None,
             renderer: None,
+            renderer_signature,
             egui: None,
             keymap,
             tabs: Vec::new(),
@@ -242,8 +251,11 @@ impl App {
             launch_cwd: launch.cwd,
             remember_tabs: launch.remember_tabs,
             ephemeral,
+            applied_window_chrome,
             rename: None,
             save_after: None,
+            config_save_after: None,
+            renderer_rebuild_after: None,
             cwd_deadline: now + CWD_POLL_INTERVAL,
             last_terminal_grid: None,
             blink_enabled,
@@ -266,6 +278,7 @@ impl App {
             AppInput::Resized { width, height } => self.on_resize(width, height),
             AppInput::ScaleChanged => self.rebuild_renderer(),
             AppInput::CloseRequested => {
+                self.flush_config_save();
                 self.save_tabs();
                 for tab in &self.tabs {
                     let _ = self.pty.kill(tab.pty_id);
@@ -375,6 +388,18 @@ impl App {
         self.config.tab_layout != "vertical"
     }
 
+    fn window_chrome(&self) -> chrome::WindowChrome {
+        chrome::WindowChrome::from_config(&self.config.window_chrome)
+    }
+
+    fn applied_window_chrome(&self) -> chrome::WindowChrome {
+        chrome::WindowChrome::from_config(&self.applied_window_chrome)
+    }
+
+    fn custom_window_chrome(&self) -> bool {
+        self.applied_window_chrome().is_custom()
+    }
+
     fn content_width(&self, width: u32) -> f32 {
         width.max(1) as f32
     }
@@ -389,6 +414,7 @@ impl App {
                     h as f32,
                     renderer.cell_size().1,
                     self.horizontal(),
+                    self.applied_window_chrome(),
                 );
                 renderer.grid_size(layout.viewport.w as u32, layout.viewport.h as u32)
             }
@@ -430,6 +456,14 @@ impl App {
         if !self.ephemeral && self.save_after.is_none() {
             self.save_after = Some(Instant::now() + SAVE_DEBOUNCE);
         }
+    }
+
+    fn mark_config_dirty(&mut self) {
+        self.config_save_after = Some(Instant::now() + SAVE_DEBOUNCE);
+    }
+
+    fn mark_renderer_dirty(&mut self) {
+        self.renderer_rebuild_after = Some(Instant::now() + SAVE_DEBOUNCE);
     }
 
     fn startup_tabs(&mut self) {
@@ -516,6 +550,7 @@ impl App {
         let tab = self.tabs.remove(index);
         let _ = self.pty.kill(tab.pty_id);
         if self.tabs.is_empty() {
+            self.flush_config_save();
             self.save_tabs();
             self.exit_requested = true;
             return;
@@ -577,7 +612,7 @@ impl App {
             PaletteAction::NewTabWithProfile(id) => self.spawn_tab(Some(id), None),
             PaletteAction::SetUiTheme(name) => {
                 self.config.ui_theme = name;
-                self.save_config();
+                self.mark_config_dirty();
             }
             PaletteAction::OpenSettings => self.ui.open_settings(&self.config),
         }
@@ -595,12 +630,41 @@ impl App {
         }
     }
 
+    fn flush_config_save(&mut self) {
+        if self.config_save_after.take().is_some() {
+            self.save_config();
+        }
+    }
+
     /// Persist the (already-validated) config and rebuild the renderer so font,
     /// theme, and layout changes take effect.
     fn apply_config_change(&mut self) {
-        self.save_config();
+        self.apply_window_chrome();
+        self.mark_config_dirty();
         self.blink_enabled = self.config.cursor_blink;
-        self.rebuild_renderer();
+        let next_signature = renderer_signature(&self.config);
+        if self.renderer_signature != next_signature {
+            self.mark_renderer_dirty();
+        } else {
+            self.renderer_rebuild_after = None;
+            self.request_redraw();
+        }
+    }
+
+    fn apply_window_chrome(&mut self) {
+        if self.applied_window_chrome == self.config.window_chrome {
+            return;
+        }
+        let requested = self.window_chrome();
+        if cfg!(target_os = "macos") {
+            self.show_notice("Window chrome change saved. Restart Phantom to apply it.");
+            return;
+        }
+        if let Some(gpu) = self.gpu.as_ref() {
+            gpu.window.set_decorations(!requested.is_custom());
+            gpu.window.set_transparent(requested.is_custom());
+        }
+        self.applied_window_chrome = self.config.window_chrome.clone();
     }
 
     /// Recreate the renderer (font/theme/scale) and resize every tab.
@@ -617,6 +681,7 @@ impl App {
             renderer.resize(&gpu.queue, w, h);
             self.renderer = Some(renderer);
         }
+        self.renderer_signature = renderer_signature(&self.config);
         self.sync_terminal_grid(true);
         self.request_redraw();
     }
@@ -760,13 +825,16 @@ impl App {
         enum Hit {
             New,
             Settings,
+            WindowControl(chrome::WindowControl),
             Close(usize),
             Switch(usize),
         }
         let (px, py) = self.cursor_pos;
         let mut hit = None;
         if let Some(hits) = &self.last_hits {
-            if hits.settings.contains(px, py) {
+            if let Some(control) = hits.window_control_at(px, py) {
+                hit = Some(Hit::WindowControl(control));
+            } else if hits.settings.contains(px, py) {
                 hit = Some(Hit::Settings);
             } else if hits.new_tab.contains(px, py) {
                 hit = Some(Hit::New);
@@ -789,9 +857,32 @@ impl App {
                 self.ui.toggle_settings(&self.config);
                 self.request_redraw();
             }
+            Some(Hit::WindowControl(control)) => self.handle_window_control(control),
             Some(Hit::Close(i)) => self.close_tab(i),
             Some(Hit::Switch(i)) => self.switch_tab(i),
             None => {}
+        }
+    }
+
+    fn handle_window_control(&mut self, control: chrome::WindowControl) {
+        if control == chrome::WindowControl::Close {
+            self.flush_config_save();
+            self.save_tabs();
+            for tab in &self.tabs {
+                let _ = self.pty.kill(tab.pty_id);
+            }
+            self.exit_requested = true;
+            return;
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        match control {
+            chrome::WindowControl::Close => {}
+            chrome::WindowControl::Minimize => gpu.window.set_minimized(true),
+            chrome::WindowControl::Maximize => {
+                gpu.window.set_maximized(!gpu.window.is_maximized());
+            }
         }
     }
 
@@ -844,6 +935,7 @@ impl App {
             h as f32,
             renderer.cell_size().1,
             self.horizontal(),
+            self.applied_window_chrome(),
         ))
     }
 
@@ -944,6 +1036,16 @@ impl App {
                 target: tab,
                 active: false,
             });
+            return;
+        }
+        if self
+            .last_hits
+            .as_ref()
+            .is_some_and(|hits| hits.titlebar_drag_region_contains(px, py))
+        {
+            if let Some(gpu) = self.gpu.as_ref() {
+                let _ = gpu.window.drag_window();
+            }
             return;
         }
         if !self.point_in_viewport(px, py) {
@@ -1378,6 +1480,7 @@ impl App {
         }
         self.sync_terminal_grid(false);
         let drag_indicator = self.tab_drag_indicator();
+        let custom_window_chrome = self.custom_window_chrome();
 
         let (Some(gpu), Some(renderer)) = (self.gpu.as_mut(), self.renderer.as_mut()) else {
             return;
@@ -1388,6 +1491,7 @@ impl App {
             h as f32,
             renderer.cell_size().1,
             self.config.tab_layout != "vertical",
+            chrome::WindowChrome::from_config(&self.applied_window_chrome),
         );
         let colors = chrome::ChromeColors::from_renderer(
             renderer,
@@ -1397,6 +1501,7 @@ impl App {
         let chrome_animating = self.chrome_anim.advance(Instant::now(), titles.len());
 
         renderer.begin();
+        chrome::draw_window_backfill(renderer, &layout, &colors, w as f32, h as f32);
         let terminal_pane = chrome::terminal_pane(&layout);
         renderer.draw_terminal_backdrop(
             &self.config.terminal_background,
@@ -1477,7 +1582,7 @@ impl App {
         }
         renderer.end(&gpu.device, &gpu.queue);
         if let Some(egui) = self.egui.as_mut() {
-            gpu.present_with_overlay(renderer, Some(egui));
+            gpu.present_with_overlay(renderer, Some(egui), custom_window_chrome);
         } else {
             gpu.present(renderer);
         }
@@ -1580,17 +1685,73 @@ fn is_keyboard_event(event: &WindowEvent) -> bool {
     )
 }
 
+fn renderer_signature(config: &AppConfig) -> String {
+    let theme = &config.theme;
+    [
+        config.font_family.as_str(),
+        &config.font_size.to_string(),
+        &config.line_height.to_bits().to_string(),
+        theme.background.as_str(),
+        theme.foreground.as_str(),
+        theme.cursor.as_str(),
+        theme.selection.as_str(),
+        theme.black.as_str(),
+        theme.red.as_str(),
+        theme.green.as_str(),
+        theme.yellow.as_str(),
+        theme.blue.as_str(),
+        theme.magenta.as_str(),
+        theme.cyan.as_str(),
+        theme.white.as_str(),
+        theme.bright_black.as_str(),
+        theme.bright_red.as_str(),
+        theme.bright_green.as_str(),
+        theme.bright_yellow.as_str(),
+        theme.bright_blue.as_str(),
+        theme.bright_magenta.as_str(),
+        theme.bright_cyan.as_str(),
+        theme.bright_white.as_str(),
+    ]
+    .join("\x1f")
+}
+
+fn window_attributes(config: &AppConfig) -> WindowAttributes {
+    let attrs = Window::default_attributes().with_title("Phantom Terminal");
+    if chrome::WindowChrome::from_config(&config.window_chrome) != chrome::WindowChrome::Custom {
+        return attrs;
+    }
+    custom_window_attributes(attrs)
+}
+
+#[cfg(target_os = "macos")]
+fn custom_window_attributes(attrs: WindowAttributes) -> WindowAttributes {
+    attrs
+        .with_titlebar_transparent(true)
+        .with_title_hidden(true)
+        .with_fullsize_content_view(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn custom_window_attributes(attrs: WindowAttributes) -> WindowAttributes {
+    attrs.with_decorations(false).with_transparent(true)
+}
+
 impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gpu.is_some() {
             return;
         }
+        let custom_window_chrome = self.custom_window_chrome();
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("Phantom Terminal"))
+                .create_window(window_attributes(&self.config))
                 .expect("failed to create window"),
         );
-        let gpu = match pollster::block_on(GpuContext::new(window.clone(), event_loop)) {
+        let gpu = match pollster::block_on(GpuContext::new(
+            window.clone(),
+            event_loop,
+            custom_window_chrome,
+        )) {
             Ok(gpu) => gpu,
             Err(error) => {
                 window.set_title(&format!("Phantom Terminal - {error}"));
@@ -1621,6 +1782,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         self.on_pty_event(event);
         if self.exit_requested {
+            self.flush_config_save();
             event_loop.exit();
         }
     }
@@ -1659,6 +1821,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
         if self.exit_requested {
+            self.flush_config_save();
             event_loop.exit();
         }
     }
@@ -1678,8 +1841,23 @@ impl ApplicationHandler<AppEvent> for App {
                 self.save_after = None;
             }
         }
+        if let Some(deadline) = self.config_save_after {
+            if now >= deadline {
+                self.save_config();
+                self.config_save_after = None;
+            }
+        }
+        if let Some(deadline) = self.renderer_rebuild_after {
+            if now >= deadline {
+                self.renderer_rebuild_after = None;
+                if self.renderer_signature != renderer_signature(&self.config) {
+                    self.rebuild_renderer();
+                }
+            }
+        }
         self.clear_expired_notice(now);
         if self.exit_requested {
+            self.flush_config_save();
             event_loop.exit();
             return;
         }
@@ -1689,6 +1867,12 @@ impl ApplicationHandler<AppEvent> for App {
             next = next.min(self.next_toggle);
         }
         if let Some(deadline) = self.save_after {
+            next = next.min(deadline);
+        }
+        if let Some(deadline) = self.config_save_after {
+            next = next.min(deadline);
+        }
+        if let Some(deadline) = self.renderer_rebuild_after {
             next = next.min(deadline);
         }
         if let Some(notice) = self.notice.as_ref() {
@@ -1809,5 +1993,29 @@ mod tests {
         assert_eq!(app.terminal_click_count(1, 2), 3);
         assert_eq!(app.terminal_click_count(1, 2), 3);
         assert_eq!(app.terminal_click_count(1, 3), 1);
+    }
+
+    #[test]
+    fn renderer_affecting_config_changes_are_debounced() {
+        let mut app = test_app();
+        let initial_signature = app.renderer_signature.clone();
+
+        app.config.font_size += 1;
+        app.apply_config_change();
+
+        assert_eq!(app.renderer_signature, initial_signature);
+        assert!(app.renderer_rebuild_after.is_some());
+    }
+
+    #[test]
+    fn non_renderer_config_changes_do_not_schedule_renderer_rebuild() {
+        let mut app = test_app();
+
+        app.config.terminal_background_opacity =
+            app.config.terminal_background_opacity.saturating_add(1);
+        app.apply_config_change();
+
+        assert!(app.config_save_after.is_some());
+        assert!(app.renderer_rebuild_after.is_none());
     }
 }

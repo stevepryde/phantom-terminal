@@ -115,7 +115,7 @@ impl BackdropRenderer {
     }
 
     pub(crate) fn draw(&mut self, name: &str, opacity_percent: u8, x: f32, y: f32, w: f32, h: f32) {
-        if opacity_percent == 0 || w <= 0.0 || h <= 0.0 {
+        if w <= 0.0 || h <= 0.0 {
             return;
         }
         let kind = match name {

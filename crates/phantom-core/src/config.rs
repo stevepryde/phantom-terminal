@@ -24,6 +24,7 @@ const DEFAULT_UI_THEME: &str = "phantom";
 const DEFAULT_TERMINAL_BACKGROUND: &str = "phantom";
 const MAX_TERMINAL_BACKGROUND_OPACITY: u8 = 60;
 const DEFAULT_TERMINAL_BACKGROUND_OPACITY: u8 = 24;
+const DEFAULT_WINDOW_CHROME: &str = "system";
 
 /// Full 16-color ANSI palette plus the special UI colors. Keys are snake_case on
 /// the wire; the frontend maps them onto ghostty-web's camelCase Terminal theme.
@@ -183,6 +184,7 @@ pub struct AppConfig {
     pub keybindings: Vec<Keybinding>,
     pub restore_on_launch: bool,
     pub tab_layout: String,
+    pub window_chrome: String,
     /// Lines of scrollback kept per terminal. In-memory only — never written to
     /// disk, so terminal output never persists across relaunch.
     pub scrollback_lines: u32,
@@ -211,6 +213,7 @@ impl Default for AppConfig {
             keybindings: default_keybindings(),
             restore_on_launch: true,
             tab_layout: "horizontal".to_string(),
+            window_chrome: DEFAULT_WINDOW_CHROME.to_string(),
             scrollback_lines: 10_000,
         }
     }
@@ -276,6 +279,14 @@ impl AppConfig {
             _ => {
                 return Err(AppError::InvalidConfig(
                     "tab layout must be horizontal or vertical".to_string(),
+                ));
+            }
+        }
+        match self.window_chrome.as_str() {
+            "system" | "custom" => {}
+            _ => {
+                return Err(AppError::InvalidConfig(
+                    "window chrome must be system or custom".to_string(),
                 ));
             }
         }
@@ -498,6 +509,15 @@ mod tests {
     fn rejects_invalid_tab_layout() {
         let config = AppConfig {
             tab_layout: "diagonal".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_window_chrome() {
+        let config = AppConfig {
+            window_chrome: "floating".to_string(),
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());

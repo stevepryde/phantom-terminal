@@ -45,5 +45,6 @@ fn vs(@builtin(vertex_index) vi: u32, in: VsIn) -> VsOut {
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let texel = textureSample(backdrop_tex, backdrop_samp, in.uv);
-    return vec4<f32>(texel.rgb, texel.a * in.opacity);
+    let image_alpha = texel.a * in.opacity;
+    return vec4<f32>(texel.rgb * image_alpha, 1.0);
 }

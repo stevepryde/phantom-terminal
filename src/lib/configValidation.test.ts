@@ -89,6 +89,7 @@ function config(): AppConfig {
     keybindings: DEFAULT_KEYBINDINGS,
     restore_on_launch: true,
     tab_layout: "horizontal",
+    window_chrome: "system",
     scrollback_lines: 10_000,
   };
 }
