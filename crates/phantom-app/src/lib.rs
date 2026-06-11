@@ -23,13 +23,14 @@ mod palette;
 mod tab;
 mod themes;
 
-use std::sync::{mpsc, Arc};
+use std::collections::VecDeque;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use egui_ui::{EguiLayer, UiState};
 use event::{AppInput, Mods};
-use gpu::GpuContext;
+use gpu::{GpuContext, PresentStatus};
 use keybindings::{Action, Keymap};
 use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
@@ -50,12 +51,18 @@ use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
-const CWD_POLL_INTERVAL: Duration = Duration::from_millis(400);
+const CWD_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const CWD_POLL_WINDOW: Duration = Duration::from_secs(6);
+const CWD_STARTUP_POLL_WINDOW: Duration = Duration::from_secs(3);
 const LIVE_RESIZE_REDRAW_GRACE: Duration = Duration::from_millis(120);
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_NOTICE_LEN: usize = 240;
+const MAX_PENDING_PTY_BYTES: usize = 1024 * 1024;
+const PTY_BACKPRESSURE_WAKE_INTERVAL: Duration = Duration::from_millis(50);
+const SURFACE_RETRY_DELAY: Duration = Duration::from_millis(33);
+const SURFACE_OCCLUDED_RETRY_DELAY: Duration = Duration::from_millis(250);
 const TAB_DRAG_TOLERANCE_PX: f32 = 8.0;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
@@ -65,6 +72,7 @@ const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 pub enum AppEvent {
     PtyBytes { tab: u64, bytes: Vec<u8> },
     PtyExit { tab: u64 },
+    PtyWake,
 }
 
 /// Sink for PTY output events. The winit host wraps an [`EventLoopProxy`]; tests
@@ -74,12 +82,121 @@ pub trait PtyOutbox: Send + Sync + 'static {
 }
 
 /// Production outbox: wakes the winit loop with the event.
-struct ProxyOutbox(EventLoopProxy<AppEvent>);
+struct ProxyOutbox {
+    proxy: EventLoopProxy<AppEvent>,
+    pending: Arc<PendingPtyEvents>,
+}
 
 impl PtyOutbox for ProxyOutbox {
     fn send(&self, event: AppEvent) -> bool {
-        self.0.send_event(event).is_ok()
+        let should_wake = match self.pending.push(event) {
+            Some(should_wake) => should_wake,
+            None => return false,
+        };
+        if !should_wake {
+            return true;
+        }
+        if self.proxy.send_event(AppEvent::PtyWake).is_ok() {
+            true
+        } else {
+            self.pending.close();
+            false
+        }
     }
+}
+
+struct PendingPtyEvents {
+    inner: Mutex<PendingPtyInner>,
+    drained: Condvar,
+}
+
+struct PendingPtyInner {
+    events: VecDeque<AppEvent>,
+    queued_bytes: usize,
+    wake_queued: bool,
+    closed: bool,
+}
+
+impl PendingPtyEvents {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(PendingPtyInner {
+                events: VecDeque::new(),
+                queued_bytes: 0,
+                wake_queued: false,
+                closed: false,
+            }),
+            drained: Condvar::new(),
+        }
+    }
+
+    fn push(&self, event: AppEvent) -> Option<bool> {
+        let incoming_bytes = event_byte_len(&event);
+        let mut inner = self.inner.lock().expect("pending pty queue mutex poisoned");
+        while !inner.closed
+            && incoming_bytes > 0
+            && inner.queued_bytes.saturating_add(incoming_bytes) > MAX_PENDING_PTY_BYTES
+        {
+            let (next, _) = self
+                .drained
+                .wait_timeout(inner, PTY_BACKPRESSURE_WAKE_INTERVAL)
+                .expect("pending pty queue mutex poisoned");
+            inner = next;
+        }
+        if inner.closed {
+            return None;
+        }
+
+        push_pending_pty_event(&mut inner, event, incoming_bytes);
+        if inner.wake_queued {
+            Some(false)
+        } else {
+            inner.wake_queued = true;
+            Some(true)
+        }
+    }
+
+    fn drain(&self) -> Vec<AppEvent> {
+        let mut inner = self.inner.lock().expect("pending pty queue mutex poisoned");
+        let events = inner.events.drain(..).collect();
+        inner.queued_bytes = 0;
+        inner.wake_queued = false;
+        self.drained.notify_all();
+        events
+    }
+
+    fn close(&self) {
+        let mut inner = self.inner.lock().expect("pending pty queue mutex poisoned");
+        inner.closed = true;
+        self.drained.notify_all();
+    }
+}
+
+fn event_byte_len(event: &AppEvent) -> usize {
+    match event {
+        AppEvent::PtyBytes { bytes, .. } => bytes.len(),
+        AppEvent::PtyExit { .. } | AppEvent::PtyWake => 0,
+    }
+}
+
+fn push_pending_pty_event(inner: &mut PendingPtyInner, event: AppEvent, incoming_bytes: usize) {
+    if let AppEvent::PtyBytes { tab, bytes } = event {
+        if let Some(AppEvent::PtyBytes {
+            tab: last_tab,
+            bytes: last_bytes,
+        }) = inner.events.back_mut()
+        {
+            if *last_tab == tab {
+                last_bytes.extend_from_slice(&bytes);
+                inner.queued_bytes = inner.queued_bytes.saturating_add(incoming_bytes);
+                return;
+            }
+        }
+        inner.events.push_back(AppEvent::PtyBytes { tab, bytes });
+    } else {
+        inner.events.push_back(event);
+    }
+    inner.queued_bytes = inner.queued_bytes.saturating_add(incoming_bytes);
 }
 
 enum PersistMsg {
@@ -270,6 +387,7 @@ struct LastClick {
 
 pub struct App {
     outbox: Arc<dyn PtyOutbox>,
+    pending_pty_events: Option<Arc<PendingPtyEvents>>,
     config: AppConfig,
     pty: PtyManager,
     store: Option<SessionStore>,
@@ -300,6 +418,7 @@ pub struct App {
     selecting: bool,
     last_click: Option<LastClick>,
     redraw_queued: bool,
+    surface_redraw_after: Option<Instant>,
     /// In-progress IME composition text (shown at the cursor).
     preedit: String,
     fullscreen: bool,
@@ -325,7 +444,8 @@ pub struct App {
     live_resize_until: Option<Instant>,
     terminal_resize_deadline: Option<Instant>,
     pending_terminal_grid: Option<(u16, u16)>,
-    cwd_deadline: Instant,
+    cwd_deadline: Option<Instant>,
+    cwd_poll_until: Option<Instant>,
     last_terminal_grid: Option<(u16, u16)>,
 
     blink_enabled: bool,
@@ -350,6 +470,7 @@ impl App {
         let persistence = Persistence::new(store.clone());
         Self {
             outbox,
+            pending_pty_events: None,
             config,
             pty: PtyManager::new(),
             store,
@@ -376,6 +497,7 @@ impl App {
             selecting: false,
             last_click: None,
             redraw_queued: false,
+            surface_redraw_after: None,
             preedit: String::new(),
             fullscreen: false,
             exit_requested: false,
@@ -391,7 +513,8 @@ impl App {
             live_resize_until: None,
             terminal_resize_deadline: None,
             pending_terminal_grid: None,
-            cwd_deadline: now + CWD_POLL_INTERVAL,
+            cwd_deadline: None,
+            cwd_poll_until: None,
             last_terminal_grid: None,
             blink_enabled,
             cursor_on: true,
@@ -468,6 +591,17 @@ impl App {
                     self.close_tab(index);
                 }
             }
+            AppEvent::PtyWake => self.drain_pending_pty_events(),
+        }
+    }
+
+    fn drain_pending_pty_events(&mut self) {
+        let Some(pending) = self.pending_pty_events.as_ref() else {
+            return;
+        };
+        let events = pending.drain();
+        for event in events {
+            self.on_pty_event(event);
         }
     }
 
@@ -549,12 +683,13 @@ impl App {
         match (self.gpu.as_ref(), self.renderer.as_ref()) {
             (Some(gpu), Some(renderer)) => {
                 let (w, h) = gpu.size();
-                let layout = chrome::compute_layout(
+                let layout = chrome::compute_layout_scaled(
                     self.content_width(w),
                     h as f32,
                     renderer.cell_size().1,
                     self.horizontal(),
                     self.applied_window_chrome(),
+                    gpu.scale_factor(),
                 );
                 renderer.grid_size(layout.viewport.w as u32, layout.viewport.h as u32)
             }
@@ -564,6 +699,12 @@ impl App {
 
     fn request_redraw(&mut self) {
         if self.redraw_queued {
+            return;
+        }
+        if self
+            .surface_redraw_after
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
             return;
         }
         self.redraw_queued = true;
@@ -690,6 +831,7 @@ impl App {
         self.tabs
             .push(Tab::new(tab_id, core, pty_id, start_cwd, profile_id));
         self.active = self.tabs.len() - 1;
+        self.arm_cwd_polling(CWD_STARTUP_POLL_WINDOW);
         if persist {
             self.mark_dirty();
         }
@@ -866,6 +1008,9 @@ impl App {
         if let Some(tab) = self.tabs.get(self.active) {
             let _ = self.pty.write(tab.pty_id, text.as_bytes());
         }
+        if text.contains('\n') || text.contains('\r') {
+            self.arm_cwd_polling(CWD_POLL_WINDOW);
+        }
         self.preedit.clear();
         self.request_redraw();
     }
@@ -945,6 +1090,9 @@ impl App {
             }
             if let Some(t) = self.tabs.get(self.active) {
                 let _ = self.pty.write(t.pty_id, &bytes);
+            }
+            if key == Key::Enter || bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+                self.arm_cwd_polling(CWD_POLL_WINDOW);
             }
             self.request_redraw();
         }
@@ -1084,12 +1232,13 @@ impl App {
         let gpu = self.gpu.as_ref()?;
         let renderer = self.renderer.as_ref()?;
         let (w, h) = gpu.size();
-        Some(chrome::compute_layout(
+        Some(chrome::compute_layout_scaled(
             self.content_width(w),
             h as f32,
             renderer.cell_size().1,
             self.horizontal(),
             self.applied_window_chrome(),
+            gpu.scale_factor(),
         ))
     }
 
@@ -1519,6 +1668,9 @@ impl App {
             bytes.extend_from_slice(text.as_bytes());
         }
         let _ = self.pty.write(pty_id, &bytes);
+        if text.contains('\n') || text.contains('\r') {
+            self.arm_cwd_polling(CWD_POLL_WINDOW);
+        }
     }
 
     /// Detect a copy/paste shortcut: Cmd+C/V on macOS, Ctrl+Shift+C/V elsewhere
@@ -1630,7 +1782,38 @@ impl App {
         }
     }
 
+    fn arm_cwd_polling(&mut self, window: Duration) {
+        let now = Instant::now();
+        let until = now + window;
+        if self.cwd_poll_until.is_none_or(|current| until > current) {
+            self.cwd_poll_until = Some(until);
+        }
+        let next = now + CWD_POLL_INTERVAL;
+        if self.cwd_deadline.is_none_or(|current| next < current) {
+            self.cwd_deadline = Some(next);
+        }
+    }
+
+    fn pump_cwd_polling(&mut self, now: Instant) {
+        let Some(deadline) = self.cwd_deadline else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        self.poll_cwd();
+        if self.cwd_poll_until.is_some_and(|until| now < until) {
+            self.cwd_deadline = Some(now + CWD_POLL_INTERVAL);
+        } else {
+            self.cwd_deadline = None;
+            self.cwd_poll_until = None;
+        }
+    }
+
     fn request_exit(&mut self) {
+        if let Some(pending) = self.pending_pty_events.as_ref() {
+            pending.close();
+        }
         self.save_tabs();
         self.flush_persistence();
         for tab in &self.tabs {
@@ -1698,12 +1881,13 @@ impl App {
             return;
         };
         let (w, h) = gpu.size();
-        let layout = chrome::compute_layout(
+        let layout = chrome::compute_layout_scaled(
             w.max(1) as f32,
             h as f32,
             renderer.cell_size().1,
             self.config.tab_layout != "vertical",
             chrome::WindowChrome::from_config(&self.applied_window_chrome),
+            gpu.scale_factor(),
         );
         let colors = chrome::ChromeColors::from_renderer(
             renderer,
@@ -1800,16 +1984,21 @@ impl App {
             );
         }
         renderer.end(&gpu.device, &gpu.queue);
-        if let Some(egui) = self.egui.as_mut() {
-            gpu.present_with_overlay(renderer, Some(egui), custom_window_chrome);
+        let present_status = if let Some(egui) = self.egui.as_mut() {
+            gpu.present_with_overlay(renderer, Some(egui), custom_window_chrome)
         } else {
-            gpu.present(renderer);
-        }
+            gpu.present(renderer)
+        };
         self.last_hits = Some(hits);
         self.update_chrome_hover();
-        if chrome_animating {
+        self.handle_present_status(present_status);
+        if chrome_animating && present_status == PresentStatus::Presented {
             self.request_redraw();
         }
+    }
+
+    fn handle_present_status(&mut self, status: PresentStatus) {
+        self.surface_redraw_after = surface_retry_delay(status).map(|delay| Instant::now() + delay);
     }
 
     fn pump_blink(&mut self) -> bool {
@@ -1905,6 +2094,20 @@ fn app_input_bypasses_egui_overlay(input: &AppInput) -> bool {
             | AppInput::ModifiersChanged(_)
             | AppInput::CloseRequested
     )
+}
+
+fn surface_retry_delay(status: PresentStatus) -> Option<Duration> {
+    match status {
+        PresentStatus::Presented | PresentStatus::Fatal => None,
+        PresentStatus::RetrySoon => Some(SURFACE_RETRY_DELAY),
+        PresentStatus::Occluded => Some(SURFACE_OCCLUDED_RETRY_DELAY),
+    }
+}
+
+fn min_deadline(target: &mut Option<Instant>, deadline: Instant) {
+    if target.is_none_or(|current| deadline < current) {
+        *target = Some(deadline);
+    }
 }
 
 fn is_keyboard_event(event: &WindowEvent) -> bool {
@@ -2110,10 +2313,7 @@ impl ApplicationHandler<AppEvent> for App {
             self.request_redraw();
         }
         self.drain_persistence_errors();
-        if now >= self.cwd_deadline {
-            self.poll_cwd();
-            self.cwd_deadline = now + CWD_POLL_INTERVAL;
-        }
+        self.pump_cwd_polling(now);
         if let Some(deadline) = self.renderer_rebuild_after {
             if now >= deadline {
                 self.renderer_rebuild_after = None;
@@ -2133,29 +2333,50 @@ impl ApplicationHandler<AppEvent> for App {
             event_loop.exit();
             return;
         }
+        if let Some(deadline) = self.surface_redraw_after {
+            if now >= deadline {
+                self.surface_redraw_after = None;
+                self.request_redraw();
+            }
+        }
+        let surface_retry_pending = self
+            .surface_redraw_after
+            .is_some_and(|deadline| now < deadline);
         if let Some(until) = self.live_resize_until {
-            if now < until {
+            if now < until && !surface_retry_pending {
                 self.request_redraw();
                 event_loop.set_control_flow(ControlFlow::Poll);
                 return;
             }
-            self.live_resize_until = None;
+            if now >= until {
+                self.live_resize_until = None;
+            }
         }
 
-        let mut next = self.cwd_deadline;
+        let mut next = None;
         if self.blink_enabled {
-            next = next.min(self.next_toggle);
+            min_deadline(&mut next, self.next_toggle);
+        }
+        if let Some(deadline) = self.cwd_deadline {
+            min_deadline(&mut next, deadline);
+        }
+        if let Some(deadline) = self.surface_redraw_after {
+            min_deadline(&mut next, deadline);
         }
         if let Some(deadline) = self.renderer_rebuild_after {
-            next = next.min(deadline);
+            min_deadline(&mut next, deadline);
         }
         if let Some(deadline) = self.terminal_resize_deadline {
-            next = next.min(deadline);
+            min_deadline(&mut next, deadline);
         }
         if let Some(notice) = self.notice.as_ref() {
-            next = next.min(notice.until);
+            min_deadline(&mut next, notice.until);
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+        if let Some(next) = next {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 }
 
@@ -2224,8 +2445,13 @@ pub fn run() {
         .build()
         .expect("failed to build event loop");
     let proxy = event_loop.create_proxy();
-    let outbox: Arc<dyn PtyOutbox> = Arc::new(ProxyOutbox(proxy));
+    let pending = Arc::new(PendingPtyEvents::new());
+    let outbox: Arc<dyn PtyOutbox> = Arc::new(ProxyOutbox {
+        proxy,
+        pending: Arc::clone(&pending),
+    });
     let mut app = App::new(outbox, config, store, launch);
+    app.pending_pty_events = Some(pending);
     event_loop.run_app(&mut app).expect("event loop error");
 }
 
@@ -2442,5 +2668,91 @@ mod tests {
             app.keymap.lookup(Key::Char('n'), mods),
             Some(Action::NewTab)
         );
+    }
+
+    #[test]
+    fn cwd_polling_is_armed_by_command_submission_only() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(2, 20, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+
+        app.handle_input(AppInput::Key {
+            key: Key::Char('c'),
+            text: Some("c".to_string()),
+            mods: Mods::default(),
+        });
+
+        assert_eq!(app.cwd_deadline, None);
+        assert_eq!(app.cwd_poll_until, None);
+
+        app.handle_input(AppInput::Key {
+            key: Key::Enter,
+            text: None,
+            mods: Mods::default(),
+        });
+
+        assert!(app.cwd_deadline.is_some());
+        assert!(app.cwd_poll_until.is_some());
+    }
+
+    #[test]
+    fn surface_retry_statuses_back_off_redraws() {
+        let mut app = test_app();
+        let future = Instant::now() + Duration::from_secs(1);
+        app.surface_redraw_after = Some(future);
+
+        app.request_redraw();
+
+        assert!(!app.redraw_queued);
+        assert_eq!(
+            surface_retry_delay(PresentStatus::Occluded),
+            Some(SURFACE_OCCLUDED_RETRY_DELAY)
+        );
+        assert_eq!(
+            surface_retry_delay(PresentStatus::RetrySoon),
+            Some(SURFACE_RETRY_DELAY)
+        );
+
+        app.handle_present_status(PresentStatus::Presented);
+
+        assert_eq!(app.surface_redraw_after, None);
+    }
+
+    #[test]
+    fn pending_pty_events_coalesce_adjacent_bytes_per_tab() {
+        let pending = PendingPtyEvents::new();
+
+        assert_eq!(
+            pending.push(AppEvent::PtyBytes {
+                tab: 7,
+                bytes: b"abc".to_vec(),
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            pending.push(AppEvent::PtyBytes {
+                tab: 7,
+                bytes: b"def".to_vec(),
+            }),
+            Some(false)
+        );
+        assert_eq!(pending.push(AppEvent::PtyExit { tab: 7 }), Some(false));
+
+        let events = pending.drain();
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            AppEvent::PtyBytes { tab, bytes } => {
+                assert_eq!(*tab, 7);
+                assert_eq!(bytes, b"abcdef");
+            }
+            other => panic!("expected coalesced bytes, got {other:?}"),
+        }
+        assert!(matches!(events[1], AppEvent::PtyExit { tab: 7 }));
     }
 }

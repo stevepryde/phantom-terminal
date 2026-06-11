@@ -56,6 +56,14 @@ pub struct GpuContext {
     blur: BlurPass,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentStatus {
+    Presented,
+    RetrySoon,
+    Occluded,
+    Fatal,
+}
+
 impl GpuContext {
     pub async fn new(
         window: Arc<Window>,
@@ -153,7 +161,7 @@ impl GpuContext {
 
     /// Acquire the next frame, clear it, and let `renderer` draw the prepared
     /// instances. Transient surface states trigger a redraw rather than a panic.
-    pub fn present(&mut self, renderer: &Renderer) -> bool {
+    pub fn present(&mut self, renderer: &Renderer) -> PresentStatus {
         self.present_with_overlay(renderer, None, false)
     }
 
@@ -162,17 +170,14 @@ impl GpuContext {
         renderer: &Renderer,
         mut overlay: Option<&mut dyn FrameOverlay>,
         transparent_clear: bool,
-    ) -> bool {
+    ) -> PresentStatus {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                self.window.request_redraw();
-                return false;
-            }
+            wgpu::CurrentSurfaceTexture::Timeout => return PresentStatus::RetrySoon,
+            wgpu::CurrentSurfaceTexture::Occluded => return PresentStatus::Occluded,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 self.surface.configure(&self.device, &self.surface_config);
-                self.window.request_redraw();
-                return false;
+                return PresentStatus::RetrySoon;
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface = self
@@ -180,12 +185,11 @@ impl GpuContext {
                     .create_surface(self.window.clone())
                     .expect("recreate surface");
                 self.surface.configure(&self.device, &self.surface_config);
-                self.window.request_redraw();
-                return false;
+                return PresentStatus::RetrySoon;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 eprintln!("surface validation error");
-                return false;
+                return PresentStatus::Fatal;
             }
         };
 
@@ -279,6 +283,6 @@ impl GpuContext {
         if let Some(overlay) = overlay {
             overlay.after_submit();
         }
-        true
+        PresentStatus::Presented
     }
 }

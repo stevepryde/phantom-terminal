@@ -44,6 +44,10 @@ impl Rect {
     }
 }
 
+fn px(layout: &Layout, value: f32) -> f32 {
+    value * layout.scale_factor
+}
+
 /// Window split into the tab bar and the terminal viewport.
 #[derive(Debug, Clone, Copy)]
 pub struct Layout {
@@ -52,6 +56,7 @@ pub struct Layout {
     pub viewport: Rect,
     pub horizontal: bool,
     pub custom_chrome: bool,
+    scale_factor: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,21 +81,40 @@ impl WindowChrome {
 
 /// Compute the layout for a window of `w` x `h` physical px. `horizontal` puts
 /// the tab bar across the top; otherwise down the left side.
-pub fn compute_layout(
+#[cfg(test)]
+fn compute_layout(
     w: f32,
     h: f32,
     cell_h: f32,
     horizontal: bool,
     window_chrome: WindowChrome,
 ) -> Layout {
+    compute_layout_scaled(w, h, cell_h, horizontal, window_chrome, 1.0)
+}
+
+/// Compute layout in physical px while preserving chrome dimensions specified
+/// in logical desktop points.
+pub fn compute_layout_scaled(
+    w: f32,
+    h: f32,
+    cell_h: f32,
+    horizontal: bool,
+    window_chrome: WindowChrome,
+    scale_factor: f32,
+) -> Layout {
+    let scale_factor = scale_factor.max(1.0);
     let custom_chrome = window_chrome.is_custom();
+    let pad = PAD * scale_factor;
+    let terminal_margin = TERMINAL_MARGIN * scale_factor;
     let edge = if custom_chrome {
-        CUSTOM_EDGE_INSET
+        CUSTOM_EDGE_INSET * scale_factor
     } else {
         0.0
     };
     let titlebar_h = if custom_chrome {
-        (cell_h + PAD * 2.0).ceil().max(CUSTOM_TITLEBAR_H)
+        (cell_h + pad * 2.0)
+            .ceil()
+            .max(CUSTOM_TITLEBAR_H * scale_factor)
     } else {
         0.0
     };
@@ -98,7 +122,7 @@ pub fn compute_layout(
         let bar_h = if custom_chrome {
             titlebar_h
         } else {
-            (cell_h + PAD * 2.0).ceil()
+            (cell_h + pad * 2.0).ceil()
         };
         Layout {
             bar: Rect {
@@ -114,17 +138,19 @@ pub fn compute_layout(
                 h: titlebar_h,
             }),
             viewport: Rect {
-                x: edge + TERMINAL_MARGIN,
-                y: edge + bar_h + TERMINAL_MARGIN,
-                w: (w - edge * 2.0 - TERMINAL_MARGIN * 2.0).max(0.0),
-                h: (h - edge * 2.0 - bar_h - TERMINAL_MARGIN * 2.0).max(0.0),
+                x: edge + terminal_margin,
+                y: edge + bar_h + terminal_margin,
+                w: (w - edge * 2.0 - terminal_margin * 2.0).max(0.0),
+                h: (h - edge * 2.0 - bar_h - terminal_margin * 2.0).max(0.0),
             },
             horizontal,
             custom_chrome,
+            scale_factor,
         }
     } else {
-        let max_bar_w = (w - TERMINAL_MARGIN * 2.0 - MIN_VERTICAL_VIEWPORT_W).max(0.0);
-        let bar_w = max_bar_w.min(VERTICAL_BAR_W);
+        let max_bar_w =
+            (w - terminal_margin * 2.0 - MIN_VERTICAL_VIEWPORT_W * scale_factor).max(0.0);
+        let bar_w = max_bar_w.min(VERTICAL_BAR_W * scale_factor);
         Layout {
             titlebar: custom_chrome.then_some(Rect {
                 x: edge,
@@ -139,13 +165,14 @@ pub fn compute_layout(
                 h: (h - edge * 2.0 - titlebar_h).max(0.0),
             },
             viewport: Rect {
-                x: edge + bar_w + TERMINAL_MARGIN,
-                y: edge + titlebar_h + TERMINAL_MARGIN,
-                w: (w - edge * 2.0 - bar_w - TERMINAL_MARGIN * 2.0).max(0.0),
-                h: (h - edge * 2.0 - titlebar_h - TERMINAL_MARGIN * 2.0).max(0.0),
+                x: edge + bar_w + terminal_margin,
+                y: edge + titlebar_h + terminal_margin,
+                w: (w - edge * 2.0 - bar_w - terminal_margin * 2.0).max(0.0),
+                h: (h - edge * 2.0 - titlebar_h - terminal_margin * 2.0).max(0.0),
             },
             horizontal,
             custom_chrome,
+            scale_factor,
         }
     }
 }
@@ -153,18 +180,19 @@ pub fn compute_layout(
 /// Area behind the terminal viewport. This includes the intentional text inset
 /// so backdrops can fill the pane while terminal glyphs stay padded.
 pub fn terminal_pane(layout: &Layout) -> Rect {
+    let terminal_margin = px(layout, TERMINAL_MARGIN);
     if layout.horizontal {
         Rect {
             x: layout.bar.x,
             y: layout.bar.y + layout.bar.h,
             w: layout.bar.w,
-            h: layout.viewport.h + TERMINAL_MARGIN * 2.0,
+            h: layout.viewport.h + terminal_margin * 2.0,
         }
     } else {
         Rect {
             x: layout.bar.x + layout.bar.w,
             y: layout.bar.y,
-            w: layout.viewport.w + TERMINAL_MARGIN * 2.0,
+            w: layout.viewport.w + terminal_margin * 2.0,
             h: layout.bar.h,
         }
     }
@@ -172,20 +200,23 @@ pub fn terminal_pane(layout: &Layout) -> Rect {
 
 pub fn terminal_scrollbar_track(layout: &Layout) -> Rect {
     let pane = terminal_pane(layout);
+    let inset = px(layout, SCROLLBAR_INSET);
+    let scrollbar_w = px(layout, SCROLLBAR_W);
     Rect {
-        x: pane.x + pane.w - SCROLLBAR_INSET - SCROLLBAR_W,
-        y: pane.y + SCROLLBAR_INSET,
-        w: SCROLLBAR_W,
-        h: (pane.h - SCROLLBAR_INSET * 2.0).max(0.0),
+        x: pane.x + pane.w - inset - scrollbar_w,
+        y: pane.y + inset,
+        w: scrollbar_w,
+        h: (pane.h - inset * 2.0).max(0.0),
     }
 }
 
 pub fn terminal_scrollbar_hit_track(layout: &Layout) -> Rect {
     let track = terminal_scrollbar_track(layout);
+    let hit_w = px(layout, SCROLLBAR_HIT_W);
     Rect {
-        x: track.x + track.w - SCROLLBAR_HIT_W,
+        x: track.x + track.w - hit_w,
         y: track.y,
-        w: SCROLLBAR_HIT_W,
+        w: hit_w,
         h: track.h,
     }
 }
@@ -232,11 +263,9 @@ pub fn draw_terminal_scrollbar(
     let Some(thumb) = scrollbar_thumb(track, scroll) else {
         return;
     };
-    let visual_w = if active {
-        SCROLLBAR_HOVER_W
-    } else {
-        SCROLLBAR_W
-    };
+    let scrollbar_w = px(layout, SCROLLBAR_W);
+    let hover_w = px(layout, SCROLLBAR_HOVER_W);
+    let visual_w = if active { hover_w } else { scrollbar_w };
     let track = Rect {
         x: track.x + track.w - visual_w,
         w: visual_w,
@@ -514,13 +543,15 @@ pub fn draw_tab_bar(
 
     if layout.horizontal {
         let right_reserved = custom_right_reserved(layout);
+        let settings_w = px(layout, SETTINGS_W);
         let settings = Rect {
-            x: bar.x + (bar.w - right_reserved - SETTINGS_W).max(0.0),
+            x: bar.x + (bar.w - right_reserved - settings_w).max(0.0),
             y: bar.y,
-            w: SETTINGS_W,
+            w: settings_w,
             h: bar.h,
         };
-        let ephemeral_indicator = ephemeral.then_some(ephemeral_indicator_rect(settings));
+        let ephemeral_indicator =
+            ephemeral.then_some(ephemeral_indicator_rect_for_layout(layout, settings));
         let HorizontalTabLayout { rects, new_tab } =
             horizontal_tab_layout(layout, settings, titles.len(), ephemeral);
         let mut tabs = Vec::with_capacity(rects.len());
@@ -541,15 +572,16 @@ pub fn draw_tab_bar(
                 i == active,
                 colors,
                 cell_w,
+                layout.scale_factor,
                 true,
                 hover,
                 dragging,
                 editing,
             );
             let close = Rect {
-                x: rect.x + rect.w - CLOSE_W - PAD * 0.5,
+                x: rect.x + rect.w - px(layout, CLOSE_W) - px(layout, PAD) * 0.5,
                 y: rect.y,
-                w: CLOSE_W,
+                w: px(layout, CLOSE_W),
                 h: rect.h,
             };
             let close_hover = if drag_indicator.is_some() {
@@ -586,11 +618,13 @@ pub fn draw_tab_bar(
         );
         hits
     } else {
-        let row_h = (r_cell_h(r) + PAD * 2.0).ceil();
+        let pad = px(layout, PAD);
+        let settings_w = px(layout, SETTINGS_W);
+        let row_h = (r_cell_h(r) + pad * 2.0).ceil();
         let sidebar_settings = Rect {
-            x: bar.x + (bar.w - SETTINGS_W).max(0.0),
+            x: bar.x + (bar.w - settings_w).max(0.0),
             y: bar.y,
-            w: SETTINGS_W,
+            w: settings_w,
             h: row_h,
         };
         let settings = if layout.custom_chrome {
@@ -600,7 +634,8 @@ pub fn draw_tab_bar(
         } else {
             sidebar_settings
         };
-        let ephemeral_indicator = ephemeral.then_some(ephemeral_indicator_rect(settings));
+        let ephemeral_indicator =
+            ephemeral.then_some(ephemeral_indicator_rect_for_layout(layout, settings));
         if let Some(titlebar) = titlebar {
             draw_titlebar_controls(
                 r,
@@ -640,15 +675,16 @@ pub fn draw_tab_bar(
                 i == active,
                 colors,
                 cell_w,
+                layout.scale_factor,
                 false,
                 hover,
                 dragging,
                 editing,
             );
             let close = Rect {
-                x: rect.x + rect.w - CLOSE_W - PAD,
+                x: rect.x + rect.w - px(layout, CLOSE_W) - pad,
                 y: rect.y,
-                w: CLOSE_W,
+                w: px(layout, CLOSE_W),
                 h: rect.h,
             };
             let close_hover = if drag_indicator.is_some() {
@@ -672,8 +708,8 @@ pub fn draw_tab_bar(
         };
         r.text(
             queue,
-            new_tab.x + PAD,
-            new_tab.y + PAD,
+            new_tab.x + pad,
+            new_tab.y + pad,
             "+ new tab",
             colors.dim_text,
         );
@@ -701,6 +737,7 @@ pub fn draw_tab_bar(
     }
 }
 
+#[cfg(test)]
 fn horizontal_tab_rects(
     tab_count: usize,
     tab_start: f32,
@@ -708,15 +745,27 @@ fn horizontal_tab_rects(
     y: f32,
     h: f32,
 ) -> Vec<Rect> {
+    horizontal_tab_rects_with_widths(tab_count, tab_start, tab_limit, y, h, TAB_W, MIN_TAB_W)
+}
+
+fn horizontal_tab_rects_with_widths(
+    tab_count: usize,
+    tab_start: f32,
+    tab_limit: f32,
+    y: f32,
+    h: f32,
+    default_tab_w: f32,
+    min_tab_w: f32,
+) -> Vec<Rect> {
     if tab_count == 0 {
         return Vec::new();
     }
     let available = (tab_limit - tab_start).max(0.0);
-    let default_total = TAB_W * tab_count as f32;
+    let default_total = default_tab_w * tab_count as f32;
     let tab_w = if default_total <= available {
-        TAB_W
+        default_tab_w
     } else {
-        (available / tab_count as f32).clamp(MIN_TAB_W, TAB_W)
+        (available / tab_count as f32).clamp(min_tab_w, default_tab_w)
     };
     let mut tabs = Vec::with_capacity(tab_count);
     let mut x = tab_start;
@@ -740,9 +789,18 @@ fn horizontal_tab_layout(
     let drag_handle_w = custom_tab_drag_handle_w(layout);
     let tab_start = bar.x + custom_left_reserved(layout) + drag_handle_w;
     let status_w = horizontal_status_slot_w(layout, ephemeral);
-    let new_tab_limit = (settings.x - status_w - NEW_TAB_W).max(tab_start);
+    let new_tab_w = px(layout, NEW_TAB_W);
+    let new_tab_limit = (settings.x - status_w - new_tab_w).max(tab_start);
     let tab_limit = new_tab_limit;
-    let rects = horizontal_tab_rects(tab_count, tab_start, tab_limit, bar.y, bar.h);
+    let rects = horizontal_tab_rects_with_widths(
+        tab_count,
+        tab_start,
+        tab_limit,
+        bar.y,
+        bar.h,
+        px(layout, TAB_W),
+        px(layout, MIN_TAB_W),
+    );
     let tab_end = rects
         .last()
         .map(|rect| rect.x + rect.w)
@@ -750,7 +808,7 @@ fn horizontal_tab_layout(
     let new_tab = Rect {
         x: tab_end.min(new_tab_limit).max(bar.x),
         y: bar.y,
-        w: NEW_TAB_W,
+        w: new_tab_w,
         h: bar.h,
     };
 
@@ -759,7 +817,7 @@ fn horizontal_tab_layout(
 
 fn custom_tab_drag_handle_w(layout: &Layout) -> f32 {
     if layout.custom_chrome {
-        CUSTOM_TAB_DRAG_HANDLE_W
+        px(layout, CUSTOM_TAB_DRAG_HANDLE_W)
     } else {
         0.0
     }
@@ -767,7 +825,7 @@ fn custom_tab_drag_handle_w(layout: &Layout) -> f32 {
 
 fn horizontal_status_slot_w(layout: &Layout, ephemeral: bool) -> f32 {
     if layout.custom_chrome || ephemeral {
-        EPHEMERAL_W
+        px(layout, EPHEMERAL_W)
     } else {
         0.0
     }
@@ -821,7 +879,7 @@ pub fn draw_window_backfill(
     }
 
     let pane = terminal_pane(layout);
-    let edge = CUSTOM_EDGE_INSET;
+    let edge = px(layout, CUSTOM_EDGE_INSET);
     let right = (w - edge).max(edge);
     let bottom = (h - edge).max(edge);
     let fill = colors.active_bg;
@@ -856,7 +914,7 @@ pub fn draw_window_backfill(
     );
 
     if cfg!(target_os = "linux") {
-        let radius = 14.0;
+        let radius = 14.0 * layout.scale_factor;
         draw_rounded_corner_fill(r, edge, edge, radius, fill, Corner::TopLeft);
         draw_rounded_corner_fill(r, right - radius, edge, radius, fill, Corner::TopRight);
         draw_rounded_corner_fill(r, edge, bottom - radius, radius, fill, Corner::BottomLeft);
@@ -904,31 +962,20 @@ fn draw_linux_border(r: &mut Renderer, layout: &Layout, colors: &ChromeColors) {
     let Some(titlebar) = layout.titlebar else {
         return;
     };
-    let x = CUSTOM_EDGE_INSET;
-    let y = CUSTOM_EDGE_INSET;
+    let x = px(layout, CUSTOM_EDGE_INSET);
+    let y = px(layout, CUSTOM_EDGE_INSET);
     let w = titlebar.w;
+    let border_w = px(layout, WINDOW_BORDER_W);
     let h = if layout.horizontal {
-        layout.bar.h + layout.viewport.h + TERMINAL_MARGIN * 2.0
+        layout.bar.h + layout.viewport.h + px(layout, TERMINAL_MARGIN) * 2.0
     } else {
         titlebar.h + layout.bar.h
     };
     let border = with_alpha(mix(colors.text, colors.accent, 0.5), 90);
-    r.fill_rect(x, y, w, WINDOW_BORDER_W, border);
-    r.fill_rect(x, y, WINDOW_BORDER_W, h.max(0.0), border);
-    r.fill_rect(
-        x + w - WINDOW_BORDER_W,
-        y,
-        WINDOW_BORDER_W,
-        h.max(0.0),
-        border,
-    );
-    r.fill_rect(
-        x,
-        y + h - WINDOW_BORDER_W,
-        w,
-        WINDOW_BORDER_W,
-        with_alpha(border, 54),
-    );
+    r.fill_rect(x, y, w, border_w, border);
+    r.fill_rect(x, y, border_w, h.max(0.0), border);
+    r.fill_rect(x + w - border_w, y, border_w, h.max(0.0), border);
+    r.fill_rect(x, y + h - border_w, w, border_w, with_alpha(border, 54));
 }
 
 fn draw_titlebar_gradient(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
@@ -984,7 +1031,7 @@ fn draw_rounded_corner_fill(
 
 fn custom_left_reserved(layout: &Layout) -> f32 {
     if layout.custom_chrome && cfg!(target_os = "macos") {
-        MAC_TRAFFIC_LIGHT_SPACE
+        px(layout, MAC_TRAFFIC_LIGHT_SPACE)
     } else {
         0.0
     }
@@ -992,26 +1039,28 @@ fn custom_left_reserved(layout: &Layout) -> f32 {
 
 fn custom_right_reserved(layout: &Layout) -> f32 {
     if layout.custom_chrome && !cfg!(target_os = "macos") {
-        LINUX_WINDOW_BUTTON_W * 3.0
+        px(layout, LINUX_WINDOW_BUTTON_W) * 3.0
     } else {
         0.0
     }
 }
 
 fn titlebar_settings_rect(titlebar: Rect, layout: &Layout) -> Rect {
+    let settings_w = px(layout, SETTINGS_W);
     Rect {
-        x: titlebar.x + (titlebar.w - custom_right_reserved(layout) - SETTINGS_W).max(0.0),
+        x: titlebar.x + (titlebar.w - custom_right_reserved(layout) - settings_w).max(0.0),
         y: titlebar.y,
-        w: SETTINGS_W,
+        w: settings_w,
         h: titlebar.h,
     }
 }
 
-fn ephemeral_indicator_rect(settings: Rect) -> Rect {
+fn ephemeral_indicator_rect_for_layout(layout: &Layout, settings: Rect) -> Rect {
+    let ephemeral_w = px(layout, EPHEMERAL_W);
     Rect {
-        x: (settings.x - EPHEMERAL_W).max(0.0),
+        x: (settings.x - ephemeral_w).max(0.0),
         y: settings.y,
-        w: EPHEMERAL_W,
+        w: ephemeral_w,
         h: settings.h,
     }
 }
@@ -1023,7 +1072,8 @@ fn window_control_hits(layout: &Layout) -> Vec<WindowControlHit> {
     let Some(titlebar) = layout.titlebar else {
         return Vec::new();
     };
-    let mut x = titlebar.x + titlebar.w - LINUX_WINDOW_BUTTON_W * 3.0;
+    let button_w = px(layout, LINUX_WINDOW_BUTTON_W);
+    let mut x = titlebar.x + titlebar.w - button_w * 3.0;
     [
         WindowControl::Minimize,
         WindowControl::Maximize,
@@ -1034,10 +1084,10 @@ fn window_control_hits(layout: &Layout) -> Vec<WindowControlHit> {
         let rect = Rect {
             x,
             y: titlebar.y,
-            w: LINUX_WINDOW_BUTTON_W,
+            w: button_w,
             h: titlebar.h,
         };
-        x += LINUX_WINDOW_BUTTON_W;
+        x += button_w;
         WindowControlHit { control, rect }
     })
     .collect()
@@ -1053,7 +1103,11 @@ fn draw_titlebar_controls(
 ) {
     let settings = titlebar_settings_rect(titlebar, layout);
     if state.ephemeral {
-        draw_ephemeral_indicator(r, ephemeral_indicator_rect(settings), colors);
+        draw_ephemeral_indicator(
+            r,
+            ephemeral_indicator_rect_for_layout(layout, settings),
+            colors,
+        );
     }
     draw_settings_button(
         r,
@@ -1066,7 +1120,7 @@ fn draw_titlebar_controls(
         return;
     }
     let text = "Phantom Terminal";
-    let x = titlebar.x + MAC_TRAFFIC_LIGHT_SPACE;
+    let x = titlebar.x + px(layout, MAC_TRAFFIC_LIGHT_SPACE);
     let y = titlebar.y + (titlebar.h - r.cell_size().1) * 0.5;
     r.text(queue, x, y, text, with_alpha(colors.dim_text, 160));
 }
@@ -1127,36 +1181,44 @@ fn draw_settings_button(
             colors.accent,
         );
     }
-    let (cell_w, cell_h) = r.cell_size();
+    let icon_size = (rect.w.min(rect.h) * 0.58).max(16.0);
     let base_icon = if active { colors.text } else { colors.dim_text };
     let color = mix(base_icon, colors.accent, hover);
     draw_settings_icon(
         r,
-        rect.x + (rect.w - cell_w) * 0.5,
-        rect.y + (rect.h - cell_h) * 0.5,
-        cell_w,
-        cell_h,
+        rect.x + (rect.w - icon_size) * 0.5,
+        rect.y + (rect.h - icon_size) * 0.5,
+        icon_size,
+        icon_size,
         color,
     );
 }
 
 fn draw_ephemeral_indicator(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
     let accent = [251, 191, 36, 255];
-    let size = 10.0;
+    let scale = (rect.h / CUSTOM_TITLEBAR_H).max(1.0);
+    let size = 10.0 * scale;
+    let line = 2.0 * scale;
     let x = rect.x + (rect.w - size) * 0.5;
     let y = rect.y + (rect.h - size) * 0.5;
     r.fill_rect(
-        x - 3.0,
-        y - 3.0,
-        size + 6.0,
-        size + 6.0,
+        x - 3.0 * scale,
+        y - 3.0 * scale,
+        size + 6.0 * scale,
+        size + 6.0 * scale,
         with_alpha(accent, 28),
     );
-    r.fill_rect(x, y, size, 2.0, accent);
-    r.fill_rect(x, y + size - 2.0, size, 2.0, accent);
-    r.fill_rect(x, y, 2.0, size, accent);
-    r.fill_rect(x + size - 2.0, y, 2.0, size, accent);
-    r.fill_rect(x + 4.0, y + 4.0, 2.0, 2.0, mix(accent, colors.text, 0.35));
+    r.fill_rect(x, y, size, line, accent);
+    r.fill_rect(x, y + size - line, size, line, accent);
+    r.fill_rect(x, y, line, size, accent);
+    r.fill_rect(x + size - line, y, line, size, accent);
+    r.fill_rect(
+        x + 4.0 * scale,
+        y + 4.0 * scale,
+        line,
+        line,
+        mix(accent, colors.text, 0.35),
+    );
 }
 
 fn draw_settings_icon(r: &mut Renderer, x: f32, y: f32, w: f32, h: f32, color: [u8; 4]) {
@@ -1216,6 +1278,7 @@ fn draw_tab_label(
     active: bool,
     colors: &ChromeColors,
     cell_w: f32,
+    scale_factor: f32,
     underline_accent: bool,
     hover: f32,
     dragging: bool,
@@ -1235,11 +1298,20 @@ fn draw_tab_label(
         draw_drag_source(r, rect, colors);
     }
     if active && underline_accent {
-        r.fill_rect(rect.x, rect.y + rect.h - 2.0, rect.w, 2.0, colors.accent);
+        let underline_h = 2.0 * scale_factor;
+        r.fill_rect(
+            rect.x,
+            rect.y + rect.h - underline_h,
+            rect.w,
+            underline_h,
+            colors.accent,
+        );
     } else if active {
-        r.fill_rect(rect.x, rect.y, 2.0, rect.h, colors.accent);
+        r.fill_rect(rect.x, rect.y, 2.0 * scale_factor, rect.h, colors.accent);
     }
-    let max_chars = (((rect.w - PAD * 2.0 - CLOSE_W) / cell_w).floor() as usize).max(1);
+    let pad = PAD * scale_factor;
+    let close_w = CLOSE_W * scale_factor;
+    let max_chars = (((rect.w - pad * 2.0 - close_w) / cell_w).floor() as usize).max(1);
     let (label, text_color) = match editing {
         // Show the tail of the edit buffer (what's being typed) plus a caret.
         Some(buf) => (
@@ -1255,7 +1327,7 @@ fn draw_tab_label(
             },
         ),
     };
-    r.text(queue, rect.x + PAD, rect.y + PAD, &label, text_color);
+    r.text(queue, rect.x + pad, rect.y + pad, &label, text_color);
 }
 
 fn draw_drag_source(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
@@ -1480,6 +1552,29 @@ mod tests {
     }
 
     #[test]
+    fn custom_horizontal_layout_scales_titlebar_controls() {
+        let scale = 2.0;
+        let layout = compute_layout_scaled(1600.0, 1200.0, 40.0, true, WindowChrome::Custom, scale);
+        let titlebar = layout.titlebar.expect("custom titlebar");
+        let settings = titlebar_settings_rect(titlebar, &layout);
+
+        assert!(layout.bar.h >= CUSTOM_TITLEBAR_H * scale);
+        assert_eq!(settings.w, SETTINGS_W * scale);
+        assert_eq!(settings.h, titlebar.h);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scaled_custom_horizontal_layout_reserves_macos_traffic_light_space() {
+        let scale = 2.0;
+        let layout = compute_layout_scaled(1600.0, 1200.0, 40.0, true, WindowChrome::Custom, scale);
+        let settings = titlebar_settings_rect(layout.titlebar.unwrap(), &layout);
+        let strip = horizontal_tab_layout(&layout, settings, 1, false);
+
+        assert!(strip.rects[0].x >= MAC_TRAFFIC_LIGHT_SPACE * scale);
+    }
+
+    #[test]
     fn custom_vertical_layout_keeps_tabs_below_titlebar() {
         let l = compute_layout(1000.0, 600.0, 20.0, false, WindowChrome::Custom);
         let titlebar = l.titlebar.expect("custom titlebar");
@@ -1526,7 +1621,7 @@ mod tests {
     fn ephemeral_indicator_sits_next_to_settings_and_is_drag_region() {
         let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
         let settings = titlebar_settings_rect(layout.titlebar.unwrap(), &layout);
-        let indicator = ephemeral_indicator_rect(settings);
+        let indicator = ephemeral_indicator_rect_for_layout(&layout, settings);
         let hits = TabBarHits {
             tabs: Vec::new(),
             new_tab: Rect {
