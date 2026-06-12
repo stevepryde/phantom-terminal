@@ -78,7 +78,7 @@ impl Harness {
         let (device, queue) =
             block(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
 
-        let renderer = Renderer::new(&device, &queue, FORMAT, config, 1.0);
+        let renderer = Renderer::new(&device, &queue, FORMAT, config, 1.0).ok()?;
         renderer.resize(&queue, width, height);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {

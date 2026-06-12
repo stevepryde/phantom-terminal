@@ -86,6 +86,10 @@ pub struct Renderer {
     // so overlays composite correctly on top of the terminal.
     solids: [Vec<SolidInstance>; 2],
     glyphs: [Vec<GlyphInstance>; 2],
+    /// Active clip rect (x0, y0, x1, y1) in physical px. Quads are clamped at
+    /// emit time (glyph UVs proportionally), so oversized fallback glyphs and
+    /// scrolled chrome can't paint outside their region.
+    clip: Option<[f32; 4]>,
     target: usize,
     solid_counts: [u32; 2],
     glyph_counts: [u32; 2],
@@ -105,13 +109,13 @@ impl Renderer {
         format: wgpu::TextureFormat,
         config: &AppConfig,
         scale_factor: f32,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let palette = Palette::from_theme(&config.theme);
         let font = FontSet::new(
             &config.font_family,
             (config.font_size as f32 * scale_factor).max(1.0),
             config.line_height,
-        );
+        )?;
         let metrics = font.metrics();
         let atlas = GlyphAtlas::new(device, ATLAS_SIZE);
 
@@ -227,6 +231,7 @@ impl Renderer {
             glyph_cap: INITIAL_INSTANCE_CAP,
             solids: [Vec::new(), Vec::new()],
             glyphs: [Vec::new(), Vec::new()],
+            clip: None,
             target: LAYER_BASE,
             solid_counts: [0, 0],
             glyph_counts: [0, 0],
@@ -238,7 +243,7 @@ impl Renderer {
             strikeout_offset: metrics.strikeout_offset,
         };
         renderer.write_uniforms(queue, [1.0, 1.0]);
-        renderer
+        Ok(renderer)
     }
 
     /// Cell size in physical px.
@@ -297,14 +302,15 @@ impl Renderer {
         self.palette.ansi(index.min(15))
     }
 
-    /// Advance width of `s` rendered as monospace text.
+    /// Advance width of `s` rendered as monospace text (wide chars = 2 cells).
     pub fn text_width(&self, s: &str) -> f32 {
-        s.chars().count() as f32 * self.cell_w
+        s.chars().map(|ch| char_cells(ch) as f32).sum::<f32>() * self.cell_w
     }
 
     /// Start a frame: clear both layers and target the base layer.
     pub fn begin(&mut self) {
         self.backdrop.clear();
+        self.atlas.begin_frame();
         for layer in 0..2 {
             self.solids[layer].clear();
             self.glyphs[layer].clear();
@@ -318,13 +324,46 @@ impl Renderer {
         self.target = LAYER_OVERLAY;
     }
 
+    /// Clamp subsequent draws to the given rect (physical px) until
+    /// [`clear_clip`](Self::clear_clip).
+    pub fn set_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.clip = Some([x, y, x + w.max(0.0), y + h.max(0.0)]);
+    }
+
+    pub fn clear_clip(&mut self) {
+        self.clip = None;
+    }
+
+    /// Intersect a quad with the active clip; `None` when fully clipped.
+    fn clip_quad(&self, x: f32, y: f32, w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+        let Some([cx0, cy0, cx1, cy1]) = self.clip else {
+            return Some((x, y, w, h));
+        };
+        let x0 = x.max(cx0);
+        let y0 = y.max(cy0);
+        let x1 = (x + w).min(cx1);
+        let y1 = (y + h).min(cy1);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some((x0, y0, x1 - x0, y1 - y0))
+    }
+
     /// Fill an axis-aligned rectangle (physical px) in the current layer.
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
+        let Some((x, y, w, h)) = self.clip_quad(x, y, w, h) else {
+            return;
+        };
         self.solids[self.target].push(solid(x, y, w, h, color));
     }
 
     /// Fill an axis-aligned rectangle with smoothly interpolated corner colours.
+    /// Under a clip the rect is clamped and the corner colours apply to the
+    /// clamped rect (the gradient compresses slightly at a clipped edge).
     pub fn fill_rect_gradient(&mut self, x: f32, y: f32, w: f32, h: f32, corners: [Rgba; 4]) {
+        let Some((x, y, w, h)) = self.clip_quad(x, y, w, h) else {
+            return;
+        };
         self.solids[self.target].push(gradient(x, y, w, h, corners));
     }
 
@@ -342,7 +381,8 @@ impl Renderer {
     }
 
     /// Draw monospace `s` with its top-left at `(x, y)` in the current layer.
-    /// Returns the advance width.
+    /// Returns the advance width. Wide characters (CJK, emoji) advance two
+    /// cells, matching the grid — IME preedit and tab titles overlap otherwise.
     pub fn text(&mut self, queue: &wgpu::Queue, x: f32, y: f32, s: &str, color: Rgba) -> f32 {
         let start = x.round();
         let baseline = y.round() + self.ascent;
@@ -351,7 +391,7 @@ impl Renderer {
             if ch != ' ' {
                 self.emit_glyph(queue, REGULAR, ch, pen, baseline, color);
             }
-            pen += self.cell_w;
+            pen += self.cell_w * char_cells(ch) as f32;
         }
         pen - start
     }
@@ -397,6 +437,12 @@ impl Renderer {
         let show_cursor = cursor.visible && cursor_on;
         let rows = (snap.rows as usize).min(max_grid.0);
         let cols = (snap.cols as usize).min(max_grid.1);
+
+        // Oversized fallback glyphs (emoji from a non-mono face, italic
+        // overhang in the last column) must not paint over the margin,
+        // scrollbar, or chrome.
+        let previous_clip = self.clip;
+        self.set_clip(ox, oy, cols as f32 * cw, rows as f32 * ch);
 
         for row in 0..rows {
             for col in 0..cols {
@@ -468,6 +514,8 @@ impl Renderer {
                 }
             }
         }
+
+        self.clip = previous_clip;
     }
 
     fn emit_glyph(
@@ -487,27 +535,42 @@ impl Renderer {
             glyph_id: resolved.glyph_id,
         };
         let entry = match self.atlas.get(key) {
-            Some(entry) => Some(entry),
-            None => self
-                .font
-                .rasterize(resolved)
-                .map(|raster| self.atlas.insert(queue, key, &raster)),
+            Some(entry) => entry,
+            None => match self.font.rasterize(resolved) {
+                Some(raster) => self.atlas.insert(queue, key, &raster),
+                None => self.atlas.insert_failed(key),
+            },
         };
-        if let Some(entry) = entry {
-            if !entry.empty {
-                let gx = (pen_x + entry.left as f32).round();
-                let gy = (baseline_y - entry.top as f32).round();
-                self.glyphs[self.target].push(glyph(
-                    gx,
-                    gy,
-                    entry.width as f32,
-                    entry.height as f32,
-                    entry.uv_min,
-                    entry.uv_max,
-                    color,
-                    entry.is_color,
-                ));
-            }
+        if !entry.empty {
+            let gx = (pen_x + entry.left as f32).round();
+            let gy = (baseline_y - entry.top as f32).round();
+            let w = entry.width as f32;
+            let h = entry.height as f32;
+            let Some((qx, qy, qw, qh)) = self.clip_quad(gx, gy, w, h) else {
+                return;
+            };
+            // Clamp UVs in proportion to the clipped quad so the visible part
+            // of the glyph keeps its texels (no squash).
+            let du = entry.uv_max[0] - entry.uv_min[0];
+            let dv = entry.uv_max[1] - entry.uv_min[1];
+            let uv_min = [
+                entry.uv_min[0] + du * (qx - gx) / w,
+                entry.uv_min[1] + dv * (qy - gy) / h,
+            ];
+            let uv_max = [
+                entry.uv_min[0] + du * (qx + qw - gx) / w,
+                entry.uv_min[1] + dv * (qy + qh - gy) / h,
+            ];
+            self.glyphs[self.target].push(glyph(
+                qx,
+                qy,
+                qw,
+                qh,
+                uv_min,
+                uv_max,
+                color,
+                entry.is_color,
+            ));
         }
     }
 
@@ -517,30 +580,43 @@ impl Renderer {
         self.solid_counts = [self.solids[0].len() as u32, self.solids[1].len() as u32];
         self.glyph_counts = [self.glyphs[0].len() as u32, self.glyphs[1].len() as u32];
 
-        let mut all_solids = Vec::with_capacity(self.solids[0].len() + self.solids[1].len());
-        all_solids.extend_from_slice(&self.solids[0]);
-        all_solids.extend_from_slice(&self.solids[1]);
-        let solid_bytes = bytemuck::cast_slice(&all_solids);
-        if solid_bytes.len() as u64 > self.solid_cap {
-            self.solid_cap = (solid_bytes.len() as u64).next_power_of_two();
+        // Upload the two layers back-to-back at offsets — no concat Vec.
+        let base_solid_bytes: &[u8] = bytemuck::cast_slice(&self.solids[0]);
+        let overlay_solid_bytes: &[u8] = bytemuck::cast_slice(&self.solids[1]);
+        let solid_total = (base_solid_bytes.len() + overlay_solid_bytes.len()) as u64;
+        if solid_total > self.solid_cap {
+            self.solid_cap = solid_total.next_power_of_two();
             self.solid_buffer =
                 create_instance_buffer(device, "phantom-solid-inst", self.solid_cap);
         }
-        if !all_solids.is_empty() {
-            queue.write_buffer(&self.solid_buffer, 0, solid_bytes);
+        if !base_solid_bytes.is_empty() {
+            queue.write_buffer(&self.solid_buffer, 0, base_solid_bytes);
+        }
+        if !overlay_solid_bytes.is_empty() {
+            queue.write_buffer(
+                &self.solid_buffer,
+                base_solid_bytes.len() as u64,
+                overlay_solid_bytes,
+            );
         }
 
-        let mut all_glyphs = Vec::with_capacity(self.glyphs[0].len() + self.glyphs[1].len());
-        all_glyphs.extend_from_slice(&self.glyphs[0]);
-        all_glyphs.extend_from_slice(&self.glyphs[1]);
-        let glyph_bytes = bytemuck::cast_slice(&all_glyphs);
-        if glyph_bytes.len() as u64 > self.glyph_cap {
-            self.glyph_cap = (glyph_bytes.len() as u64).next_power_of_two();
+        let base_glyph_bytes: &[u8] = bytemuck::cast_slice(&self.glyphs[0]);
+        let overlay_glyph_bytes: &[u8] = bytemuck::cast_slice(&self.glyphs[1]);
+        let glyph_total = (base_glyph_bytes.len() + overlay_glyph_bytes.len()) as u64;
+        if glyph_total > self.glyph_cap {
+            self.glyph_cap = glyph_total.next_power_of_two();
             self.glyph_buffer =
                 create_instance_buffer(device, "phantom-glyph-inst", self.glyph_cap);
         }
-        if !all_glyphs.is_empty() {
-            queue.write_buffer(&self.glyph_buffer, 0, glyph_bytes);
+        if !base_glyph_bytes.is_empty() {
+            queue.write_buffer(&self.glyph_buffer, 0, base_glyph_bytes);
+        }
+        if !overlay_glyph_bytes.is_empty() {
+            queue.write_buffer(
+                &self.glyph_buffer,
+                base_glyph_bytes.len() as u64,
+                overlay_glyph_bytes,
+            );
         }
     }
 
@@ -577,6 +653,14 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.glyph_buffer.slice(..));
         pass.draw(0..4, range);
     }
+}
+
+/// Terminal cells a character occupies in chrome text (same wcwidth rules the
+/// grid uses via alacritty); zero-width marks still take one cell here because
+/// chrome text draws them standalone.
+fn char_cells(ch: char) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    ch.width().unwrap_or(1).max(1)
 }
 
 fn solid(x: f32, y: f32, w: f32, h: f32, color: Rgba) -> SolidInstance {

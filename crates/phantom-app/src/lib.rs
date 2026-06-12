@@ -63,6 +63,10 @@ const MAX_PENDING_PTY_BYTES: usize = 1024 * 1024;
 const PTY_BACKPRESSURE_WAKE_INTERVAL: Duration = Duration::from_millis(50);
 const SURFACE_RETRY_DELAY: Duration = Duration::from_millis(33);
 const SURFACE_OCCLUDED_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Consecutive fatal present failures tolerated before giving up and exiting.
+const MAX_FATAL_PRESENTS: u32 = 10;
+/// Logical px the tab strip scrolls per wheel notch line.
+const TAB_STRIP_WHEEL_PX: f32 = 24.0;
 const TAB_DRAG_TOLERANCE_PX: f32 = 8.0;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
@@ -297,20 +301,33 @@ fn persistence_worker(
     error_tx: mpsc::Sender<String>,
 ) {
     while let Ok(msg) = rx.recv() {
-        match msg {
-            PersistMsg::SaveTabs(records) => {
-                if let Err(error) = persist_tabs(&store, records) {
-                    let _ = error_tx.send(error);
-                }
+        // Coalesce bursts: a settings-slider drag emits one SaveConfig per
+        // frame, and only the newest of each kind needs to hit disk. Flush
+        // replies are sent after the batch they arrived with is applied.
+        let mut tabs = None;
+        let mut config = None;
+        let mut flushes = Vec::new();
+        let mut next = Some(msg);
+        while let Some(msg) = next {
+            match msg {
+                PersistMsg::SaveTabs(records) => tabs = Some(records),
+                PersistMsg::SaveConfig(new_config) => config = Some(new_config),
+                PersistMsg::Flush(reply) => flushes.push(reply),
             }
-            PersistMsg::SaveConfig(config) => {
-                if let Err(error) = store.save_config(&config) {
-                    let _ = error_tx.send(error.to_string());
-                }
+            next = rx.try_recv().ok();
+        }
+        if let Some(records) = tabs {
+            if let Err(error) = persist_tabs(&store, records) {
+                let _ = error_tx.send(error);
             }
-            PersistMsg::Flush(reply) => {
-                let _ = reply.send(());
+        }
+        if let Some(config) = config {
+            if let Err(error) = store.save_config(&config) {
+                let _ = error_tx.send(error.to_string());
             }
+        }
+        for reply in flushes {
+            let _ = reply.send(());
         }
     }
 }
@@ -419,6 +436,18 @@ pub struct App {
     last_click: Option<LastClick>,
     redraw_queued: bool,
     surface_redraw_after: Option<Instant>,
+    /// Consecutive fatal present failures; reset on a successful present.
+    fatal_presents: u32,
+    /// When egui asked to be repainted (animations); None when egui is idle.
+    egui_repaint_after: Option<Instant>,
+    /// Mirrors `WindowEvent::Occluded`: while hidden, skip timed redraws.
+    window_occluded: bool,
+    /// Whether the cursor was over the scrollbar track on the last mouse move.
+    scrollbar_hovered: bool,
+    /// Tab strip scroll offset (physical px); clamped by the chrome each frame.
+    tab_scroll: f32,
+    /// Scroll this tab fully into the strip on the next frame.
+    tab_scroll_into_view: Option<usize>,
     /// In-progress IME composition text (shown at the cursor).
     preedit: String,
     fullscreen: bool,
@@ -498,6 +527,12 @@ impl App {
             last_click: None,
             redraw_queued: false,
             surface_redraw_after: None,
+            fatal_presents: 0,
+            egui_repaint_after: None,
+            window_occluded: false,
+            scrollbar_hovered: false,
+            tab_scroll: 0.0,
+            tab_scroll_into_view: None,
             preedit: String::new(),
             fullscreen: false,
             exit_requested: false,
@@ -759,22 +794,34 @@ impl App {
                 .unwrap_or_default();
             if !records.is_empty() {
                 let mut active = 0;
-                for (i, rec) in records.iter().enumerate() {
-                    self.spawn_tab_with_persistence(
+                for rec in &records {
+                    // A record can fail to spawn (stale profile, dead shell
+                    // path); only apply its title/active bookkeeping when a
+                    // tab was actually pushed, or the previous record's tab
+                    // gets renamed and the active index drifts.
+                    if !self.spawn_tab_with_persistence(
                         rec.shell_profile_id.clone(),
                         Some(rec.cwd.clone()),
                         false,
-                    );
+                    ) {
+                        continue;
+                    }
+                    let index = self.tabs.len() - 1;
                     if rec.title != basename(&rec.cwd) {
                         if let Some(tab) = self.tabs.last_mut() {
                             tab.custom_title = rec.title.clone();
                         }
                     }
                     if rec.is_active {
-                        active = i;
+                        active = index;
                     }
                 }
-                self.active = active.min(self.tabs.len().saturating_sub(1));
+                if self.tabs.is_empty() {
+                    // Every restore failed: fall through to a fresh default tab.
+                    self.spawn_tab(None, None);
+                    return;
+                }
+                self.active = active.min(self.tabs.len() - 1);
                 return;
             }
         }
@@ -786,12 +833,13 @@ impl App {
         self.spawn_tab_with_persistence(profile_id, cwd, true);
     }
 
+    /// Spawn a tab; returns whether a tab was actually added.
     fn spawn_tab_with_persistence(
         &mut self,
         profile_id: Option<String>,
         cwd: Option<String>,
         persist: bool,
-    ) {
+    ) -> bool {
         let (rows, cols) = self.viewport_grid();
         let launch =
             match resolve_launch_opts(&self.config, profile_id.as_deref(), cwd.clone(), rows, cols)
@@ -799,7 +847,7 @@ impl App {
                 Ok(launch) => launch,
                 Err(e) => {
                     self.show_notice(format!("Could not resolve shell profile: {e}"));
-                    return;
+                    return false;
                 }
             };
         let start_cwd = launch
@@ -818,7 +866,7 @@ impl App {
             Ok(id) => id,
             Err(e) => {
                 self.show_notice(format!("Could not start shell: {e}"));
-                return;
+                return false;
             }
         };
 
@@ -831,17 +879,20 @@ impl App {
         self.tabs
             .push(Tab::new(tab_id, core, pty_id, start_cwd, profile_id));
         self.active = self.tabs.len() - 1;
+        self.tab_scroll_into_view = Some(self.active);
         self.arm_cwd_polling(CWD_STARTUP_POLL_WINDOW);
         if persist {
             self.mark_dirty();
         }
         self.request_redraw();
+        true
     }
 
     fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
+        let closed_active = index == self.active;
         let tab = self.tabs.remove(index);
         let _ = self.pty.kill(tab.pty_id);
         if self.tabs.is_empty() {
@@ -855,6 +906,27 @@ impl App {
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        // Tabs can vanish mid-gesture (a shell exiting fires PtyExit): shift or
+        // cancel pointer state that captured pre-removal indices, and drop last
+        // frame's hit rects so a racing click can't act on a neighboring tab.
+        self.tab_drag = match self.tab_drag.take() {
+            Some(drag) if drag.from == index => None,
+            Some(mut drag) => {
+                if index < drag.from {
+                    drag.from -= 1;
+                }
+                if index < drag.target {
+                    drag.target -= 1;
+                }
+                Some(drag)
+            }
+            None => None,
+        };
+        if closed_active {
+            self.scroll_drag = None;
+        }
+        self.last_hits = None;
+        self.tab_scroll_into_view = Some(self.active);
         self.rename = None;
         self.mark_dirty();
         self.request_redraw();
@@ -867,7 +939,12 @@ impl App {
             Action::SwitchTab(n) => {
                 let i = (n as usize).saturating_sub(1);
                 if i < self.tabs.len() {
+                    if i != self.active {
+                        // A scrollbar drag in progress belongs to the previous tab.
+                        self.scroll_drag = None;
+                    }
                     self.active = i;
+                    self.tab_scroll_into_view = Some(i);
                     self.mark_dirty();
                     self.request_redraw();
                 }
@@ -971,16 +1048,25 @@ impl App {
     /// Recreate the renderer (font/theme/scale) and resize every tab.
     fn rebuild_renderer(&mut self) {
         if let Some(gpu) = self.gpu.as_ref() {
-            let renderer = Renderer::new(
+            match Renderer::new(
                 &gpu.device,
                 &gpu.queue,
                 gpu.format(),
                 &self.config,
                 gpu.scale_factor(),
-            );
-            let (w, h) = gpu.size();
-            renderer.resize(&gpu.queue, w, h);
-            self.renderer = Some(renderer);
+            ) {
+                Ok(renderer) => {
+                    let (w, h) = gpu.size();
+                    renderer.resize(&gpu.queue, w, h);
+                    self.renderer = Some(renderer);
+                }
+                // Keep rendering with the previous renderer rather than
+                // crashing mid-session (e.g. a corrupt font encountered on a
+                // monitor-scale change).
+                Err(error) => {
+                    self.show_notice(format!("Could not load font: {error}"));
+                }
+            }
         }
         self.renderer_signature = renderer_signature(&self.config);
         self.sync_terminal_grid(true);
@@ -1192,7 +1278,12 @@ impl App {
         if index >= self.tabs.len() {
             return;
         }
+        if index != self.active {
+            // A scrollbar drag in progress belongs to the previous tab.
+            self.scroll_drag = None;
+        }
         self.active = index;
+        self.tab_scroll_into_view = Some(index);
         self.rename = None;
         self.mark_dirty();
         self.request_redraw();
@@ -1211,6 +1302,7 @@ impl App {
         let tab = self.tabs.remove(from);
         self.tabs.insert(insert_at, tab);
         self.active = insert_at;
+        self.tab_scroll_into_view = Some(insert_at);
         self.rename = None;
         self.mark_dirty();
     }
@@ -1455,7 +1547,12 @@ impl App {
         let Some(scroll) = self.active_scroll_state() else {
             return false;
         };
-        let Some(thumb) = chrome::scrollbar_thumb(track, scroll) else {
+        let scale_factor = self
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.scale_factor())
+            .unwrap_or(1.0);
+        let Some(thumb) = chrome::scrollbar_thumb(track, scroll, scale_factor) else {
             return false;
         };
 
@@ -1515,11 +1612,17 @@ impl App {
             return;
         }
         let (px, py) = self.cursor_pos;
-        if self.scroll_drag.is_some()
+        let scrollbar_hover = self.scroll_drag.is_some()
             || self
                 .active_scrollbar_track()
-                .is_some_and(|track| track.contains(px, py))
-        {
+                .is_some_and(|track| track.contains(px, py));
+        // The widened/highlighted scrollbar is derived from the live cursor in
+        // render(), so entering/leaving the track needs its own repaint.
+        if scrollbar_hover != self.scrollbar_hovered {
+            self.scrollbar_hovered = scrollbar_hover;
+            self.request_redraw();
+        }
+        if scrollbar_hover {
             self.set_pointer_cursor(true);
             if self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None) {
                 self.request_redraw();
@@ -1563,6 +1666,21 @@ impl App {
 
     fn on_scroll(&mut self, lines: f32) {
         let (px, py) = self.cursor_pos;
+        // Wheel over an overflowing tab strip scrolls the strip, not the
+        // terminal. Wheel-up moves toward the first tab.
+        if let Some(hits) = self.last_hits.as_ref() {
+            if hits.max_tab_scroll > 0.0 && hits.tab_strip.contains(px, py) {
+                let scale = self
+                    .gpu
+                    .as_ref()
+                    .map(|gpu| gpu.scale_factor())
+                    .unwrap_or(1.0);
+                let step = lines * TAB_STRIP_WHEEL_PX * scale;
+                self.tab_scroll = (self.tab_scroll - step).clamp(0.0, hits.max_tab_scroll);
+                self.request_redraw();
+                return;
+            }
+        }
         if self.active_mouse_mode().reports() {
             let ticks = lines.round() as i32;
             if ticks == 0 {
@@ -1865,6 +1983,18 @@ impl App {
             ),
             _ => Default::default(),
         };
+        // Honor egui's repaint request (caret blink, hover fades): zero means
+        // redraw right away, a finite delay becomes a wake-up deadline, and
+        // `Duration::MAX` (idle) overflows checked_add to None.
+        if let Some(egui) = self.egui.as_ref() {
+            let delay = egui.repaint_delay();
+            if delay.is_zero() {
+                self.egui_repaint_after = None;
+                self.request_redraw();
+            } else {
+                self.egui_repaint_after = Instant::now().checked_add(delay);
+            }
+        }
         if ui_outcome.config_changed {
             self.apply_config_change();
         }
@@ -1919,7 +2049,10 @@ impl App {
             self.ephemeral,
             &self.chrome_anim,
             drag_indicator,
+            self.tab_scroll,
+            self.tab_scroll_into_view.take(),
         );
+        self.tab_scroll = hits.tab_scroll;
         if let Some(tab) = self.tabs.get(self.active) {
             let snapshot = tab.core.snapshot();
             if let Some((rows, cols)) = self.pending_terminal_grid {
@@ -1998,7 +2131,34 @@ impl App {
     }
 
     fn handle_present_status(&mut self, status: PresentStatus) {
-        self.surface_redraw_after = surface_retry_delay(status).map(|delay| Instant::now() + delay);
+        match status {
+            // A persistent validation failure must not silently freeze a live
+            // window: retry a bounded number of times, then exit cleanly
+            // (tabs and config are flushed by request_exit).
+            PresentStatus::Fatal => {
+                self.fatal_presents += 1;
+                if self.fatal_presents >= MAX_FATAL_PRESENTS {
+                    eprintln!("rendering failed {MAX_FATAL_PRESENTS} times in a row; exiting");
+                    self.request_exit();
+                    return;
+                }
+                self.surface_redraw_after = Some(Instant::now() + SURFACE_RETRY_DELAY);
+            }
+            PresentStatus::Presented => {
+                self.fatal_presents = 0;
+                self.surface_redraw_after = None;
+            }
+            // While the window is known-hidden, resume on Occluded(false)
+            // instead of polling the surface at 4 Hz forever. The timed retry
+            // stays as the fallback when no occlusion event was seen.
+            PresentStatus::Occluded if self.window_occluded => {
+                self.surface_redraw_after = None;
+            }
+            other => {
+                self.surface_redraw_after =
+                    surface_retry_delay(other).map(|delay| Instant::now() + delay);
+            }
+        }
     }
 
     fn pump_blink(&mut self) -> bool {
@@ -2240,13 +2400,20 @@ impl ApplicationHandler<AppEvent> for App {
         };
         configure_custom_window_drag(&gpu.window, custom_window_chrome);
         gpu.window.set_ime_allowed(true);
-        let renderer = Renderer::new(
+        let renderer = match Renderer::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
             &self.config,
             gpu.scale_factor(),
-        );
+        ) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                window.set_title(&format!("Phantom Terminal - {error}"));
+                self.show_notice(error);
+                return;
+            }
+        };
         let (w, h) = gpu.size();
         renderer.resize(&gpu.queue, w, h);
         let egui = EguiLayer::new(&gpu.window, &gpu.device, gpu.format());
@@ -2274,6 +2441,12 @@ impl ApplicationHandler<AppEvent> for App {
         }
         if matches!(event, WindowEvent::CursorLeft { .. }) {
             self.clear_chrome_hover();
+        }
+        if let WindowEvent::Occluded(occluded) = event {
+            self.window_occluded = occluded;
+            if !occluded {
+                self.request_redraw();
+            }
         }
 
         let terminal_owns_keyboard = terminal_owns_keyboard(
@@ -2339,6 +2512,12 @@ impl ApplicationHandler<AppEvent> for App {
                 self.request_redraw();
             }
         }
+        if let Some(deadline) = self.egui_repaint_after {
+            if now >= deadline {
+                self.egui_repaint_after = None;
+                self.request_redraw();
+            }
+        }
         let surface_retry_pending = self
             .surface_redraw_after
             .is_some_and(|deadline| now < deadline);
@@ -2354,7 +2533,8 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         let mut next = None;
-        if self.blink_enabled {
+        // No blink wake-ups while hidden; Occluded(false) restarts rendering.
+        if self.blink_enabled && !self.window_occluded {
             min_deadline(&mut next, self.next_toggle);
         }
         if let Some(deadline) = self.cwd_deadline {
@@ -2367,6 +2547,9 @@ impl ApplicationHandler<AppEvent> for App {
             min_deadline(&mut next, deadline);
         }
         if let Some(deadline) = self.terminal_resize_deadline {
+            min_deadline(&mut next, deadline);
+        }
+        if let Some(deadline) = self.egui_repaint_after {
             min_deadline(&mut next, deadline);
         }
         if let Some(notice) = self.notice.as_ref() {
@@ -2513,6 +2696,71 @@ mod tests {
         assert_eq!(app.terminal_click_count(1, 2), 3);
         assert_eq!(app.terminal_click_count(1, 2), 3);
         assert_eq!(app.terminal_click_count(1, 3), 1);
+    }
+
+    #[test]
+    fn closing_a_tab_mid_drag_shifts_or_cancels_the_drag() {
+        let mut app = test_app();
+        for id in 0..4 {
+            app.tabs.push(Tab::new(
+                id,
+                AlacrittyCore::new(2, 20, 100, CursorShape::Block),
+                u32::MAX,
+                String::new(),
+                None,
+            ));
+        }
+        app.active = 3;
+
+        // Dragging tab 2 while tab 0 exits: indices shift down by one.
+        app.tab_drag = Some(TabDrag {
+            from: 2,
+            start: (0.0, 0.0),
+            target: 3,
+            active: true,
+        });
+        app.close_tab(0);
+        let drag = app.tab_drag.as_ref().expect("drag survives");
+        assert_eq!(drag.from, 1);
+        assert_eq!(drag.target, 2);
+
+        // The dragged tab itself exiting cancels the drag.
+        app.close_tab(1);
+        assert!(app.tab_drag.is_none());
+    }
+
+    #[test]
+    fn closing_the_active_tab_cancels_scroll_drag() {
+        let mut app = test_app();
+        for id in 0..2 {
+            app.tabs.push(Tab::new(
+                id,
+                AlacrittyCore::new(2, 20, 100, CursorShape::Block),
+                u32::MAX,
+                String::new(),
+                None,
+            ));
+        }
+        app.active = 1;
+        app.scroll_drag = Some(ScrollDrag {
+            start_y: 10.0,
+            start_offset: 3,
+        });
+
+        // Closing a different tab keeps the drag (same tab stays active)...
+        app.close_tab(0);
+        assert!(app.scroll_drag.is_some());
+
+        // ...but switching tabs cancels it.
+        app.tabs.push(Tab::new(
+            2,
+            AlacrittyCore::new(2, 20, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.switch_tab(1);
+        assert!(app.scroll_drag.is_none());
     }
 
     #[test]

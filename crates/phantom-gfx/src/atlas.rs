@@ -35,19 +35,22 @@ impl ShelfPacker {
         if w > self.width || h > self.height {
             return None;
         }
-        if self.x + w > self.width {
+        // Compute the candidate position without committing, so a failed
+        // allocation doesn't abandon the remaining width of the open shelf.
+        let (mut x, mut y, mut shelf_height) = (self.x, self.y, self.shelf_height);
+        if x + w > self.width {
             // Advance to a new shelf.
-            self.x = 0;
-            self.y += self.shelf_height + 1;
-            self.shelf_height = 0;
+            x = 0;
+            y += shelf_height + 1;
+            shelf_height = 0;
         }
-        if self.y + h > self.height {
+        if y + h > self.height {
             return None;
         }
-        let pos = (self.x, self.y);
-        self.x += w + 1;
-        self.shelf_height = self.shelf_height.max(h);
-        Some(pos)
+        self.x = x + w + 1;
+        self.y = y;
+        self.shelf_height = shelf_height.max(h);
+        Some((x, y))
     }
 }
 
@@ -95,6 +98,9 @@ pub struct GlyphAtlas {
     size: u32,
     packer: ShelfPacker,
     cache: HashMap<GlyphKey, GlyphEntry>,
+    /// Whether a full atlas may still evict-and-repack this frame. One reset
+    /// per frame bounds the work when the visible glyph set exceeds capacity.
+    reset_allowed: bool,
 }
 
 impl GlyphAtlas {
@@ -122,6 +128,7 @@ impl GlyphAtlas {
             size,
             packer: ShelfPacker::new(size, size),
             cache: HashMap::new(),
+            reset_allowed: true,
         }
     }
 
@@ -133,9 +140,24 @@ impl GlyphAtlas {
         self.cache.get(&key).copied()
     }
 
+    /// Re-arm the once-per-frame eviction. Call at the start of each frame.
+    pub fn begin_frame(&mut self) {
+        self.reset_allowed = true;
+    }
+
+    /// Cache a rasterization failure as an empty entry so it isn't retried —
+    /// a retry re-maps and re-parses the font file every frame for every
+    /// visible occurrence of the glyph.
+    pub fn insert_failed(&mut self, key: GlyphKey) -> GlyphEntry {
+        let entry = GlyphEntry::empty(0, 0, false);
+        self.cache.insert(key, entry);
+        entry
+    }
+
     /// Upload a rasterized glyph and cache its placement. Idempotent per key.
-    /// If the atlas is full, the glyph is cached as empty (skipped) so we don't
-    /// retry every frame.
+    /// When the atlas is full, all cached glyphs are evicted (at most once per
+    /// frame) so live glyphs re-pack on demand instead of newly seen
+    /// characters rendering as permanently invisible cells.
     pub fn insert(
         &mut self,
         queue: &wgpu::Queue,
@@ -146,9 +168,24 @@ impl GlyphAtlas {
             return *entry;
         }
 
-        let entry = if glyph.width == 0 || glyph.height == 0 {
-            GlyphEntry::empty(glyph.left, glyph.top, glyph.is_color)
-        } else if let Some((x, y)) = self.packer.alloc(glyph.width, glyph.height) {
+        let slot = if glyph.width == 0 || glyph.height == 0 {
+            None
+        } else {
+            let mut slot = self.packer.alloc(glyph.width, glyph.height);
+            if slot.is_none() && self.reset_allowed {
+                self.reset_allowed = false;
+                self.packer = ShelfPacker::new(self.size, self.size);
+                self.cache.clear();
+                eprintln!(
+                    "glyph atlas full ({0}x{0}); evicting all cached glyphs",
+                    self.size
+                );
+                slot = self.packer.alloc(glyph.width, glyph.height);
+            }
+            slot
+        };
+
+        let entry = if let Some((x, y)) = slot {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.texture,
@@ -219,5 +256,15 @@ mod tests {
         let mut p = ShelfPacker::new(16, 16);
         assert!(p.alloc(17, 4).is_none());
         assert!(p.alloc(4, 17).is_none());
+    }
+
+    #[test]
+    fn failed_alloc_keeps_open_shelf_usable() {
+        let mut p = ShelfPacker::new(20, 25);
+        assert_eq!(p.alloc(10, 20), Some((0, 0)));
+        // Doesn't fit horizontally, and the new shelf fails the height check:
+        // the open shelf must not be abandoned.
+        assert!(p.alloc(15, 20).is_none());
+        assert_eq!(p.alloc(8, 20), Some((11, 0)));
     }
 }

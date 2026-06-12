@@ -103,10 +103,27 @@ impl GpuContext {
         } else {
             CompositeAlphaMode::Opaque
         };
+        // Bgra8UnormSrgb is universal on Metal/DX12/desktop Vulkan, but GL/GLES
+        // fallbacks may only expose Rgba8UnormSrgb; configuring an unsupported
+        // format is a validation panic, so pick from what the surface offers.
+        let format = if capabilities
+            .formats
+            .contains(&TextureFormat::Bgra8UnormSrgb)
+        {
+            TextureFormat::Bgra8UnormSrgb
+        } else {
+            capabilities
+                .formats
+                .iter()
+                .copied()
+                .find(|format| format.is_srgb())
+                .or_else(|| capabilities.formats.first().copied())
+                .ok_or_else(|| "surface reports no supported texture formats".to_string())?
+        };
         let surface_config = SurfaceConfiguration {
             // COPY_SRC lets the backdrop-blur pass snapshot the rendered frame.
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            format: TextureFormat::Bgra8UnormSrgb,
+            format,
             width: physical.width.max(1),
             height: physical.height.max(1),
             present_mode: PresentMode::Fifo,
@@ -180,11 +197,16 @@ impl GpuContext {
                 return PresentStatus::RetrySoon;
             }
             wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface = self
-                    .instance
-                    .create_surface(self.window.clone())
-                    .expect("recreate surface");
-                self.surface.configure(&self.device, &self.surface_config);
+                // Lost usually accompanies a GPU/driver reset — the worst
+                // moment to assume surface creation succeeds. Keep the old
+                // surface on failure and retry on the next attempt.
+                match self.instance.create_surface(self.window.clone()) {
+                    Ok(surface) => {
+                        self.surface = surface;
+                        self.surface.configure(&self.device, &self.surface_config);
+                    }
+                    Err(error) => eprintln!("failed to recreate lost surface: {error}"),
+                }
                 return PresentStatus::RetrySoon;
             }
             wgpu::CurrentSurfaceTexture::Validation => {

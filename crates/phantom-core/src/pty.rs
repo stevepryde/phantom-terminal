@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -12,6 +13,15 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 
 const MAX_LIVE_PTY_SESSIONS: usize = 256;
+
+/// Input is forwarded to a per-session writer thread in chunks of this size
+/// through a queue of [`WRITE_QUEUE_CHUNKS`] entries, bounding buffered input
+/// to ~1 MB per session. PTY master writes block when the child stops reading
+/// (suspended job, `Ctrl+S` flow control), so they must never run on the UI
+/// thread; when the queue fills, [`PtyManager::write`] fails instead of
+/// blocking.
+const WRITE_CHUNK_BYTES: usize = 4096;
+const WRITE_QUEUE_CHUNKS: usize = 256;
 
 /// Consumer of a PTY session's output.
 ///
@@ -53,7 +63,7 @@ pub struct LaunchOpts {
 
 struct PtySession {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    write_tx: SyncSender<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
 }
@@ -75,6 +85,7 @@ pub struct PtyManager {
     next_id: AtomicU32,
     live_sessions: Arc<AtomicUsize>,
     max_sessions: usize,
+    reaper_tx: SyncSender<PtySession>,
 }
 
 impl Default for PtyManager {
@@ -84,8 +95,26 @@ impl Default for PtyManager {
             next_id: AtomicU32::new(0),
             live_sessions: Arc::new(AtomicUsize::new(0)),
             max_sessions: MAX_LIVE_PTY_SESSIONS,
+            reaper_tx: spawn_reaper(),
         }
     }
+}
+
+/// One thread that kills and reaps sessions handed off by [`PtyManager::kill`],
+/// keeping the SIGHUP grace sleep and the `wait()` off the UI thread. If the
+/// thread can't be spawned, the dangling sender makes every `try_send` fail and
+/// `kill` falls back to inline kill+reap.
+fn spawn_reaper() -> SyncSender<PtySession> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<PtySession>(64);
+    let _ = std::thread::Builder::new()
+        .name("pty-reaper".to_string())
+        .spawn(move || {
+            while let Ok(mut s) = rx.recv() {
+                let _ = s.child.kill();
+                let _ = s.child.wait();
+            }
+        });
+    tx
 }
 
 impl PtyManager {
@@ -153,18 +182,38 @@ impl PtyManager {
             .master
             .try_clone_reader()
             .map_err(|e| AppError::Pty(format!("clone reader failed: {e}")))?;
-        let writer = pair
+        let mut writer = pair
             .master
             .take_writer()
             .map_err(|e| AppError::Pty(format!("take writer failed: {e}")))?;
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
+        // Writer pump: the PTY master blocks when the child stops reading, so
+        // all writes happen here, off the UI thread. The thread exits when the
+        // session (and with it `write_tx`) is dropped, or when a write fails
+        // (EIO after the child dies).
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_CHUNKS);
+        std::thread::Builder::new()
+            .name(format!("pty-writer-{id}"))
+            .spawn(move || {
+                while let Ok(data) = write_rx.recv() {
+                    if writer
+                        .write_all(&data)
+                        .and_then(|_| writer.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| AppError::Pty(format!("writer thread failed: {e}")))?;
+
         self.lock().insert(
             id,
             PtySession {
                 master: pair.master,
-                writer,
+                write_tx,
                 child,
                 pid,
             },
@@ -188,19 +237,24 @@ impl PtyManager {
                     }
                 }
                 sink.on_eof();
-                // Shell exited or pipe closed: drop the session.
-                let removed = sessions
+                // Shell exited or pipe closed: drop the session. Bind before
+                // the `if let` so the map lock is released first, then reap —
+                // dropping a Child never calls wait(), and an unreaped child
+                // is a zombie for the rest of the app's lifetime.
+                let session = sessions
                     .lock()
                     .expect("pty sessions mutex poisoned")
-                    .remove(&id)
-                    .is_some();
-                if removed {
+                    .remove(&id);
+                if let Some(mut s) = session {
                     live_sessions.fetch_sub(1, Ordering::AcqRel);
+                    let _ = s.child.wait();
                 }
             })
             .map_err(|e| {
-                if let Some(mut s) = self.lock().remove(&id) {
+                let session = self.lock().remove(&id);
+                if let Some(mut s) = session {
                     let _ = s.child.kill();
+                    let _ = s.child.wait();
                 }
                 AppError::Pty(format!("reader thread failed: {e}"))
             })?;
@@ -209,13 +263,23 @@ impl PtyManager {
         Ok(id)
     }
 
+    /// Queue `data` for the session's writer thread. Fails fast instead of
+    /// blocking when the child has stopped reading input and the queue is full.
     pub fn write(&self, id: u32, data: &[u8]) -> AppResult<()> {
-        let mut sessions = self.lock();
-        let s = sessions
-            .get_mut(&id)
-            .ok_or_else(|| AppError::Pty("no such pty".to_string()))?;
-        s.writer.write_all(data)?;
-        s.writer.flush()?;
+        let tx = self
+            .lock()
+            .get(&id)
+            .ok_or_else(|| AppError::Pty("no such pty".to_string()))?
+            .write_tx
+            .clone();
+        for chunk in data.chunks(WRITE_CHUNK_BYTES) {
+            tx.try_send(chunk.to_vec()).map_err(|e| match e {
+                TrySendError::Full(_) => {
+                    AppError::Pty("terminal is not accepting input".to_string())
+                }
+                TrySendError::Disconnected(_) => AppError::Pty("no such pty".to_string()),
+            })?;
+        }
         Ok(())
     }
 
@@ -235,9 +299,23 @@ impl PtyManager {
     }
 
     pub fn kill(&self, id: u32) -> AppResult<()> {
-        if let Some(mut s) = self.lock().remove(&id) {
-            let _ = s.child.kill();
+        // Bind before destructuring: in edition 2021 the `if let` scrutinee
+        // temporary (the MutexGuard) would otherwise live across the kill.
+        let session = self.lock().remove(&id);
+        if let Some(s) = session {
             self.live_sessions.fetch_sub(1, Ordering::AcqRel);
+            // portable-pty's kill() sleeps through a SIGHUP grace period
+            // (~250 ms) before SIGKILL, and the child must be reaped after —
+            // hand both to the reaper thread instead of the calling (UI)
+            // thread. try_send returns the session on failure, so the
+            // fallback (a brief stall, better than a leak) kills inline.
+            if let Err(error) = self.reaper_tx.try_send(s) {
+                let mut s = match error {
+                    TrySendError::Full(s) | TrySendError::Disconnected(s) => s,
+                };
+                let _ = s.child.kill();
+                let _ = s.child.wait();
+            }
         }
         Ok(())
     }
@@ -631,6 +709,59 @@ mod tests {
         assert_eq!(error, "pty error: too many terminals");
         drop(reservation);
         assert!(manager.reserve_session().is_ok());
+    }
+
+    #[cfg(unix)]
+    struct EofFlag(Arc<AtomicUsize>);
+
+    #[cfg(unix)]
+    impl PtySink for EofFlag {
+        fn on_bytes(&mut self, _bytes: &[u8]) -> bool {
+            true
+        }
+        fn on_eof(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// A shell that exits on its own must be reaped (no zombie left behind).
+    /// Signal 0 succeeds for zombies, so it only starts failing with ESRCH
+    /// once the child has been wait()ed on.
+    #[test]
+    #[cfg(unix)]
+    fn natural_exit_reaps_child() {
+        let manager = PtyManager::new();
+        let eof = Arc::new(AtomicUsize::new(0));
+        let id = manager
+            .spawn(
+                LaunchOpts {
+                    command: Some("/bin/sh".to_string()),
+                    args: vec!["-c".to_string(), "exit 0".to_string()],
+                    cwd: None,
+                    rows: 24,
+                    cols: 80,
+                },
+                EofFlag(Arc::clone(&eof)),
+            )
+            .expect("spawn shell");
+        let pid = {
+            let sessions = manager.lock();
+            sessions.get(&id).and_then(|s| s.pid).expect("child pid")
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reaped = loop {
+            let eof_seen = eof.load(Ordering::Acquire) > 0;
+            let gone = unsafe { libc::kill(pid as libc::c_int, 0) } == -1;
+            if eof_seen && gone {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(reaped, "child {pid} was not reaped after natural exit");
     }
 
     #[test]

@@ -21,6 +21,26 @@ const MAX_KEYBINDING_FIELD_LEN: usize = 128;
 const OLD_DEFAULT_SELECTION: &str = "#33415580";
 const DEFAULT_SELECTION: &str = "#ffffff24";
 const DEFAULT_UI_THEME: &str = "phantom";
+
+/// All selectable UI theme names, in display order. The single source of
+/// truth: `validate()` checks against this list and the app's theme picker
+/// and palette commands render from it.
+pub const UI_THEMES: &[&str] = &[
+    "phantom",
+    "aurora",
+    "ember",
+    "cobalt",
+    "verdant",
+    "violet",
+    "amethyst",
+    "ultraviolet",
+    "sapphire",
+    "glacier",
+    "lagoon",
+    "emerald",
+    "jade",
+    "silver",
+];
 const DEFAULT_TERMINAL_BACKGROUND: &str = "phantom";
 const MAX_TERMINAL_BACKGROUND_OPACITY: u8 = 60;
 const DEFAULT_TERMINAL_BACKGROUND_OPACITY: u8 = 24;
@@ -152,7 +172,9 @@ impl ShellProfile {
     fn validate(&self) -> AppResult<()> {
         validate_nonempty("shell profile id", &self.id)?;
         validate_len("shell profile id", &self.id, MAX_ID_LEN)?;
+        validate_no_nul("shell profile id", &self.id)?;
         validate_len("shell profile name", &self.name, MAX_NAME_LEN)?;
+        validate_no_nul("shell profile name", &self.name)?;
         validate_len("shell profile command", &self.command, MAX_COMMAND_LEN)?;
         if self.args.len() > MAX_ARGS_PER_PROFILE {
             return Err(AppError::InvalidConfig(format!(
@@ -257,15 +279,11 @@ impl AppConfig {
                 ));
             }
         }
-        match self.ui_theme.as_str() {
-            "phantom" | "aurora" | "ember" | "cobalt" | "verdant" | "violet" | "amethyst"
-            | "ultraviolet" | "sapphire" | "glacier" | "lagoon" | "emerald" | "jade" | "silver" => {
-            }
-            _ => {
-                return Err(AppError::InvalidConfig(
-                    "ui theme must be one of: phantom, aurora, ember, cobalt, verdant, violet, amethyst, ultraviolet, sapphire, glacier, lagoon, emerald, jade, silver".to_string(),
-                ));
-            }
+        if !UI_THEMES.contains(&self.ui_theme.as_str()) {
+            return Err(AppError::InvalidConfig(format!(
+                "ui theme must be one of: {}",
+                UI_THEMES.join(", ")
+            )));
         }
         match self.terminal_background.as_str() {
             "none" | "phantom" | "dragon" => {}

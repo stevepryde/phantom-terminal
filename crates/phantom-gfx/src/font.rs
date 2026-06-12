@@ -116,14 +116,18 @@ pub struct FontSet {
 impl FontSet {
     /// Load the family at `size_px` (already scaled for HiDPI) with the given
     /// line-height multiplier.
-    pub fn new(family: &str, size_px: f32, line_height: f32) -> Self {
+    ///
+    /// Fallible because it runs not only at startup but on every renderer
+    /// rebuild (font settings change, monitor scale change): a corrupt font
+    /// file mid-session must surface as an error, not a panic.
+    pub fn new(family: &str, size_px: f32, line_height: f32) -> Result<Self, String> {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
 
         let mut faces = Vec::new();
         let regular_id =
             resolve_primary_face(&db, family, fontdb::Weight::NORMAL, fontdb::Style::Normal)
-                .expect("no usable font found on this system");
+                .ok_or_else(|| "no usable font found on this system".to_string())?;
         let regular = push_face(&mut faces, regular_id);
         let bold = resolve_primary_face(&db, family, fontdb::Weight::BOLD, fontdb::Style::Normal)
             .map(|id| push_face(&mut faces, id))
@@ -138,19 +142,40 @@ impl FontSet {
                 .unwrap_or(bold);
 
         let fallback_order = fallback_faces(&db, &mut faces, family);
-        let metrics = metrics_for_face(&db, faces[regular].id, size_px, line_height)
-            .expect("regular face failed to parse");
+        let mut primary = [regular, bold, italic, bold_italic];
+        let metrics = match metrics_for_face(&db, faces[regular].id, size_px, line_height) {
+            Some(metrics) => metrics,
+            None => {
+                // The picked face exists but fails to parse (corrupt file):
+                // fall back to the first installed face that does parse, and
+                // point any style slot that resolved to the broken face at it.
+                let (id, metrics) = db
+                    .faces()
+                    .find_map(|face| {
+                        metrics_for_face(&db, face.id, size_px, line_height)
+                            .map(|metrics| (face.id, metrics))
+                    })
+                    .ok_or_else(|| "no installed font face could be parsed".to_string())?;
+                let parsed = push_face(&mut faces, id);
+                for slot in &mut primary {
+                    if *slot == regular {
+                        *slot = parsed;
+                    }
+                }
+                metrics
+            }
+        };
 
-        Self {
+        Ok(Self {
             db,
             faces,
-            primary: [regular, bold, italic, bold_italic],
+            primary,
             fallback_order,
             px: size_px,
             metrics,
             ctx: ScaleContext::new(),
             glyphs: HashMap::new(),
-        }
+        })
     }
 
     pub fn metrics(&self) -> FontMetrics {
@@ -166,17 +191,20 @@ impl FontSet {
             return *glyph;
         }
 
-        let mut candidates = Vec::with_capacity(self.fallback_order.len() + 2);
-        push_unique(&mut candidates, self.primary[slot]);
-        if self.primary[slot] != self.primary[REGULAR] {
-            push_unique(&mut candidates, self.primary[REGULAR]);
-        }
-        for face in &self.fallback_order {
-            push_unique(&mut candidates, *face);
-        }
-
-        let resolved = candidates
-            .into_iter()
+        // `fallback_order` is already deduplicated, so only the two primary
+        // faces need skipping — no per-push `contains` scan (which made the
+        // first resolution of an uncovered codepoint O(faces²) on systems
+        // with many installed fonts).
+        let primary_slot = self.primary[slot];
+        let primary_regular = self.primary[REGULAR];
+        let resolved = std::iter::once(primary_slot)
+            .chain((primary_slot != primary_regular).then_some(primary_regular))
+            .chain(
+                self.fallback_order
+                    .iter()
+                    .copied()
+                    .filter(|&face| face != primary_slot && face != primary_regular),
+            )
             .find_map(|face| self.glyph_in_face(face, ch));
         self.glyphs.insert((slot, ch), resolved);
         resolved
@@ -467,7 +495,7 @@ mod tests {
 
     #[test]
     fn resolves_ascii_to_real_glyph() {
-        let mut fonts = FontSet::new("monospace", 14.0, 1.2);
+        let mut fonts = FontSet::new("monospace", 14.0, 1.2).expect("load fonts");
 
         let glyph = fonts
             .resolve_glyph(REGULAR, '>')
@@ -480,7 +508,7 @@ mod tests {
 
     #[test]
     fn resolved_glyphs_never_return_notdef() {
-        let mut fonts = FontSet::new("monospace", 14.0, 1.2);
+        let mut fonts = FontSet::new("monospace", 14.0, 1.2).expect("load fonts");
 
         for ch in ['>', '\u{276f}', '\u{e0b0}', '\u{1f680}', '\u{10fffd}'] {
             if let Some(glyph) = fonts.resolve_glyph(REGULAR, ch) {
@@ -491,7 +519,7 @@ mod tests {
 
     #[test]
     fn starship_symbols_resolve_when_installed() {
-        let mut fonts = FontSet::new("monospace", 14.0, 1.2);
+        let mut fonts = FontSet::new("monospace", 14.0, 1.2).expect("load fonts");
 
         // Starship/Nerd Font prompts commonly use one or more of these. This is
         // optional because a clean CI image may not have Nerd Fonts installed.

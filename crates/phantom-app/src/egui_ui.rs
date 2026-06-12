@@ -15,7 +15,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::gpu::{BlurRegion, FrameOverlay};
-use crate::keybindings::parse_combo;
+use crate::keybindings::{parse_combo, Combo, ComboKey};
 use crate::palette::{PaletteAction, PaletteState};
 use crate::themes;
 
@@ -85,6 +85,10 @@ pub struct UiState {
     panel_width_px: f32,
     font_families: Vec<String>,
     notice: Option<String>,
+    /// An edited-but-invalid settings draft, kept so the user can type through
+    /// invalid intermediate states. Only a draft that passes
+    /// `AppConfig::validate()` is committed to the live config.
+    settings_draft: Option<AppConfig>,
     /// Rects (egui points) of panels drawn translucent this frame, whose
     /// backdrop should be frosted. Rebuilt every `draw`.
     blur_regions: Vec<egui::Rect>,
@@ -98,6 +102,7 @@ impl UiState {
             panel_width_px: 0.0,
             font_families: font_families_with_current(&config.font_family),
             notice: None,
+            settings_draft: None,
             blur_regions: Vec::new(),
         }
     }
@@ -110,6 +115,7 @@ impl UiState {
         self.active_panel = Some(PanelKind::Settings);
         self.font_families = font_families_with_current(&config.font_family);
         self.notice = None;
+        self.settings_draft = None;
     }
 
     pub fn toggle_settings(&mut self, config: &AppConfig) {
@@ -124,6 +130,7 @@ impl UiState {
         self.active_panel = None;
         self.panel_width_px = 0.0;
         self.notice = None;
+        self.settings_draft = None;
     }
 
     pub fn settings_open(&self) -> bool {
@@ -140,7 +147,14 @@ impl UiState {
         self.blur_regions.clear();
         let alpha = panel_alpha(config.panel_opacity);
         let transparent = config.panel_opacity < 100;
-        if !palette.open && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+        // Escape is also egui's "release focus" key for text fields: only
+        // close the panel when no widget holds keyboard focus, so escaping
+        // out of a keybinding edit doesn't take the whole panel with it.
+        let widget_focused = ui.ctx().memory(|memory| memory.focused().is_some());
+        if !palette.open
+            && !widget_focused
+            && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape))
+        {
             self.close_panel();
         }
 
@@ -160,7 +174,12 @@ impl UiState {
         } else {
             self.panel_width_px = 0.0;
         }
-        let palette = command_palette_overlay(ui.ctx(), palette, alpha);
+        let toggle_combo = config
+            .keybindings
+            .iter()
+            .find(|kb| kb.action == "palette.toggle")
+            .and_then(|kb| parse_combo(&kb.keys));
+        let palette = command_palette_overlay(ui.ctx(), palette, alpha, toggle_combo.as_ref());
         outcome.palette_action = palette.action;
         if transparent {
             if let Some(rect) = palette.rect {
@@ -172,6 +191,11 @@ impl UiState {
 
     fn settings_panel(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
         let mut changed = false;
+        // Widgets edit a draft, not the live config: a value is only applied
+        // (and persisted) once the whole draft round-trips through
+        // `AppConfig::validate()`. An invalid draft is kept across frames so
+        // the user can type through invalid intermediate states.
+        let mut draft = self.settings_draft.take().unwrap_or_else(|| config.clone());
 
         ui.horizontal(|ui| {
             ui.heading("Settings");
@@ -200,18 +224,41 @@ impl UiState {
                 egui::vec2(ui.available_width(), ui.available_height()),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    changed |= self.settings_content(ui, config);
+                    changed |= self.settings_content(ui, &mut draft);
                 },
             );
         });
 
-        if changed {
-            match config.validate() {
-                Ok(()) => self.notice = None,
-                Err(error) => self.notice = Some(error.to_string()),
+        // Core bounds validation plus the app-level rule that every binding
+        // parses to a usable combo (core can't know the combo grammar).
+        let validation = draft.validate().map_err(|e| e.to_string()).and_then(|()| {
+            match draft
+                .keybindings
+                .iter()
+                .find(|kb| parse_combo(&kb.keys).is_none())
+            {
+                Some(bad) => Err(format!(
+                    "keybinding '{}' is not a valid key combination \
+                     (letter keys need Cmd/Ctrl/Alt)",
+                    bad.keys
+                )),
+                None => Ok(()),
+            }
+        });
+        match validation {
+            Ok(()) => {
+                self.notice = None;
+                if changed {
+                    *config = draft;
+                    return true;
+                }
+            }
+            Err(error) => {
+                self.notice = Some(error);
+                self.settings_draft = Some(draft);
             }
         }
-        changed
+        false
     }
 
     fn settings_nav(&mut self, ui: &mut Ui) {
@@ -370,6 +417,8 @@ pub struct EguiLayer {
     textures_delta: egui::TexturesDelta,
     screen: ScreenDescriptor,
     blur_regions: Vec<BlurRegion>,
+    /// egui's requested repaint delay from the last `run` (`MAX` = idle).
+    repaint_delay: std::time::Duration,
 }
 
 impl EguiLayer {
@@ -396,6 +445,7 @@ impl EguiLayer {
                 pixels_per_point: window.scale_factor() as f32,
             },
             blur_regions: Vec::new(),
+            repaint_delay: std::time::Duration::MAX,
         }
     }
 
@@ -436,7 +486,21 @@ impl EguiLayer {
             .ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
         self.textures_delta.append(full_output.textures_delta);
+        // egui's requested repaint (caret blink, animations) — `Duration::MAX`
+        // when idle. The app folds this into its wake-up deadline; dropping it
+        // would freeze egui animations between window events.
+        self.repaint_delay = full_output
+            .viewport_output
+            .values()
+            .map(|viewport| viewport.repaint_delay)
+            .min()
+            .unwrap_or(std::time::Duration::MAX);
         outcome
+    }
+
+    /// How soon egui wants to be repainted after the last `run`.
+    pub fn repaint_delay(&self) -> std::time::Duration {
+        self.repaint_delay
     }
 
     fn prepare_inner(
@@ -677,7 +741,12 @@ struct PaletteOverlay {
     rect: Option<egui::Rect>,
 }
 
-fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState, alpha: u8) -> PaletteOverlay {
+fn command_palette_overlay(
+    ctx: &Context,
+    palette: &mut PaletteState,
+    alpha: u8,
+    toggle_combo: Option<&Combo>,
+) -> PaletteOverlay {
     if !palette.open {
         return PaletteOverlay::default();
     }
@@ -685,9 +754,13 @@ fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState, alpha: u8)
     let mut action = None;
     let mut close = false;
     ctx.input(|input| {
-        if input.key_pressed(EguiKey::Escape)
-            || (input.modifiers.command && input.key_pressed(EguiKey::K))
-        {
+        // The configured `palette.toggle` chord closes an open palette, so a
+        // rebound shortcut keeps working both ways. Escape always closes.
+        let chord_close = match toggle_combo {
+            Some(combo) => combo_matches_egui_input(input, combo),
+            None => input.modifiers.command && input.key_pressed(EguiKey::K),
+        };
+        if input.key_pressed(EguiKey::Escape) || chord_close {
             close = true;
         }
         if input.key_pressed(EguiKey::ArrowDown) {
@@ -774,12 +847,64 @@ fn command_palette_overlay(ctx: &Context, palette: &mut PaletteState, alpha: u8)
             frame.response.rect
         });
 
+    // A click on the dimmed backdrop (outside the palette frame) dismisses it,
+    // matching every other overlay convention.
+    let clicked_backdrop = ctx.input(|input| {
+        input.pointer.primary_pressed()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|pos| !area.inner.contains(pos))
+    });
+    if clicked_backdrop {
+        palette.close();
+        return PaletteOverlay::default();
+    }
+
     if action.is_some() {
         palette.close();
     }
     PaletteOverlay {
         action,
         rect: Some(area.inner),
+    }
+}
+
+/// Whether the parsed config combo is pressed in this egui frame. egui's
+/// `command` modifier already means Cmd on macOS / Ctrl elsewhere, matching
+/// `Combo::primary`; `Combo::ctrl` is the literal Ctrl key (macOS only).
+fn combo_matches_egui_input(input: &egui::InputState, combo: &Combo) -> bool {
+    let Some(key) = egui_key_for_combo(&combo.key) else {
+        return false;
+    };
+    if !input.key_pressed(key) {
+        return false;
+    }
+    let mods = input.modifiers;
+    (!combo.primary || mods.command)
+        && (!combo.ctrl || mods.ctrl)
+        && (!combo.alt || mods.alt)
+        && (!combo.shift || mods.shift)
+}
+
+fn egui_key_for_combo(key: &ComboKey) -> Option<EguiKey> {
+    match key {
+        // Letters/digits register under their uppercase name; punctuation
+        // under its symbol.
+        ComboKey::Char(c) => EguiKey::from_name(&c.to_ascii_uppercase().to_string())
+            .or_else(|| EguiKey::from_name(&c.to_string())),
+        // Named keys are stored lowercase ("escape", "f2"); egui uses
+        // capitalized names ("Escape", "F2").
+        ComboKey::Named(name) => {
+            let mut chars = name.chars();
+            let capitalized: String = chars
+                .next()
+                .map(|c| c.to_ascii_uppercase())
+                .into_iter()
+                .chain(chars)
+                .collect();
+            EguiKey::from_name(&capitalized).or_else(|| EguiKey::from_name(name))
+        }
     }
 }
 

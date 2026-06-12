@@ -1821,6 +1821,7 @@ dependencies = [
  "png 0.17.16",
  "pollster",
  "swash",
+ "unicode-width",
  "wgpu",
 ]
 
