@@ -20,7 +20,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRe
 phantom-core = { version = "0.1.2", path = "crates/phantom-core" }
 phantom-emu = { version = "0.1.2", path = "crates/phantom-emu" }
 phantom-gfx = { version = "0.1.2", path = "crates/phantom-gfx" }
-png = "0.17"
+png = "0.18"
 pollster = "0.4.0"
 portable-pty = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
