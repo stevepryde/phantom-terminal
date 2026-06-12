@@ -1,24 +1,9 @@
 //! UI theme accents. The terminal ANSI palette comes from `config.theme`; the
 //! `ui_theme` name selects the chrome accent colour (tab underline, highlights).
-//! These names mirror the validated set in `AppConfig::validate`.
+//! The name list lives in `phantom-core` so the validated set and the picker
+//! can never drift apart.
 
-/// All selectable UI theme names, in display order.
-pub const UI_THEMES: &[&str] = &[
-    "phantom",
-    "aurora",
-    "ember",
-    "cobalt",
-    "verdant",
-    "violet",
-    "amethyst",
-    "ultraviolet",
-    "sapphire",
-    "glacier",
-    "lagoon",
-    "emerald",
-    "jade",
-    "silver",
-];
+pub use phantom_core::UI_THEMES;
 
 /// Accent colour (sRGBA) for a UI theme name, falling back to the phantom accent.
 pub fn ui_theme_accent(name: &str) -> [u8; 4] {
@@ -40,4 +25,23 @@ pub fn ui_theme_accent(name: &str) -> [u8; 4] {
         _ => [0xb4, 0x78, 0xff],
     };
     [rgb[0], rgb[1], rgb[2], 255]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches adding a theme to `phantom_core::UI_THEMES` without giving it
+    /// an accent here (it would silently render with the fallback colour).
+    #[test]
+    fn every_ui_theme_has_a_dedicated_accent() {
+        let fallback = ui_theme_accent("definitely-not-a-theme");
+        for name in UI_THEMES.iter().filter(|name| **name != "phantom") {
+            assert_ne!(
+                ui_theme_accent(name),
+                fallback,
+                "theme {name} falls back to the default accent"
+            );
+        }
+    }
 }

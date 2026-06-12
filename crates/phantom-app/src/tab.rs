@@ -1,5 +1,7 @@
 //! A single terminal tab: its VT model, PTY id, and display metadata.
 
+use std::borrow::Cow;
+
 use phantom_emu::{AlacrittyCore, VtCore};
 
 pub struct Tab {
@@ -69,6 +71,13 @@ impl Tab {
 struct StartupBlankLineFilter {
     done: bool,
     pending: Vec<u8>,
+    /// Bytes of post-decision output still eligible for the repaint-LF strip.
+    /// The erase-then-LF of a prompt repaint can arrive in a chunk after the
+    /// startup scan already flushed, but the same byte pattern also occurs in
+    /// ordinary output (progress bars, pagers), so the strip must not run for
+    /// the tab's lifetime: it stops after one strip or once this budget is
+    /// spent.
+    strip_budget: usize,
 }
 
 impl StartupBlankLineFilter {
@@ -78,37 +87,57 @@ impl StartupBlankLineFilter {
         Self {
             done: false,
             pending: Vec::new(),
+            strip_budget: Self::MAX_PENDING,
         }
     }
 
     fn arm(&mut self) {
         self.done = false;
         self.pending.clear();
+        self.strip_budget = Self::MAX_PENDING;
     }
 
-    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+    fn filter<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
         if self.done {
-            return strip_repaint_blank_line(bytes);
+            if self.strip_budget == 0 {
+                return Cow::Borrowed(bytes);
+            }
+            return match strip_repaint_blank_line(bytes) {
+                Some(stripped) => {
+                    self.strip_budget = 0;
+                    Cow::Owned(stripped)
+                }
+                None => {
+                    self.strip_budget = self.strip_budget.saturating_sub(bytes.len());
+                    Cow::Borrowed(bytes)
+                }
+            };
         }
 
         self.pending.extend_from_slice(bytes);
         match scan_startup_bytes(&self.pending) {
-            StartupScan::NeedMore if self.pending.len() <= Self::MAX_PENDING => Vec::new(),
+            StartupScan::NeedMore if self.pending.len() <= Self::MAX_PENDING => {
+                Cow::Owned(Vec::new())
+            }
             StartupScan::Strip { start, end } => {
                 self.done = true;
+                self.strip_budget = 0;
                 let mut out = std::mem::take(&mut self.pending);
                 out.drain(start..end);
-                out
+                Cow::Owned(out)
             }
             StartupScan::Keep | StartupScan::NeedMore => {
                 self.done = true;
-                std::mem::take(&mut self.pending)
+                Cow::Owned(std::mem::take(&mut self.pending))
             }
         }
     }
 }
 
-fn strip_repaint_blank_line(bytes: &[u8]) -> Vec<u8> {
+/// Remove the first LF that follows an erase with no visible text in between
+/// (the blank spacer line of a prompt repaint). Returns `None` when nothing
+/// was stripped so the caller can pass the chunk through without copying.
+fn strip_repaint_blank_line(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut index = 0;
     let mut saw_erase = false;
     let mut saw_visible_since_erase = false;
@@ -117,7 +146,7 @@ fn strip_repaint_blank_line(bytes: &[u8]) -> Vec<u8> {
             b'\n' if saw_erase && !saw_visible_since_erase => {
                 let mut out = bytes.to_vec();
                 out.remove(index);
-                return out;
+                return Some(out);
             }
             b'\n' => {
                 saw_erase = false;
@@ -132,7 +161,7 @@ fn strip_repaint_blank_line(bytes: &[u8]) -> Vec<u8> {
                     }
                     index = escape.next;
                 }
-                None => return bytes.to_vec(),
+                None => return None,
             },
             b' ' | b'\t' | b'\r' => index += 1,
             0x00..=0x1f | 0x7f => index += 1,
@@ -144,7 +173,7 @@ fn strip_repaint_blank_line(bytes: &[u8]) -> Vec<u8> {
             }
         }
     }
-    bytes.to_vec()
+    None
 }
 
 enum StartupScan {
@@ -184,7 +213,14 @@ fn scan_startup_bytes(bytes: &[u8]) -> StartupScan {
             }
         }
     }
-    StartupScan::NeedMore
+    // Visible content with no erase pending is a prompt that simply has no
+    // newline (plain `bash-5.2$ `): flush it rather than withholding output —
+    // the repaint-LF strip window covers an erase arriving in a later chunk.
+    if saw_visible && !saw_erase {
+        StartupScan::Keep
+    } else {
+        StartupScan::NeedMore
+    }
 }
 
 struct EscapeSkip {
@@ -249,8 +285,46 @@ mod tests {
     fn strips_initial_lf_before_prompt_text() {
         let mut filter = StartupBlankLineFilter::new();
 
-        assert_eq!(filter.filter(b"\nprompt"), b"prompt");
-        assert_eq!(filter.filter(b"\nnext prompt"), b"\nnext prompt");
+        assert_eq!(&filter.filter(b"\nprompt")[..], b"prompt");
+        assert_eq!(&filter.filter(b"\nnext prompt")[..], b"\nnext prompt");
+    }
+
+    #[test]
+    fn newline_less_prompt_flushes_immediately() {
+        let mut filter = StartupBlankLineFilter::new();
+
+        // A plain prompt has no LF; withholding it would leave the tab blank
+        // (and swallow keystroke echoes) until the user presses Enter.
+        assert_eq!(&filter.filter(b"bash-5.2$ ")[..], b"bash-5.2$ ");
+        assert_eq!(&filter.filter(b"l")[..], b"l");
+    }
+
+    #[test]
+    fn steady_state_output_keeps_erase_newlines() {
+        let mut filter = StartupBlankLineFilter::new();
+        assert_eq!(&filter.filter(b"prompt")[..], b"prompt");
+
+        // Spend the post-startup strip window on ordinary output...
+        let bulk = vec![b'x'; StartupBlankLineFilter::MAX_PENDING + 1];
+        assert_eq!(&filter.filter(&bulk)[..], &bulk[..]);
+
+        // ...after which a progress bar's clear-to-EOL + newline must survive.
+        let progress = b"50%\x1b[K\r\ndone\r\n";
+        assert_eq!(&filter.filter(progress)[..], progress);
+    }
+
+    #[test]
+    fn repaint_strip_applies_once_after_rearm() {
+        let mut filter = StartupBlankLineFilter::new();
+        assert_eq!(&filter.filter(b"prompt")[..], b"prompt");
+
+        filter.arm();
+        // Visible output first (flushed), then the repaint's erase + LF in a
+        // later chunk: the spacer LF is stripped exactly once.
+        assert_eq!(&filter.filter(b"prompt")[..], b"prompt");
+        assert_eq!(&filter.filter(b"\x1b[J\r\nprompt")[..], b"\x1b[J\rprompt");
+        let again = b"\x1b[J\r\nprompt";
+        assert_eq!(&filter.filter(again)[..], again);
     }
 
     #[test]
@@ -279,7 +353,7 @@ mod tests {
         let mut filter = StartupBlankLineFilter::new();
 
         assert_eq!(
-            filter.filter(b"\x1b[?2004h\x1b]0;title\x07\r\nprompt"),
+            &filter.filter(b"\x1b[?2004h\x1b]0;title\x07\r\nprompt")[..],
             b"\x1b[?2004h\x1b]0;title\x07\rprompt"
         );
     }
@@ -288,14 +362,14 @@ mod tests {
     fn keeps_output_that_starts_with_visible_text() {
         let mut filter = StartupBlankLineFilter::new();
 
-        assert_eq!(filter.filter(b"motd\nprompt"), b"motd\nprompt");
+        assert_eq!(&filter.filter(b"motd\nprompt")[..], b"motd\nprompt");
     }
 
     #[test]
     fn strips_initial_lf_after_prompt_leading_whitespace() {
         let mut filter = StartupBlankLineFilter::new();
 
-        assert_eq!(filter.filter(b" \r\nprompt"), b" \rprompt");
+        assert_eq!(&filter.filter(b" \r\nprompt")[..], b" \rprompt");
     }
 
     #[test]
@@ -303,7 +377,7 @@ mod tests {
         let mut filter = StartupBlankLineFilter::new();
 
         assert!(filter.filter(b"\x1b[").is_empty());
-        assert_eq!(filter.filter(b"?2004h\nprompt"), b"\x1b[?2004hprompt");
+        assert_eq!(&filter.filter(b"?2004h\nprompt")[..], b"\x1b[?2004hprompt");
     }
 
     #[test]

@@ -285,6 +285,14 @@ impl BlurPass {
         if regions.is_empty() {
             return;
         }
+        // The vertical pass samples up to `reach` pixels outside each region, so
+        // the horizontal pass must populate that margin in the temp texture.
+        let reach = (BLUR_STRIDE_PX * (TAP_COUNT - 1) as f32).ceil() as u32;
+        // All regions degenerate (clamped to zero size): nothing to frost —
+        // skip the snapshot copy and both passes entirely.
+        let Some(bounds) = union_bounds(regions, width, height, reach) else {
+            return;
+        };
         self.ensure_sized(device, queue, width, height);
         let sized = self
             .sized
@@ -311,11 +319,6 @@ impl BlurPass {
                 depth_or_array_layers: 1,
             },
         );
-
-        // The vertical pass samples up to `reach` pixels outside each region, so
-        // the horizontal pass must populate that margin in the temp texture.
-        let reach = (BLUR_STRIDE_PX * (TAP_COUNT - 1) as f32).ceil() as u32;
-        let bounds = union_bounds(regions, sized.width, sized.height, reach);
 
         // Horizontal pass: copy_tex -> tmp, limited to the (expanded) bounds.
         {
@@ -399,32 +402,36 @@ fn clamp_rect(region: &BlurRegion, width: u32, height: u32) -> (u32, u32, u32, u
     (x, y, w, h)
 }
 
-/// Bounding box of all regions, expanded by `reach` and clamped to the surface.
+/// Bounding box of all regions, expanded by `reach` and clamped to the
+/// surface. `None` when every region clamps to zero size (nothing to blur).
 fn union_bounds(
     regions: &[BlurRegion],
     width: u32,
     height: u32,
     reach: u32,
-) -> (u32, u32, u32, u32) {
+) -> Option<(u32, u32, u32, u32)> {
     let mut min_x = width;
     let mut min_y = height;
     let mut max_x = 0u32;
     let mut max_y = 0u32;
     for region in regions {
         let (x, y, w, h) = clamp_rect(region, width, height);
+        if w == 0 || h == 0 {
+            continue;
+        }
         min_x = min_x.min(x);
         min_y = min_y.min(y);
         max_x = max_x.max(x + w);
         max_y = max_y.max(y + h);
     }
     if max_x <= min_x || max_y <= min_y {
-        return (0, 0, width, height);
+        return None;
     }
     let min_x = min_x.saturating_sub(reach);
     let min_y = min_y.saturating_sub(reach);
     let max_x = (max_x + reach).min(width);
     let max_y = (max_y + reach).min(height);
-    (min_x, min_y, max_x - min_x, max_y - min_y)
+    Some((min_x, min_y, max_x - min_x, max_y - min_y))
 }
 
 #[cfg(test)]
@@ -452,11 +459,24 @@ mod tests {
         let bounds = union_bounds(&regions, 1000, 600, 20);
         // x: 900-20=880, y: 100-20=80, right: min(1000, 1000+20)=1000 -> w=120,
         // bottom: 200+20=220 -> h=220-80=140
-        assert_eq!(bounds, (880, 80, 120, 140));
+        assert_eq!(bounds, Some((880, 80, 120, 140)));
     }
 
     #[test]
-    fn union_bounds_falls_back_to_full_surface_when_empty() {
-        assert_eq!(union_bounds(&[], 800, 480, 10), (0, 0, 800, 480));
+    fn union_bounds_is_none_when_nothing_to_blur() {
+        // No regions, and regions that clamp to zero size, both mean the
+        // whole blur pass can be skipped.
+        assert_eq!(union_bounds(&[], 800, 480, 10), None);
+        assert_eq!(union_bounds(&[region(800, 0, 50, 50)], 800, 480, 10), None);
+        assert_eq!(union_bounds(&[region(10, 10, 0, 50)], 800, 480, 10), None);
+    }
+
+    #[test]
+    fn union_bounds_ignores_degenerate_regions_in_a_mix() {
+        let regions = [region(10, 10, 0, 50), region(100, 100, 50, 50)];
+        assert_eq!(
+            union_bounds(&regions, 800, 480, 0),
+            Some((100, 100, 50, 50))
+        );
     }
 }

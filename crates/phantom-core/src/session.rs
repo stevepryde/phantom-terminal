@@ -71,6 +71,10 @@ impl SessionStore {
         }
         let conn = Connection::open(&path)?;
         restrict_db_permissions(&path);
+        // Two running instances share this WAL database; without a busy
+        // timeout a concurrent write returns SQLITE_BUSY immediately and the
+        // save fails with a user-visible notice.
+        conn.busy_timeout(std::time::Duration::from_millis(2000))?;
         migrate(&conn)?;
         restrict_db_permissions(&path);
         Ok(Self {

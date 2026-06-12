@@ -15,7 +15,7 @@ pub mod pty;
 pub mod session;
 pub mod spawn;
 
-pub use config::{AppConfig, Keybinding, ShellProfile, Theme};
+pub use config::{AppConfig, Keybinding, ShellProfile, Theme, UI_THEMES};
 pub use error::{AppError, AppResult};
 pub use launch::{LaunchContext, LaunchState};
 pub use pty::{LaunchOpts, PtyManager, PtySink, SpawnOpts};

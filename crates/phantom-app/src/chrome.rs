@@ -39,9 +39,52 @@ pub struct Rect {
 }
 
 impl Rect {
+    pub const EMPTY: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+    };
+
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
+
+    /// Overlap of two rects; `None` when they don't intersect.
+    pub fn intersect(&self, other: Rect) -> Option<Rect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.w).min(other.x + other.w);
+        let y1 = (self.y + self.h).min(other.y + other.h);
+        (x1 > x0 && y1 > y0).then_some(Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        })
+    }
+}
+
+/// Clamp a strip scroll offset to its content, optionally adjusting it so the
+/// `ensure` span (content coordinates) is fully visible. Returns the adjusted
+/// scroll and the maximum scroll.
+fn strip_scroll(
+    content: f32,
+    viewport: f32,
+    scroll: f32,
+    ensure: Option<(f32, f32)>,
+) -> (f32, f32) {
+    let max_scroll = (content - viewport).max(0.0);
+    let mut scroll = scroll.clamp(0.0, max_scroll);
+    if let Some((lo, hi)) = ensure {
+        if lo < scroll {
+            scroll = lo;
+        } else if hi > scroll + viewport {
+            scroll = hi - viewport;
+        }
+        scroll = scroll.clamp(0.0, max_scroll);
+    }
+    (scroll, max_scroll)
 }
 
 fn px(layout: &Layout, value: f32) -> f32 {
@@ -221,14 +264,17 @@ pub fn terminal_scrollbar_hit_track(layout: &Layout) -> Rect {
     }
 }
 
-pub fn scrollbar_thumb(track: Rect, scroll: ScrollState) -> Option<Rect> {
+pub fn scrollbar_thumb(track: Rect, scroll: ScrollState, scale_factor: f32) -> Option<Rect> {
     if !scroll.is_scrollable() || track.h <= 0.0 {
         return None;
     }
 
     let content_rows = scroll.history + scroll.viewport_rows;
     let visible_fraction = scroll.viewport_rows as f32 / content_rows.max(1) as f32;
-    let thumb_h = (track.h * visible_fraction).clamp(SCROLLBAR_MIN_THUMB_H.min(track.h), track.h);
+    // The minimum grab size is a logical dimension like every other chrome
+    // metric, so scale it to physical px before clamping.
+    let min_thumb_h = (SCROLLBAR_MIN_THUMB_H * scale_factor.max(0.1)).min(track.h);
+    let thumb_h = (track.h * visible_fraction).clamp(min_thumb_h, track.h);
     let travel = (track.h - thumb_h).max(0.0);
     let from_top = if scroll.history == 0 {
         0.0
@@ -245,7 +291,11 @@ pub fn scrollbar_thumb(track: Rect, scroll: ScrollState) -> Option<Rect> {
 }
 
 pub fn terminal_scrollbar_hit_thumb(layout: &Layout, scroll: ScrollState) -> Option<Rect> {
-    scrollbar_thumb(terminal_scrollbar_hit_track(layout), scroll)
+    scrollbar_thumb(
+        terminal_scrollbar_hit_track(layout),
+        scroll,
+        layout.scale_factor,
+    )
 }
 
 pub fn draw_terminal_scrollbar(
@@ -260,7 +310,7 @@ pub fn draw_terminal_scrollbar(
     } else {
         terminal_scrollbar_track(layout)
     };
-    let Some(thumb) = scrollbar_thumb(track, scroll) else {
+    let Some(thumb) = scrollbar_thumb(track, scroll, layout.scale_factor) else {
         return;
     };
     let scrollbar_w = px(layout, SCROLLBAR_W);
@@ -340,11 +390,21 @@ pub struct TabBarHits {
     pub settings: Rect,
     pub titlebar: Option<Rect>,
     pub window_controls: Vec<WindowControlHit>,
+    /// Visible region of the (scrollable) tab strip.
+    pub tab_strip: Rect,
+    /// The scroll offset actually applied this frame (clamped, and adjusted
+    /// when a tab was scrolled into view). The app stores this back.
+    pub tab_scroll: f32,
+    /// Maximum scroll offset; zero when every tab fits.
+    pub max_tab_scroll: f32,
 }
 
 struct HorizontalTabLayout {
     rects: Vec<Rect>,
     new_tab: Rect,
+    strip: Rect,
+    scroll: f32,
+    max_scroll: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -514,12 +574,16 @@ impl TabBarHits {
                 return tab.index;
             }
         }
-        self.tabs.len()
+        // Past every visible tab: drop after the last visible one. With a
+        // scrolled strip the hits hold real indices, so `tabs.len()` would be
+        // wrong (it counts only visible tabs).
+        self.tabs.last().map(|tab| tab.index + 1).unwrap_or(0)
     }
 }
 
 /// Draw the tab bar and return click regions. `titles` and `active` describe the
-/// open tabs.
+/// open tabs. `tab_scroll` is the strip scroll offset from the previous frame
+/// (clamped here); `scroll_into_view` scrolls that tab fully into the strip.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_tab_bar(
     r: &mut Renderer,
@@ -533,6 +597,8 @@ pub fn draw_tab_bar(
     ephemeral: bool,
     animations: &ChromeAnimationState,
     drag_indicator: Option<DragIndicator>,
+    tab_scroll: f32,
+    scroll_into_view: Option<usize>,
 ) -> TabBarHits {
     let bar = layout.bar;
     draw_chrome_surfaces(r, layout, colors);
@@ -552,10 +618,28 @@ pub fn draw_tab_bar(
         };
         let ephemeral_indicator =
             ephemeral.then_some(ephemeral_indicator_rect_for_layout(layout, settings));
-        let HorizontalTabLayout { rects, new_tab } =
-            horizontal_tab_layout(layout, settings, titles.len(), ephemeral);
+        let HorizontalTabLayout {
+            rects,
+            new_tab,
+            strip,
+            scroll,
+            max_scroll,
+        } = horizontal_tab_layout(
+            layout,
+            settings,
+            titles.len(),
+            ephemeral,
+            tab_scroll,
+            scroll_into_view,
+        );
         let mut tabs = Vec::with_capacity(rects.len());
+        // Scrolled tabs are clipped to the strip: partially visible tabs draw
+        // their visible part only, and fully hidden tabs draw (and hit) nothing.
+        r.set_clip(strip.x, strip.y, strip.w, strip.h);
         for (i, rect) in rects.iter().copied().enumerate() {
+            let Some(visible) = rect.intersect(strip) else {
+                continue;
+            };
             let title = &titles[i];
             let editing = if i == active { rename } else { None };
             let dragging = drag_indicator.is_some_and(|drag| drag.source == i);
@@ -592,10 +676,11 @@ pub fn draw_tab_bar(
             draw_close_button(r, queue, close, colors, close_hover);
             tabs.push(TabHit {
                 index: i,
-                rect,
-                close,
+                rect: visible,
+                close: close.intersect(strip).unwrap_or(Rect::EMPTY),
             });
         }
+        r.clear_clip();
         draw_new_tab_button(r, queue, new_tab, colors);
         if let Some(rect) = ephemeral_indicator {
             draw_ephemeral_indicator(r, rect, colors);
@@ -608,6 +693,9 @@ pub fn draw_tab_bar(
             settings,
             titlebar,
             window_controls,
+            tab_strip: strip,
+            tab_scroll: scroll,
+            max_tab_scroll: max_scroll,
         };
         draw_drop_indicator(
             r,
@@ -651,14 +739,32 @@ pub fn draw_tab_bar(
             );
             draw_window_controls(r, queue, window_controls.as_slice(), colors);
         }
+        // Rows live in a vertically scrollable strip below the header row; the
+        // "+ new tab" row scrolls with them.
+        let strip = Rect {
+            x: bar.x,
+            y: bar.y + row_h,
+            w: bar.w,
+            h: (bar.h - row_h).max(0.0),
+        };
+        let content_h = row_h * (titles.len() + 1) as f32;
+        let ensure = scroll_into_view
+            .filter(|i| *i < titles.len())
+            .map(|i| (i as f32 * row_h, (i + 1) as f32 * row_h));
+        let (scroll, max_scroll) = strip_scroll(content_h, strip.h, tab_scroll, ensure);
         let mut tabs = Vec::with_capacity(titles.len());
-        let mut y = bar.y + row_h;
+        let mut y = strip.y - scroll;
+        r.set_clip(strip.x, strip.y, strip.w, strip.h);
         for (i, title) in titles.iter().enumerate() {
             let rect = Rect {
                 x: bar.x,
                 y,
                 w: bar.w,
                 h: row_h,
+            };
+            y += row_h;
+            let Some(visible) = rect.intersect(strip) else {
+                continue;
             };
             let editing = if i == active { rename } else { None };
             let dragging = drag_indicator.is_some_and(|drag| drag.source == i);
@@ -695,10 +801,9 @@ pub fn draw_tab_bar(
             draw_close_button(r, queue, close, colors, close_hover);
             tabs.push(TabHit {
                 index: i,
-                rect,
-                close,
+                rect: visible,
+                close: close.intersect(strip).unwrap_or(Rect::EMPTY),
             });
-            y += row_h;
         }
         let new_tab = Rect {
             x: bar.x,
@@ -713,6 +818,7 @@ pub fn draw_tab_bar(
             "+ new tab",
             colors.dim_text,
         );
+        r.clear_clip();
         if !layout.custom_chrome {
             if let Some(rect) = ephemeral_indicator {
                 draw_ephemeral_indicator(r, rect, colors);
@@ -721,10 +827,13 @@ pub fn draw_tab_bar(
         }
         let hits = TabBarHits {
             tabs,
-            new_tab,
+            new_tab: new_tab.intersect(strip).unwrap_or(Rect::EMPTY),
             settings,
             titlebar,
             window_controls,
+            tab_strip: strip,
+            tab_scroll: scroll,
+            max_tab_scroll: max_scroll,
         };
         draw_drop_indicator(
             r,
@@ -745,9 +854,25 @@ fn horizontal_tab_rects(
     y: f32,
     h: f32,
 ) -> Vec<Rect> {
-    horizontal_tab_rects_with_widths(tab_count, tab_start, tab_limit, y, h, TAB_W, MIN_TAB_W)
+    horizontal_tab_rects_with_widths(tab_count, tab_start, tab_limit, y, h, TAB_W, MIN_TAB_W, 0.0)
 }
 
+/// One tab's width when `tab_count` tabs share `available` px: the default
+/// width while there is room, shrinking down to `min_tab_w` when crowded.
+/// Below that the strip scrolls instead of shrinking further.
+fn horizontal_tab_width(
+    tab_count: usize,
+    available: f32,
+    default_tab_w: f32,
+    min_tab_w: f32,
+) -> f32 {
+    if tab_count == 0 || default_tab_w * tab_count as f32 <= available {
+        return default_tab_w;
+    }
+    (available / tab_count as f32).clamp(min_tab_w, default_tab_w)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn horizontal_tab_rects_with_widths(
     tab_count: usize,
     tab_start: f32,
@@ -756,27 +881,20 @@ fn horizontal_tab_rects_with_widths(
     h: f32,
     default_tab_w: f32,
     min_tab_w: f32,
+    scroll: f32,
 ) -> Vec<Rect> {
-    if tab_count == 0 {
-        return Vec::new();
-    }
     let available = (tab_limit - tab_start).max(0.0);
-    let default_total = default_tab_w * tab_count as f32;
-    let tab_w = if default_total <= available {
-        default_tab_w
-    } else {
-        (available / tab_count as f32).clamp(min_tab_w, default_tab_w)
-    };
-    let mut tabs = Vec::with_capacity(tab_count);
-    let mut x = tab_start;
-    for _ in 0..tab_count {
-        if x + tab_w > tab_limit + f32::EPSILON {
-            break;
-        }
-        tabs.push(Rect { x, y, w: tab_w, h });
-        x += tab_w;
-    }
-    tabs
+    let tab_w = horizontal_tab_width(tab_count, available, default_tab_w, min_tab_w);
+    // Every tab gets a rect; tabs scrolled out of the strip are culled (and
+    // partially visible ones clipped) by the caller.
+    (0..tab_count)
+        .map(|i| Rect {
+            x: tab_start + i as f32 * tab_w - scroll,
+            y,
+            w: tab_w,
+            h,
+        })
+        .collect()
 }
 
 fn horizontal_tab_layout(
@@ -784,6 +902,8 @@ fn horizontal_tab_layout(
     settings: Rect,
     tab_count: usize,
     ephemeral: bool,
+    scroll: f32,
+    scroll_into_view: Option<usize>,
 ) -> HorizontalTabLayout {
     let bar = layout.bar;
     let drag_handle_w = custom_tab_drag_handle_w(layout);
@@ -792,6 +912,17 @@ fn horizontal_tab_layout(
     let new_tab_w = px(layout, NEW_TAB_W);
     let new_tab_limit = (settings.x - status_w - new_tab_w).max(tab_start);
     let tab_limit = new_tab_limit;
+    let available = (tab_limit - tab_start).max(0.0);
+    let tab_w = horizontal_tab_width(
+        tab_count,
+        available,
+        px(layout, TAB_W),
+        px(layout, MIN_TAB_W),
+    );
+    let ensure = scroll_into_view
+        .filter(|i| *i < tab_count)
+        .map(|i| (i as f32 * tab_w, (i + 1) as f32 * tab_w));
+    let (scroll, max_scroll) = strip_scroll(tab_w * tab_count as f32, available, scroll, ensure);
     let rects = horizontal_tab_rects_with_widths(
         tab_count,
         tab_start,
@@ -800,6 +931,7 @@ fn horizontal_tab_layout(
         bar.h,
         px(layout, TAB_W),
         px(layout, MIN_TAB_W),
+        scroll,
     );
     let tab_end = rects
         .last()
@@ -811,8 +943,20 @@ fn horizontal_tab_layout(
         w: new_tab_w,
         h: bar.h,
     };
+    let strip = Rect {
+        x: tab_start,
+        y: bar.y,
+        w: available,
+        h: bar.h,
+    };
 
-    HorizontalTabLayout { rects, new_tab }
+    HorizontalTabLayout {
+        rects,
+        new_tab,
+        strip,
+        scroll,
+        max_scroll,
+    }
 }
 
 fn custom_tab_drag_handle_w(layout: &Layout) -> f32 {
@@ -1455,6 +1599,9 @@ mod tests {
             },
             titlebar: None,
             window_controls: Vec::new(),
+            tab_strip: Rect::EMPTY,
+            tab_scroll: 0.0,
+            max_tab_scroll: 0.0,
         }
     }
 
@@ -1479,6 +1626,9 @@ mod tests {
             },
             titlebar: None,
             window_controls: Vec::new(),
+            tab_strip: Rect::EMPTY,
+            tab_scroll: 0.0,
+            max_tab_scroll: 0.0,
         }
     }
 
@@ -1569,7 +1719,7 @@ mod tests {
         let scale = 2.0;
         let layout = compute_layout_scaled(1600.0, 1200.0, 40.0, true, WindowChrome::Custom, scale);
         let settings = titlebar_settings_rect(layout.titlebar.unwrap(), &layout);
-        let strip = horizontal_tab_layout(&layout, settings, 1, false);
+        let strip = horizontal_tab_layout(&layout, settings, 1, false, 0.0, None);
 
         assert!(strip.rects[0].x >= MAC_TRAFFIC_LIGHT_SPACE * scale);
     }
@@ -1608,6 +1758,9 @@ mod tests {
             settings: titlebar_settings_rect(layout.titlebar.unwrap(), &layout),
             titlebar: layout.titlebar,
             window_controls: controls,
+            tab_strip: Rect::EMPTY,
+            tab_scroll: 0.0,
+            max_tab_scroll: 0.0,
         };
 
         assert_eq!(
@@ -1633,6 +1786,9 @@ mod tests {
             settings,
             titlebar: layout.titlebar,
             window_controls: window_control_hits(&layout),
+            tab_strip: Rect::EMPTY,
+            tab_scroll: 0.0,
+            max_tab_scroll: 0.0,
         };
 
         assert_eq!(indicator.x + indicator.w, settings.x);
@@ -1656,6 +1812,9 @@ mod tests {
             settings: titlebar_settings_rect(layout.titlebar.unwrap(), &layout),
             titlebar: layout.titlebar,
             window_controls: window_control_hits(&layout),
+            tab_strip: Rect::EMPTY,
+            tab_scroll: 0.0,
+            max_tab_scroll: 0.0,
         };
 
         assert_eq!(hits.tab_body_at(tab_body_x, tab_body_y), Some(0));
@@ -1666,27 +1825,31 @@ mod tests {
     fn custom_horizontal_tabs_use_status_slot_drag_handle_when_crowded() {
         let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
         let settings = titlebar_settings_rect(layout.titlebar.unwrap(), &layout);
-        let normal_strip = horizontal_tab_layout(&layout, settings, 50, false);
-        let ephemeral_strip = horizontal_tab_layout(&layout, settings, 50, true);
+        let normal_strip = horizontal_tab_layout(&layout, settings, 50, false, 0.0, None);
+        let ephemeral_strip = horizontal_tab_layout(&layout, settings, 50, true, 0.0, None);
         assert_eq!(normal_strip.new_tab, ephemeral_strip.new_tab);
 
         let strip = normal_strip;
         let first_tab = strip.rects.first().copied().expect("visible tab");
-        let last_tab = strip.rects.last().copied().expect("visible tab");
+        // Mirror production: only tabs intersecting the strip become hits.
         let tabs = strip
             .rects
             .iter()
             .copied()
             .enumerate()
-            .map(|(index, rect)| TabHit {
-                index,
-                rect,
-                close: Rect {
-                    x: rect.x + rect.w - CLOSE_W - PAD * 0.5,
-                    y: rect.y,
-                    w: CLOSE_W,
-                    h: rect.h,
-                },
+            .filter_map(|(index, rect)| {
+                rect.intersect(strip.strip).map(|visible| TabHit {
+                    index,
+                    rect: visible,
+                    close: Rect {
+                        x: rect.x + rect.w - CLOSE_W - PAD * 0.5,
+                        y: rect.y,
+                        w: CLOSE_W,
+                        h: rect.h,
+                    }
+                    .intersect(strip.strip)
+                    .unwrap_or(Rect::EMPTY),
+                })
             })
             .collect();
         let hits = TabBarHits {
@@ -1695,6 +1858,9 @@ mod tests {
             settings,
             titlebar: layout.titlebar,
             window_controls: window_control_hits(&layout),
+            tab_strip: strip.strip,
+            tab_scroll: strip.scroll,
+            max_tab_scroll: strip.max_scroll,
         };
         let y = layout.bar.y + layout.bar.h * 0.5;
         let left_handle_x = first_tab.x - CUSTOM_TAB_DRAG_HANDLE_W * 0.5;
@@ -1703,12 +1869,71 @@ mod tests {
         assert!(
             first_tab.x - layout.bar.x >= custom_left_reserved(&layout) + CUSTOM_TAB_DRAG_HANDLE_W
         );
-        assert_eq!(strip.new_tab.x, last_tab.x + last_tab.w);
+        // 50 tabs overflow: the strip scrolls, tabs fill it edge to edge, and
+        // the new-tab button is pinned at the strip's right end.
+        assert!(strip.max_scroll > 0.0);
+        assert_eq!(strip.new_tab.x, strip.strip.x + strip.strip.w);
         assert!(settings.x - (strip.new_tab.x + strip.new_tab.w) >= EPHEMERAL_W);
         assert!(hits.titlebar_drag_region_contains(left_handle_x, y));
         assert!(hits.titlebar_drag_region_contains(status_slot_x, y));
         assert!(!hits.titlebar_drag_region_contains(first_tab.x + 1.0, y));
         assert!(!hits.titlebar_drag_region_contains(strip.new_tab.x + 1.0, y));
+    }
+
+    #[test]
+    fn crowded_horizontal_tabs_scroll_instead_of_disappearing() {
+        let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::System);
+        let settings = Rect {
+            x: 760.0,
+            y: layout.bar.y,
+            w: 34.0,
+            h: layout.bar.h,
+        };
+
+        let at_start = horizontal_tab_layout(&layout, settings, 40, false, 0.0, None);
+        assert_eq!(at_start.rects.len(), 40, "every tab gets a rect");
+        assert!(at_start.max_scroll > 0.0);
+        assert_eq!(at_start.scroll, 0.0);
+        assert_eq!(
+            at_start.rects[0].w, MIN_TAB_W,
+            "crowded tabs stop at min width"
+        );
+
+        // Scrolling shifts every rect left; an absurd offset clamps to max.
+        let scrolled = horizontal_tab_layout(&layout, settings, 40, false, 1e9, None);
+        assert_eq!(scrolled.scroll, scrolled.max_scroll);
+        assert_eq!(
+            scrolled.rects[0].x,
+            at_start.rects[0].x - scrolled.max_scroll
+        );
+
+        // Scrolling the last tab into view places its right edge at the strip's.
+        let into_view = horizontal_tab_layout(&layout, settings, 40, false, 0.0, Some(39));
+        let last = into_view.rects[39];
+        assert!((last.x + last.w - (into_view.strip.x + into_view.strip.w)).abs() < 0.5);
+        assert_eq!(into_view.scroll, into_view.max_scroll);
+
+        // And scrolling the first tab back pins the strip to the start.
+        let back = horizontal_tab_layout(&layout, settings, 40, false, 1e9, Some(0));
+        assert_eq!(back.scroll, 0.0);
+    }
+
+    #[test]
+    fn strip_scroll_clamps_and_ensures_visibility() {
+        // Content fits: never scrolls.
+        assert_eq!(strip_scroll(100.0, 200.0, 50.0, None), (0.0, 0.0));
+        // Clamped to max.
+        assert_eq!(strip_scroll(300.0, 200.0, 500.0, None), (100.0, 100.0));
+        // Ensure below the viewport scrolls forward just enough.
+        assert_eq!(
+            strip_scroll(300.0, 200.0, 0.0, Some((250.0, 280.0))),
+            (80.0, 100.0)
+        );
+        // Ensure above the viewport scrolls back to the span start.
+        assert_eq!(
+            strip_scroll(300.0, 200.0, 90.0, Some((10.0, 40.0))),
+            (10.0, 100.0)
+        );
     }
 
     #[test]
@@ -1740,6 +1965,7 @@ mod tests {
                 history: 100,
                 viewport_rows: 25,
             },
+            1.0,
         )
         .unwrap();
         let at_top = scrollbar_thumb(
@@ -1749,12 +1975,33 @@ mod tests {
                 history: 100,
                 viewport_rows: 25,
             },
+            1.0,
         )
         .unwrap();
 
         assert_eq!(at_bottom.y + at_bottom.h, track.y + track.h);
         assert_eq!(at_top.y, track.y);
         assert_eq!(at_bottom.h, at_top.h);
+    }
+
+    #[test]
+    fn scrollbar_min_thumb_scales_with_dpi() {
+        let track = Rect {
+            x: 90.0,
+            y: 0.0,
+            w: 4.0,
+            h: 1000.0,
+        };
+        // A tiny visible fraction forces the minimum-height clamp.
+        let scroll = ScrollState {
+            offset: 0,
+            history: 1_000_000,
+            viewport_rows: 1,
+        };
+        let at_1x = scrollbar_thumb(track, scroll, 1.0).unwrap();
+        let at_2x = scrollbar_thumb(track, scroll, 2.0).unwrap();
+        assert_eq!(at_1x.h, SCROLLBAR_MIN_THUMB_H);
+        assert_eq!(at_2x.h, SCROLLBAR_MIN_THUMB_H * 2.0);
     }
 
     #[test]
@@ -1772,6 +2019,7 @@ mod tests {
                 history: 0,
                 viewport_rows: 25,
             },
+            1.0,
         )
         .is_none());
     }
@@ -1806,6 +2054,9 @@ mod tests {
             },
             titlebar: None,
             window_controls: Vec::new(),
+            tab_strip: Rect::EMPTY,
+            tab_scroll: 0.0,
+            max_tab_scroll: 0.0,
         };
 
         assert_eq!(hits.hover_target(10.0, 10.0), ChromeHoverTarget::Tab(0));
