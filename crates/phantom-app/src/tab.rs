@@ -1,7 +1,5 @@
 //! A single terminal tab: its VT model, PTY id, and display metadata.
 
-use std::borrow::Cow;
-
 use phantom_emu::{AlacrittyCore, VtCore};
 
 pub struct Tab {
@@ -16,7 +14,6 @@ pub struct Tab {
     pub cwd: String,
     /// Profile this tab was launched with; persisted for faithful restore.
     pub profile_id: Option<String>,
-    startup_blank_line: StartupBlankLineFilter,
 }
 
 impl Tab {
@@ -34,20 +31,20 @@ impl Tab {
             custom_title: String::new(),
             cwd,
             profile_id,
-            startup_blank_line: StartupBlankLineFilter::new(),
         }
     }
 
-    /// Feed PTY bytes into the terminal model.
+    /// Feed PTY bytes into the terminal model verbatim.
+    ///
+    /// The byte stream is passed straight to the VT core with no rewriting. A
+    /// terminal emulator must be a faithful sink: mutating the stream (e.g. to
+    /// hide a prompt's cosmetic leading blank line) desyncs the cursor model of
+    /// any program that redraws in place with erase-then-newline sequences
+    /// (`inquire`/`fzf` menus, docker/build progress), garbling their output.
     pub fn advance_pty(&mut self, bytes: &[u8]) {
-        let bytes = self.startup_blank_line.filter(bytes);
         if !bytes.is_empty() {
-            self.core.advance(&bytes);
+            self.core.advance(bytes);
         }
-    }
-
-    pub fn expect_prompt_repaint(&mut self) {
-        self.startup_blank_line.arm();
     }
 
     /// The label shown on the tab: the custom title if set, else the cwd
@@ -64,372 +61,54 @@ impl Tab {
     }
 }
 
-/// Starship and similar prompts can intentionally start with a newline so
-/// repeated prompts have breathing room. At the very start of a fresh tab that
-/// spacer becomes a stored empty first scrollback row, so remove exactly one
-/// initial LF before prompt content has reached the first terminal line.
-struct StartupBlankLineFilter {
-    done: bool,
-    pending: Vec<u8>,
-    /// Bytes of post-decision output still eligible for the repaint-LF strip.
-    /// The erase-then-LF of a prompt repaint can arrive in a chunk after the
-    /// startup scan already flushed, but the same byte pattern also occurs in
-    /// ordinary output (progress bars, pagers), so the strip must not run for
-    /// the tab's lifetime: it stops after one strip or once this budget is
-    /// spent.
-    strip_budget: usize,
-}
-
-impl StartupBlankLineFilter {
-    const MAX_PENDING: usize = 4096;
-
-    fn new() -> Self {
-        Self {
-            done: false,
-            pending: Vec::new(),
-            strip_budget: Self::MAX_PENDING,
-        }
-    }
-
-    fn arm(&mut self) {
-        self.done = false;
-        self.pending.clear();
-        self.strip_budget = Self::MAX_PENDING;
-    }
-
-    fn filter<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
-        if self.done {
-            if self.strip_budget == 0 {
-                return Cow::Borrowed(bytes);
-            }
-            return match strip_repaint_blank_line(bytes) {
-                Some(stripped) => {
-                    self.strip_budget = 0;
-                    Cow::Owned(stripped)
-                }
-                None => {
-                    self.strip_budget = self.strip_budget.saturating_sub(bytes.len());
-                    Cow::Borrowed(bytes)
-                }
-            };
-        }
-
-        self.pending.extend_from_slice(bytes);
-        match scan_startup_bytes(&self.pending) {
-            StartupScan::NeedMore if self.pending.len() <= Self::MAX_PENDING => {
-                Cow::Owned(Vec::new())
-            }
-            StartupScan::Strip { start, end } => {
-                self.done = true;
-                self.strip_budget = 0;
-                let mut out = std::mem::take(&mut self.pending);
-                out.drain(start..end);
-                Cow::Owned(out)
-            }
-            StartupScan::Keep | StartupScan::NeedMore => {
-                self.done = true;
-                Cow::Owned(std::mem::take(&mut self.pending))
-            }
-        }
-    }
-}
-
-/// Remove the first LF that follows an erase with no visible text in between
-/// (the blank spacer line of a prompt repaint). Returns `None` when nothing
-/// was stripped so the caller can pass the chunk through without copying.
-fn strip_repaint_blank_line(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut index = 0;
-    let mut saw_erase = false;
-    let mut saw_visible_since_erase = false;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\n' if saw_erase && !saw_visible_since_erase => {
-                let mut out = bytes.to_vec();
-                out.remove(index);
-                return Some(out);
-            }
-            b'\n' => {
-                saw_erase = false;
-                saw_visible_since_erase = false;
-                index += 1;
-            }
-            0x1b => match skip_escape(bytes, index) {
-                Some(escape) => {
-                    if escape.erases_visible_content {
-                        saw_erase = true;
-                        saw_visible_since_erase = false;
-                    }
-                    index = escape.next;
-                }
-                None => return None,
-            },
-            b' ' | b'\t' | b'\r' => index += 1,
-            0x00..=0x1f | 0x7f => index += 1,
-            _ => {
-                if saw_erase {
-                    saw_visible_since_erase = true;
-                }
-                index += 1;
-            }
-        }
-    }
-    None
-}
-
-enum StartupScan {
-    NeedMore,
-    Strip { start: usize, end: usize },
-    Keep,
-}
-
-fn scan_startup_bytes(bytes: &[u8]) -> StartupScan {
-    let mut index = 0;
-    let mut saw_visible = false;
-    let mut saw_erase = false;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\n' => {
-                return if !saw_visible || saw_erase {
-                    StartupScan::Strip {
-                        start: index,
-                        end: index + 1,
-                    }
-                } else {
-                    StartupScan::Keep
-                };
-            }
-            0x1b => match skip_escape(bytes, index) {
-                Some(escape) => {
-                    saw_erase |= escape.erases_visible_content;
-                    index = escape.next;
-                }
-                None => return StartupScan::NeedMore,
-            },
-            b' ' | b'\t' => index += 1,
-            0x00..=0x1f | 0x7f => index += 1,
-            _ => {
-                saw_visible = true;
-                index += 1;
-            }
-        }
-    }
-    // Visible content with no erase pending is a prompt that simply has no
-    // newline (plain `bash-5.2$ `): flush it rather than withholding output —
-    // the repaint-LF strip window covers an erase arriving in a later chunk.
-    if saw_visible && !saw_erase {
-        StartupScan::Keep
-    } else {
-        StartupScan::NeedMore
-    }
-}
-
-struct EscapeSkip {
-    next: usize,
-    erases_visible_content: bool,
-}
-
-fn skip_escape(bytes: &[u8], start: usize) -> Option<EscapeSkip> {
-    let introducer = *bytes.get(start + 1)?;
-    match introducer {
-        b'[' => skip_csi(bytes, start + 2),
-        b']' | b'P' | b'^' | b'_' | b'X' => {
-            skip_string_escape(bytes, start + 2).map(|next| EscapeSkip {
-                next,
-                erases_visible_content: false,
-            })
-        }
-        b'(' | b')' | b'*' | b'+' => bytes.get(start + 2).map(|_| EscapeSkip {
-            next: start + 3,
-            erases_visible_content: false,
-        }),
-        _ => Some(EscapeSkip {
-            next: start + 2,
-            erases_visible_content: false,
-        }),
-    }
-}
-
-fn skip_csi(bytes: &[u8], mut index: usize) -> Option<EscapeSkip> {
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if (0x40..=0x7e).contains(&byte) {
-            return Some(EscapeSkip {
-                next: index + 1,
-                erases_visible_content: matches!(byte, b'J' | b'K'),
-            });
-        }
-        index += 1;
-    }
-    None
-}
-
-fn skip_string_escape(bytes: &[u8], mut index: usize) -> Option<usize> {
-    while index < bytes.len() {
-        if bytes[index] == 0x07 {
-            return Some(index + 1);
-        }
-        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
-            return Some(index + 2);
-        }
-        index += 1;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AlacrittyCore, StartupBlankLineFilter, Tab};
+    use super::{AlacrittyCore, Tab};
     use phantom_emu::{CursorShape, VtCore};
 
-    #[test]
-    fn strips_initial_lf_before_prompt_text() {
-        let mut filter = StartupBlankLineFilter::new();
-
-        assert_eq!(&filter.filter(b"\nprompt")[..], b"prompt");
-        assert_eq!(&filter.filter(b"\nnext prompt")[..], b"\nnext prompt");
+    fn tab(rows: u16, cols: u16) -> Tab {
+        let core = AlacrittyCore::new(rows, cols, 100, CursorShape::Block);
+        Tab::new(1, core, 7, "/tmp".to_string(), None)
     }
 
     #[test]
-    fn newline_less_prompt_flushes_immediately() {
-        let mut filter = StartupBlankLineFilter::new();
-
-        // A plain prompt has no LF; withholding it would leave the tab blank
-        // (and swallow keystroke echoes) until the user presses Enter.
-        assert_eq!(&filter.filter(b"bash-5.2$ ")[..], b"bash-5.2$ ");
-        assert_eq!(&filter.filter(b"l")[..], b"l");
+    fn pty_bytes_reach_the_grid_unmodified() {
+        let mut tab = tab(4, 20);
+        tab.advance_pty(b"hello\r\nworld");
+        assert_eq!(tab.core.snapshot().row_text(0), "hello");
+        assert_eq!(tab.core.snapshot().row_text(1), "world");
     }
 
     #[test]
-    fn steady_state_output_keeps_erase_newlines() {
-        let mut filter = StartupBlankLineFilter::new();
-        assert_eq!(&filter.filter(b"prompt")[..], b"prompt");
+    fn in_place_redraw_after_a_plain_prompt_is_not_garbled() {
+        // Regression: a plain prompt (`user@host:~$ `, no newline, no erase)
+        // must not arm any blank-line stripping. An in-place updater that walks
+        // the screen with erase-then-newline (`\x1b[K\r\n`, as docker/build
+        // progress and TUI menus do) must land on distinct rows. Previously a
+        // newline here was silently dropped, collapsing and cascading the
+        // output. The tab's output must match the raw VT core exactly.
+        let prompt = b"user@host:~$ ".as_slice();
+        let output = b"\rStep 1\x1b[K\r\nStep 2\x1b[K\r\nStep 3\x1b[K".as_slice();
 
-        // Spend the post-startup strip window on ordinary output...
-        let bulk = vec![b'x'; StartupBlankLineFilter::MAX_PENDING + 1];
-        assert_eq!(&filter.filter(&bulk)[..], &bulk[..]);
+        let mut tab = tab(6, 40);
+        tab.advance_pty(prompt);
+        tab.advance_pty(output);
+        let via_tab: Vec<String> = (0..6)
+            .map(|r| tab.core.snapshot().row_text(r).trim_end().to_string())
+            .collect();
 
-        // ...after which a progress bar's clear-to-EOL + newline must survive.
-        let progress = b"50%\x1b[K\r\ndone\r\n";
-        assert_eq!(&filter.filter(progress)[..], progress);
-    }
+        let mut raw = AlacrittyCore::new(6, 40, 100, CursorShape::Block);
+        raw.advance(prompt);
+        raw.advance(output);
+        let via_core: Vec<String> = (0..6)
+            .map(|r| raw.snapshot().row_text(r).trim_end().to_string())
+            .collect();
 
-    #[test]
-    fn repaint_strip_applies_once_after_rearm() {
-        let mut filter = StartupBlankLineFilter::new();
-        assert_eq!(&filter.filter(b"prompt")[..], b"prompt");
-
-        filter.arm();
-        // Visible output first (flushed), then the repaint's erase + LF in a
-        // later chunk: the spacer LF is stripped exactly once.
-        assert_eq!(&filter.filter(b"prompt")[..], b"prompt");
-        assert_eq!(&filter.filter(b"\x1b[J\r\nprompt")[..], b"\x1b[J\rprompt");
-        let again = b"\x1b[J\r\nprompt";
-        assert_eq!(&filter.filter(again)[..], again);
-    }
-
-    #[test]
-    fn strips_actual_starship_prompt_leading_lf() {
-        let mut filter = StartupBlankLineFilter::new();
-        let starship_prompt = b"\n%{\x1b[1;36m%}phantom-terminal%{\x1b[0m%} via %{\
-            \x1b[1;31m%}\xf0\x9f\xa5\x9f v1.3.9 %{\x1b[0m%}\n%{\x1b[1;32m%}\xe2\x9d\xaf%{\x1b[0m%} ";
-
-        assert_eq!(&filter.filter(starship_prompt)[..1], b"%");
-    }
-
-    #[test]
-    fn strips_lf_after_actual_zsh_starship_prelude() {
-        let mut filter = StartupBlankLineFilter::new();
-        let zsh_starship_start = b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m    \
-            \r \r\r\x1b[0m\x1b[27m\x1b[24m\x1b[J\r\n\x1b[1;36mphantom-terminal";
-
-        let filtered = filter.filter(zsh_starship_start);
-
-        assert!(filtered.ends_with(b"\r\x1b[1;36mphantom-terminal"));
-        assert!(!filtered.ends_with(b"\r\n\x1b[1;36mphantom-terminal"));
-    }
-
-    #[test]
-    fn strips_initial_crlf_after_escape_setup() {
-        let mut filter = StartupBlankLineFilter::new();
-
-        assert_eq!(
-            &filter.filter(b"\x1b[?2004h\x1b]0;title\x07\r\nprompt")[..],
-            b"\x1b[?2004h\x1b]0;title\x07\rprompt"
-        );
-    }
-
-    #[test]
-    fn keeps_output_that_starts_with_visible_text() {
-        let mut filter = StartupBlankLineFilter::new();
-
-        assert_eq!(&filter.filter(b"motd\nprompt")[..], b"motd\nprompt");
-    }
-
-    #[test]
-    fn strips_initial_lf_after_prompt_leading_whitespace() {
-        let mut filter = StartupBlankLineFilter::new();
-
-        assert_eq!(&filter.filter(b" \r\nprompt")[..], b" \rprompt");
-    }
-
-    #[test]
-    fn handles_escape_sequence_split_across_chunks() {
-        let mut filter = StartupBlankLineFilter::new();
-
-        assert!(filter.filter(b"\x1b[").is_empty());
-        assert_eq!(&filter.filter(b"?2004h\nprompt")[..], b"\x1b[?2004hprompt");
-    }
-
-    #[test]
-    fn stripped_startup_line_does_not_enter_scrollback() {
-        let core = AlacrittyCore::new(2, 20, 100, CursorShape::Block);
-        let mut tab = Tab::new(1, core, 7, "/tmp".to_string(), None);
-
-        tab.advance_pty(b" \r\nprompt\r\nline1\r\nline2\r\nline3");
-        tab.core.scroll_to_offset(100);
-
-        assert_ne!(tab.core.snapshot().row_text(0), "");
-    }
-
-    #[test]
-    fn actual_zsh_starship_prelude_does_not_leave_empty_scrollback_row() {
-        let core = AlacrittyCore::new(2, 40, 100, CursorShape::Block);
-        let mut tab = Tab::new(1, core, 7, "/tmp".to_string(), None);
-        let zsh_starship_start = b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m    \
-            \r \r\r\x1b[0m\x1b[27m\x1b[24m\x1b[J\r\n\x1b[1;36mphantom-terminal";
-
-        tab.advance_pty(zsh_starship_start);
-        assert_eq!(tab.core.snapshot().row_text(0), "phantom-terminal");
-
-        tab.advance_pty(b"\r\nline1\r\nline2\r\nline3");
-        tab.core.scroll_to_offset(100);
-
-        assert_ne!(tab.core.snapshot().row_text(0), "");
-    }
-
-    #[test]
-    fn resize_rearms_filter_for_starship_prompt_repaint() {
-        let core = AlacrittyCore::new(4, 40, 100, CursorShape::Block);
-        let mut tab = Tab::new(1, core, 7, "/tmp".to_string(), None);
-
-        tab.advance_pty(b"\nphantom-terminal");
-        assert_eq!(tab.core.snapshot().row_text(0), "phantom-terminal");
-
-        tab.expect_prompt_repaint();
-        tab.advance_pty(b"\r\x1b[J\r\nphantom-terminal");
-        assert_eq!(tab.core.snapshot().row_text(0), "phantom-terminal");
-    }
-
-    #[test]
-    fn resize_rearm_keeps_visible_output_before_newline() {
-        let core = AlacrittyCore::new(4, 40, 100, CursorShape::Block);
-        let mut tab = Tab::new(1, core, 7, "/tmp".to_string(), None);
-
-        tab.advance_pty(b"\nprompt");
-        tab.expect_prompt_repaint();
-        tab.advance_pty(b"build output\r\nnext");
-
-        assert_eq!(tab.core.snapshot().row_text(0), "promptbuild output");
-        assert_eq!(tab.core.snapshot().row_text(1), "next");
+        assert_eq!(via_tab, via_core);
+        // `\r` returns to column 0 and overwrites the prompt; each step then
+        // lands on its own row.
+        assert_eq!(via_tab[0], "Step 1");
+        assert_eq!(via_tab[1], "Step 2");
+        assert_eq!(via_tab[2], "Step 3");
     }
 }

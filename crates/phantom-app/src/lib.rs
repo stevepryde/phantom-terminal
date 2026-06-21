@@ -1867,9 +1867,7 @@ impl App {
     fn apply_terminal_grid(&mut self, rows: u16, cols: u16) {
         for tab in &mut self.tabs {
             tab.core.resize(rows, cols);
-            if self.pty.resize(tab.pty_id, rows, cols).is_ok() {
-                tab.expect_prompt_repaint();
-            }
+            let _ = self.pty.resize(tab.pty_id, rows, cols);
         }
         self.last_terminal_grid = Some((rows, cols));
     }
