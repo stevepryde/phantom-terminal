@@ -167,8 +167,7 @@ impl PtyManager {
         }
         // TERM advertises a capable terminal; PATH is normalized because macOS
         // GUI apps launch with a sparse environment compared with login shells.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        apply_terminal_env(&mut cmd);
         cmd.env("PATH", &env.path);
         apply_account_env(&mut cmd, account);
 
@@ -375,6 +374,20 @@ fn default_shell(account: &AccountEnv) -> String {
         .clone()
         .or_else(|| std::env::var("SHELL").ok())
         .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+/// Seed the static terminal-capability and color environment.
+///
+/// `TERM`/`COLORTERM` advertise a truecolor-capable terminal. `CLICOLOR`
+/// switches on BSD `ls` colorization (so directories render blue out of the
+/// box, the macOS equivalent of `ls -G`), and `LSCOLORS` supplies a default
+/// scheme with bold directories. These are seeded as the spawn environment, so
+/// anything the user exports from their shell rc still takes precedence.
+fn apply_terminal_env(cmd: &mut CommandBuilder) {
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("CLICOLOR", "1");
+    cmd.env("LSCOLORS", "ExFxBxDxCxegedabagacad");
 }
 
 fn apply_account_env(cmd: &mut CommandBuilder, account: &AccountEnv) {
@@ -658,6 +671,27 @@ mod tests {
             Some("/home/x"),
         );
         assert_eq!(merged, "/home/x/.local/bin:/usr/bin");
+    }
+
+    #[test]
+    fn apply_terminal_env_sets_capability_and_color_vars() {
+        let mut cmd = CommandBuilder::new("/bin/true");
+        apply_terminal_env(&mut cmd);
+
+        assert_eq!(
+            cmd.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        assert_eq!(
+            cmd.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+        // CLICOLOR enables BSD `ls` colorization (blue directories by default).
+        assert_eq!(cmd.get_env("CLICOLOR"), Some(std::ffi::OsStr::new("1")));
+        assert_eq!(
+            cmd.get_env("LSCOLORS"),
+            Some(std::ffi::OsStr::new("ExFxBxDxCxegedabagacad"))
+        );
     }
 
     #[test]
