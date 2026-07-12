@@ -46,6 +46,7 @@ const DEFAULT_TERMINAL_BACKGROUND: &str = "phantom";
 const MAX_TERMINAL_BACKGROUND_OPACITY: u8 = 60;
 const DEFAULT_TERMINAL_BACKGROUND_OPACITY: u8 = 24;
 const DEFAULT_WINDOW_CHROME: &str = "system";
+const MAX_WINDOW_DIMENSION: u32 = 16_384;
 /// Panel opacity is a percentage. Below 100 the egui panels are translucent and
 /// the renderer blurs whatever shows through behind them. The floor keeps panels
 /// legible; 100 is fully opaque and disables the backdrop blur entirely.
@@ -154,6 +155,35 @@ pub struct Keybinding {
     pub keys: String,
 }
 
+/// Last settled normal-window size in logical pixels. Logical dimensions keep
+/// the window's apparent size stable when it is restored on a display with a
+/// different scale factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl WindowSize {
+    pub fn new(width: u32, height: u32) -> Option<Self> {
+        let size = Self { width, height };
+        size.validate().is_ok().then_some(size)
+    }
+
+    fn validate(&self) -> AppResult<()> {
+        if self.width == 0
+            || self.height == 0
+            || self.width > MAX_WINDOW_DIMENSION
+            || self.height > MAX_WINDOW_DIMENSION
+        {
+            return Err(AppError::InvalidConfig(format!(
+                "window dimensions must be between 1 and {MAX_WINDOW_DIMENSION} logical pixels"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Keybinding {
     fn validate(&self) -> AppResult<()> {
         validate_nonempty("keybinding id", &self.id)?;
@@ -217,6 +247,9 @@ pub struct AppConfig {
     pub restore_on_launch: bool,
     pub tab_layout: String,
     pub window_chrome: String,
+    /// The last settled, non-maximized window size. `None` lets the platform
+    /// choose the initial size until the first resize event is persisted.
+    pub window_size: Option<WindowSize>,
     /// Lines of scrollback kept per terminal. In-memory only — never written to
     /// disk, so terminal output never persists across relaunch.
     pub scrollback_lines: u32,
@@ -252,6 +285,7 @@ impl Default for AppConfig {
             restore_on_launch: true,
             tab_layout: "horizontal".to_string(),
             window_chrome: DEFAULT_WINDOW_CHROME.to_string(),
+            window_size: None,
             scrollback_lines: 10_000,
             context_actions: ContextActionsConfig::default(),
             trusted_projects: Vec::new(),
@@ -331,6 +365,9 @@ impl AppConfig {
                     "window chrome must be system or custom".to_string(),
                 ));
             }
+        }
+        if let Some(window_size) = self.window_size {
+            window_size.validate()?;
         }
         self.theme.validate()?;
         validate_profiles(&self.shell_profiles, &self.default_shell_profile_id)?;
@@ -603,6 +640,38 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_window_dimensions() {
+        let config = AppConfig {
+            window_size: Some(WindowSize {
+                width: 0,
+                height: 720,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = AppConfig {
+            window_size: Some(WindowSize {
+                width: 1280,
+                height: MAX_WINDOW_DIMENSION + 1,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn older_serialized_config_defaults_window_size() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("window_size");
+
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+
+        assert_eq!(config.window_size, None);
+        config.validate().unwrap();
     }
 
     #[test]

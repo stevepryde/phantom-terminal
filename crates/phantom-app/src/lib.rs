@@ -43,7 +43,7 @@ use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
     default_home_dir, load_context_manifest, resolve_launch_opts, resolve_trusted_task,
     trust_context_manifest, AppConfig, LaunchContext, LaunchOpts, PtyManager, PtySink,
-    SessionStore, StartupCommand, TabRecord, MAX_TAB_TITLE_LEN,
+    SessionStore, StartupCommand, TabRecord, WindowSize, MAX_TAB_TITLE_LEN,
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
@@ -52,6 +52,7 @@ use phantom_emu::{
 use phantom_gfx::Renderer;
 use tab::Tab;
 use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 #[cfg(target_os = "macos")]
@@ -66,6 +67,7 @@ const CWD_POLL_WINDOW: Duration = Duration::from_secs(6);
 const CWD_STARTUP_POLL_WINDOW: Duration = Duration::from_secs(3);
 const LIVE_RESIZE_REDRAW_GRACE: Duration = Duration::from_millis(120);
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
+const WINDOW_SIZE_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_NOTICE_LEN: usize = 240;
@@ -569,6 +571,8 @@ pub struct App {
     live_resize_until: Option<Instant>,
     terminal_resize_deadline: Option<Instant>,
     pending_terminal_grid: Option<(u16, u16)>,
+    window_size_save_deadline: Option<Instant>,
+    pending_window_size: Option<WindowSize>,
     cwd_deadline: Option<Instant>,
     cwd_poll_until: Option<Instant>,
     last_terminal_grid: Option<(u16, u16)>,
@@ -650,6 +654,8 @@ impl App {
             live_resize_until: None,
             terminal_resize_deadline: None,
             pending_terminal_grid: None,
+            window_size_save_deadline: None,
+            pending_window_size: None,
             cwd_deadline: None,
             cwd_poll_until: None,
             last_terminal_grid: None,
@@ -1586,17 +1592,7 @@ impl App {
             return;
         }
         let config_path = canonical_config.expect("validated canonical spdeploy config");
-        let startup = StartupCommand {
-            program: "spdeploy".to_string(),
-            args: vec![
-                "--config".to_string(),
-                config_path.to_string_lossy().into_owned(),
-                "--operation".to_string(),
-                operation.clone(),
-                "--no-ui".to_string(),
-            ],
-            env: Default::default(),
-        };
+        let startup = spdeploy_startup_command(&config_path, &operation);
         self.spawn_new_tab(NewTabRequest {
             profile_id: None,
             cwd: config_path
@@ -2470,12 +2466,52 @@ impl App {
     }
 
     fn on_resize(&mut self, width: u32, height: u32) {
+        self.schedule_window_size_save(width, height);
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.resize(width, height);
         }
         self.live_resize_until = Some(Instant::now() + LIVE_RESIZE_REDRAW_GRACE);
         self.schedule_terminal_grid_resize(false);
         self.request_redraw();
+    }
+
+    fn schedule_window_size_save(&mut self, width: u32, height: u32) {
+        let scale_factor = self
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.window.scale_factor())
+            .unwrap_or(1.0);
+        let maximized = self
+            .gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.window.is_maximized());
+        if self.fullscreen || maximized {
+            return;
+        }
+        let logical = PhysicalSize::new(width, height).to_logical::<u32>(scale_factor);
+        let Some(size) = WindowSize::new(logical.width, logical.height) else {
+            return;
+        };
+        if self.config.window_size == Some(size) {
+            self.pending_window_size = None;
+            self.window_size_save_deadline = None;
+            return;
+        }
+        self.pending_window_size = Some(size);
+        self.window_size_save_deadline = Some(Instant::now() + WINDOW_SIZE_SAVE_DEBOUNCE);
+    }
+
+    fn flush_pending_window_size(&mut self) {
+        self.window_size_save_deadline = None;
+        let Some(size) = self.pending_window_size.take() else {
+            return;
+        };
+        if self.config.window_size == Some(size) {
+            return;
+        }
+        self.config.window_size = Some(size);
+        self.ui.sync_window_size(size);
+        self.mark_config_dirty();
     }
 
     fn sync_surface_to_window_size(&mut self) {
@@ -2590,6 +2626,7 @@ impl App {
         if let Some(pending) = self.pending_pty_events.as_ref() {
             pending.close();
         }
+        self.flush_pending_window_size();
         self.save_tabs();
         self.flush_persistence();
         for tab in &self.tabs {
@@ -2962,6 +2999,19 @@ fn frequent_command_input(command: &str) -> Vec<u8> {
     input
 }
 
+fn spdeploy_startup_command(config_path: &Path, operation: &str) -> StartupCommand {
+    StartupCommand {
+        program: "spdeploy".to_string(),
+        args: vec![
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+            "--operation".to_string(),
+            operation.to_string(),
+        ],
+        env: Default::default(),
+    }
+}
+
 fn looks_like_shell_prompt(prefix: &str) -> bool {
     matches!(
         prefix.trim_end().chars().next_back(),
@@ -3052,7 +3102,10 @@ fn renderer_signature(config: &AppConfig) -> String {
 }
 
 fn window_attributes(config: &AppConfig) -> WindowAttributes {
-    let attrs = Window::default_attributes().with_title("Phantom Terminal");
+    let mut attrs = Window::default_attributes().with_title("Phantom Terminal");
+    if let Some(size) = config.window_size {
+        attrs = attrs.with_inner_size(LogicalSize::new(size.width, size.height));
+    }
     if chrome::WindowChrome::from_config(&config.window_chrome) != chrome::WindowChrome::Custom {
         return attrs;
     }
@@ -3247,6 +3300,12 @@ impl ApplicationHandler<AppEvent> for App {
                 self.flush_pending_terminal_resize();
             }
         }
+        if self
+            .window_size_save_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.flush_pending_window_size();
+        }
         self.clear_expired_notice(now);
         if self.exit_requested {
             self.flush_persistence();
@@ -3297,6 +3356,9 @@ impl ApplicationHandler<AppEvent> for App {
             min_deadline(&mut next, deadline);
         }
         if let Some(deadline) = self.terminal_resize_deadline {
+            min_deadline(&mut next, deadline);
+        }
+        if let Some(deadline) = self.window_size_save_deadline {
             min_deadline(&mut next, deadline);
         }
         if let Some(deadline) = self.egui_repaint_after {
@@ -3431,6 +3493,19 @@ mod tests {
     #[test]
     fn frequent_command_click_clears_partial_input_and_submits_exact_command() {
         assert_eq!(frequent_command_input("cargo test"), b"\x15cargo test\r");
+    }
+
+    #[test]
+    fn sidebar_spdeploy_uses_the_interactive_tty_ui() {
+        let startup = spdeploy_startup_command(Path::new("/project/deploy.yml"), "deploy");
+
+        assert_eq!(startup.program, "spdeploy");
+        assert_eq!(
+            startup.args,
+            ["--config", "/project/deploy.yml", "--operation", "deploy"]
+        );
+        assert!(!startup.args.iter().any(|arg| arg == "--no-ui"));
+        assert!(!startup.args.iter().any(|arg| arg == "--yes"));
     }
 
     #[test]
@@ -3722,6 +3797,64 @@ mod tests {
 
         assert_eq!(app.pending_terminal_grid, Some((24, 80)));
         assert!(app.terminal_resize_deadline.unwrap() > old_deadline);
+    }
+
+    #[test]
+    fn window_size_updates_config_only_after_debounce_flush() {
+        let mut app = test_app();
+
+        app.schedule_window_size_save(1280, 720);
+
+        assert_eq!(app.config.window_size, None);
+        assert_eq!(app.pending_window_size, WindowSize::new(1280, 720));
+        assert!(app.window_size_save_deadline.is_some());
+
+        app.flush_pending_window_size();
+
+        assert_eq!(app.config.window_size, WindowSize::new(1280, 720));
+        assert_eq!(app.pending_window_size, None);
+        assert_eq!(app.window_size_save_deadline, None);
+    }
+
+    #[test]
+    fn zero_sized_window_event_does_not_replace_pending_size() {
+        let mut app = test_app();
+        app.schedule_window_size_save(1024, 768);
+        let deadline = app.window_size_save_deadline;
+
+        app.schedule_window_size_save(0, 0);
+
+        assert_eq!(app.pending_window_size, WindowSize::new(1024, 768));
+        assert_eq!(app.window_size_save_deadline, deadline);
+    }
+
+    #[test]
+    fn repeated_window_resize_extends_the_save_debounce() {
+        let mut app = test_app();
+        app.pending_window_size = WindowSize::new(1024, 768);
+        let old_deadline = Instant::now() + Duration::from_millis(1);
+        app.window_size_save_deadline = Some(old_deadline);
+
+        app.schedule_window_size_save(1024, 768);
+
+        assert_eq!(app.pending_window_size, WindowSize::new(1024, 768));
+        assert!(app.window_size_save_deadline.unwrap() > old_deadline);
+    }
+
+    #[test]
+    fn persisted_window_size_is_applied_to_window_attributes() {
+        let config = AppConfig {
+            window_size: WindowSize::new(1200, 800),
+            ..AppConfig::default()
+        };
+
+        let attrs = window_attributes(&config);
+        let restored = attrs
+            .inner_size
+            .expect("persisted size should be applied")
+            .to_logical::<u32>(1.0);
+
+        assert_eq!(restored, LogicalSize::new(1200, 800));
     }
 
     #[test]

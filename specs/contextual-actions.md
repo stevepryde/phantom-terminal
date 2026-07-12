@@ -30,7 +30,10 @@ validated-execution posture.
   in the exact active directory, internally parse only the project name,
   operation names/descriptions, and single-stage submenu paths needed to build
   the dropdown, and launch the selected operation in a new tab only after
-  explicit user action. Discovery must not require or invoke the spdeploy CLI.
+  explicit user action. The visible terminal tab must retain spdeploy's TTY UI,
+  including colors and compact scrolling output; Phantom must select the
+  operation with structured `--config`/`--operation` arguments but must not pass
+  `--no-ui` or `--yes`. Discovery must not require or invoke the spdeploy CLI.
 - **CTX-009 (confirmed):** Both trust review and approved action surfaces must
   remain non-modal. Terminal input must continue unless the user is directly
   interacting with a contextual control.
@@ -173,7 +176,8 @@ a shell command string. Omitting `run` opens the default validated shell.
 - **AC-CTX-D:** Collapse the panel and each section, restart, and observe the
   same states. Disabled plugins remain undiscovered and hidden.
 - **AC-CTX-E:** A `deploy.yml` fixture produces structured operations; selecting
-  one launches fixed spdeploy argv without bypassing spdeploy confirmations.
+  one launches fixed spdeploy argv without `--no-ui` or `--yes`, preserves the
+  interactive TTY presentation, and does not bypass spdeploy confirmations.
 - **AC-CTX-F:** Malformed, oversized, traversing, symlink-escaping, unknown-key,
   or unsupported-version manifests produce a bounded local error and no launch.
 - **AC-CTX-G:** Typing into the terminal while an idle contextual panel is

@@ -590,6 +590,7 @@ mod tests {
         let mut cfg = AppConfig {
             font_size: 18,
             font_family: "JetBrains Mono".into(),
+            window_size: crate::WindowSize::new(1280, 720),
             ..AppConfig::default()
         };
         store.save_config(&cfg).unwrap();
@@ -597,6 +598,7 @@ mod tests {
         let loaded = store.load_config().unwrap();
         assert_eq!(loaded.font_size, 18);
         assert_eq!(loaded.font_family, "JetBrains Mono");
+        assert_eq!(loaded.window_size, crate::WindowSize::new(1280, 720));
 
         // Saving again must upsert (PRIMARY KEY key='app'), not error or duplicate.
         cfg.font_size = 11;

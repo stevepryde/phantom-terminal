@@ -10,7 +10,7 @@ use egui::{
 };
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use phantom_core::{
-    AppConfig, Keybinding, Theme, FREQUENT_COMMANDS_PLUGIN_ID, MANIFEST_PLUGIN_ID,
+    AppConfig, Keybinding, Theme, WindowSize, FREQUENT_COMMANDS_PLUGIN_ID, MANIFEST_PLUGIN_ID,
     RECENT_DIRECTORIES_PLUGIN_ID, SPDEPLOY_PLUGIN_ID,
 };
 use phantom_gfx::available_terminal_font_families;
@@ -157,6 +157,14 @@ impl UiState {
 
     pub fn settings_open(&self) -> bool {
         self.active_panel == Some(PanelKind::Settings)
+    }
+
+    /// Keep runtime-owned window geometry current in an invalid settings draft
+    /// so a later valid widget edit cannot restore stale geometry.
+    pub fn sync_window_size(&mut self, size: WindowSize) {
+        if let Some(draft) = self.settings_draft.as_mut() {
+            draft.window_size = Some(size);
+        }
     }
 
     pub fn context_owns_keyboard(&self) -> bool {
@@ -1183,6 +1191,23 @@ fn display_name(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::palette::PaletteState;
+
+    #[test]
+    fn window_resize_keeps_invalid_settings_draft_geometry_current() {
+        let config = AppConfig::default();
+        let mut state = UiState::new(&config);
+        let mut draft = config;
+        draft.font_size = 0;
+        state.settings_draft = Some(draft);
+        let size = WindowSize::new(1280, 720).unwrap();
+
+        state.sync_window_size(size);
+
+        assert_eq!(
+            state.settings_draft.as_ref().unwrap().window_size,
+            Some(size)
+        );
+    }
 
     /// Recursively count pure-red strokes in egui's emitted shapes. egui's
     /// debug diagnostics (`warn_if_rect_changes_id`, id-clash) outline offending

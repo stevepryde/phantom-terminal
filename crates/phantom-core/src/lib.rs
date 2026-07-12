@@ -19,7 +19,7 @@ pub mod pty;
 pub mod session;
 pub mod spawn;
 
-pub use config::{AppConfig, Keybinding, ShellProfile, Theme, UI_THEMES};
+pub use config::{AppConfig, Keybinding, ShellProfile, Theme, WindowSize, UI_THEMES};
 pub use context::{
     load_context_manifest, parse_context_manifest, resolve_trusted_task, trust_context_manifest,
     validate_context_manifest, ContextActionsConfig, ContextManifest, ContextPluginConfig,
