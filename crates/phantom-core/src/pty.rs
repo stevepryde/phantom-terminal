@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -26,7 +26,10 @@ const WRITE_QUEUE_CHUNKS: usize = 256;
 const MAX_LAUNCH_ENV_VARS: usize = 128;
 const MAX_LAUNCH_ENV_KEY_LEN: usize = 128;
 const MAX_LAUNCH_ENV_VALUE_LEN: usize = 16 * 1024;
-const MAX_SHELL_PATH_LEN: usize = 64 * 1024;
+const MAX_STARTUP_PROGRAM_LEN: usize = 4096;
+const MAX_STARTUP_ARGS: usize = 128;
+const MAX_STARTUP_ARG_LEN: usize = 4096;
+const STARTUP_EXEC_SCRIPT: &str = "exec /usr/bin/env -- \"$@\"";
 
 /// Consumer of a PTY session's output.
 ///
@@ -57,17 +60,22 @@ pub struct SpawnOpts {
 }
 
 #[derive(Debug)]
+pub struct StartupCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
 pub struct LaunchOpts {
     /// Executable to run. Empty/None falls back to the user's `$SHELL`.
     pub command: Option<String>,
     pub args: Vec<String>,
-    /// Validated per-task environment additions. Reserved terminal/account
-    /// variables are owned by Phantom and cannot be supplied by manifests.
-    pub env: BTreeMap<String, String>,
-    /// Resolve and pass PATH as initialized by the user's login shell. This is
-    /// reserved for explicit contextual actions; ordinary profiles retain
-    /// their existing launch behavior.
-    pub inherit_shell_path: bool,
+    /// Optional validated structured program to execute after the exact shell
+    /// profile used by an ordinary new tab has initialized. The fixed wrapper
+    /// never interpolates program, argument, or environment data into shell
+    /// source; they remain positional argv entries.
+    pub startup: Option<StartupCommand>,
     pub cwd: Option<String>,
     pub rows: u16,
     pub cols: u16,
@@ -90,25 +98,6 @@ struct AccountEnv {
 struct ProcessEnv {
     account: AccountEnv,
     path: String,
-    login_shell_path: OnceLock<String>,
-}
-
-impl ProcessEnv {
-    /// Explicit contextual programs must see the same PATH initialization as a
-    /// normal tab's login shell. Resolve it lazily so ordinary shell tabs do
-    /// not run startup files twice, then retain the GUI-safe fallback entries.
-    fn explicit_program_path(&self) -> &str {
-        self.login_shell_path.get_or_init(|| {
-            login_shell_path(&self.account, &self.path)
-                .map(|path| {
-                    merge_path_parts(
-                        [Some(path), Some(self.path.clone())],
-                        self.account.home.as_deref(),
-                    )
-                })
-                .unwrap_or_else(|| self.path.clone())
-        })
-    }
 }
 
 pub struct PtyManager {
@@ -164,7 +153,9 @@ impl PtyManager {
     /// Spawn a shell in a new PTY. Output bytes are delivered to `sink` from a
     /// dedicated reader thread until the shell exits or the pipe closes.
     pub fn spawn<S: PtySink>(&self, opts: LaunchOpts, mut sink: S) -> AppResult<u32> {
-        validate_launch_env(&opts.env)?;
+        if let Some(startup) = &opts.startup {
+            validate_startup_command(startup)?;
+        }
         let reservation = self.reserve_session()?;
         let size = PtySize {
             rows: opts.rows.max(1),
@@ -181,19 +172,26 @@ impl PtyManager {
         let account = &env.account;
         let use_default_shell =
             opts.command.as_ref().is_none_or(|c| c.is_empty()) && opts.args.is_empty();
-        let launch_path = if opts.inherit_shell_path && !use_default_shell {
-            env.explicit_program_path()
-        } else {
-            &env.path
-        };
-        let mut cmd = if use_default_shell {
+        let mut cmd = if let Some(startup) = opts.startup {
+            let shell = opts
+                .command
+                .filter(|command| !command.is_empty())
+                .unwrap_or_else(|| default_shell(account));
+            let shell = resolve_named_program(&shell, &env.path)?;
+            let mut cmd = CommandBuilder::new(shell);
+            for arg in &opts.args {
+                cmd.arg(arg);
+            }
+            cmd.args(startup_shell_args(startup));
+            cmd
+        } else if use_default_shell {
             CommandBuilder::new_default_prog()
         } else {
             let command = opts
                 .command
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| default_shell(account));
-            let command = resolve_named_program(&command, launch_path)?;
+            let command = resolve_named_program(&command, &env.path)?;
             let mut cmd = CommandBuilder::new(command);
             for arg in &opts.args {
                 cmd.arg(arg);
@@ -206,9 +204,8 @@ impl PtyManager {
         // TERM advertises a capable terminal; PATH is normalized because macOS
         // GUI apps launch with a sparse environment compared with login shells.
         apply_terminal_env(&mut cmd);
-        cmd.env("PATH", launch_path);
+        cmd.env("PATH", &env.path);
         apply_account_env(&mut cmd, account);
-        apply_launch_env(&mut cmd, &opts.env);
 
         let child = pair
             .slave
@@ -442,10 +439,47 @@ fn apply_account_env(cmd: &mut CommandBuilder, account: &AccountEnv) {
     }
 }
 
-fn apply_launch_env(cmd: &mut CommandBuilder, env: &BTreeMap<String, String>) {
-    for (key, value) in env {
-        cmd.env(key, value);
+fn startup_shell_args(startup: StartupCommand) -> Vec<String> {
+    let mut args = vec![
+        "-lic".to_string(),
+        STARTUP_EXEC_SCRIPT.to_string(),
+        "phantom-task".to_string(),
+    ];
+    args.extend(
+        startup
+            .env
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+    args.push(startup.program);
+    args.extend(startup.args);
+    args
+}
+
+fn validate_startup_command(startup: &StartupCommand) -> AppResult<()> {
+    if startup.program.is_empty()
+        || startup.program.len() > MAX_STARTUP_PROGRAM_LEN
+        || startup.program.chars().any(char::is_control)
+    {
+        return Err(AppError::InvalidConfig(
+            "startup program is invalid".to_string(),
+        ));
     }
+    if startup.args.len() > MAX_STARTUP_ARGS {
+        return Err(AppError::InvalidConfig(format!(
+            "startup program may contain no more than {MAX_STARTUP_ARGS} arguments"
+        )));
+    }
+    if startup
+        .args
+        .iter()
+        .any(|arg| arg.len() > MAX_STARTUP_ARG_LEN || arg.chars().any(char::is_control))
+    {
+        return Err(AppError::InvalidConfig(
+            "startup program argument is invalid".to_string(),
+        ));
+    }
+    validate_launch_env(&startup.env)
 }
 
 /// Revalidate task environment additions at the final PTY boundary so callers
@@ -504,52 +538,8 @@ fn process_env() -> &'static ProcessEnv {
     PROCESS_ENV.get_or_init(|| {
         let account = account_env();
         let path = shell_path(&account);
-        ProcessEnv {
-            account,
-            path,
-            login_shell_path: OnceLock::new(),
-        }
+        ProcessEnv { account, path }
     })
-}
-
-#[cfg(unix)]
-fn login_shell_path(account: &AccountEnv, fallback_path: &str) -> Option<String> {
-    let shell = default_shell(account);
-    let mut command = Command::new(shell);
-    command
-        // The leading NUL separates any interactive startup output from the
-        // first environment entry, even when PATH happens to be emitted first.
-        .args(["-ilc", "/usr/bin/printf '\\0'; /usr/bin/env -0"])
-        .env("PATH", fallback_path);
-    if let Some(home) = account.home.as_deref() {
-        command.env("HOME", home);
-    }
-    if let Some(shell) = account.shell.as_deref() {
-        command.env("SHELL", shell);
-    }
-    if let Some(user) = account.user.as_deref() {
-        command.env("USER", user).env("LOGNAME", user);
-    }
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_env_path(&output.stdout)
-}
-
-#[cfg(not(unix))]
-fn login_shell_path(_account: &AccountEnv, _fallback_path: &str) -> Option<String> {
-    None
-}
-
-fn parse_env_path(output: &[u8]) -> Option<String> {
-    output
-        .split(|byte| *byte == 0)
-        .filter_map(|entry| entry.strip_prefix(b"PATH="))
-        .filter(|path| !path.is_empty() && path.len() <= MAX_SHELL_PATH_LEN)
-        .filter_map(|path| std::str::from_utf8(path).ok())
-        .next_back()
-        .map(str::to_string)
 }
 
 #[cfg(target_os = "macos")]
@@ -792,25 +782,6 @@ mod tests {
         assert_eq!(merged, "/usr/bin:/bin:/opt/homebrew/bin");
     }
 
-    #[test]
-    fn env_path_parser_ignores_shell_noise_and_uses_nul_delimited_path() {
-        let output =
-            b"startup message\nHOME=/home/x\0PATH=/home/x/.bun/bin:/usr/bin\0SHELL=/bin/zsh\0";
-
-        assert_eq!(
-            parse_env_path(output).as_deref(),
-            Some("/home/x/.bun/bin:/usr/bin")
-        );
-    }
-
-    #[test]
-    fn env_path_parser_rejects_empty_invalid_or_oversized_values() {
-        assert_eq!(parse_env_path(b"PATH=\0"), None);
-        assert_eq!(parse_env_path(b"PATH=\xff\0"), None);
-        let oversized = format!("PATH={}\0", "a".repeat(MAX_SHELL_PATH_LEN + 1));
-        assert_eq!(parse_env_path(oversized.as_bytes()), None);
-    }
-
     fn account(home: Option<&str>, shell: Option<&str>, user: Option<&str>) -> AccountEnv {
         AccountEnv {
             home: home.map(str::to_string),
@@ -938,26 +909,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_launch_env_sets_validated_task_values() {
-        let mut cmd = CommandBuilder::new("/bin/true");
-        let env = BTreeMap::from([
-            ("RUST_LOG".to_string(), "phantom=debug".to_string()),
-            ("SOULFIRE_MODE".to_string(), "local".to_string()),
-        ]);
-
-        apply_launch_env(&mut cmd, &env);
-
-        assert_eq!(
-            cmd.get_env("RUST_LOG"),
-            Some(std::ffi::OsStr::new("phantom=debug"))
-        );
-        assert_eq!(
-            cmd.get_env("SOULFIRE_MODE"),
-            Some(std::ffi::OsStr::new("local"))
-        );
-    }
-
-    #[test]
     fn final_launch_boundary_rejects_reserved_or_control_environment() {
         let reserved = BTreeMap::from([("PATH".to_string(), "/tmp".to_string())]);
         assert!(validate_launch_env(&reserved).is_err());
@@ -973,6 +924,39 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(!process_env().path.is_empty());
+    }
+
+    #[test]
+    fn startup_command_stays_structured_behind_fixed_shell_source() {
+        let args = startup_shell_args(StartupCommand {
+            program: "tool; never shell source".to_string(),
+            args: vec!["$(also-not-source)".to_string()],
+            env: BTreeMap::from([("RUST_LOG".to_string(), "info;still-data".to_string())]),
+        });
+
+        assert_eq!(args[0], "-lic");
+        assert_eq!(args[1], STARTUP_EXEC_SCRIPT);
+        assert_eq!(args[2], "phantom-task");
+        assert_eq!(args[3], "RUST_LOG=info;still-data");
+        assert_eq!(args[4], "tool; never shell source");
+        assert_eq!(args[5], "$(also-not-source)");
+    }
+
+    #[test]
+    fn final_launch_boundary_rejects_invalid_startup_programs_and_arguments() {
+        let invalid_program = StartupCommand {
+            program: "bad\nprogram".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        assert!(validate_startup_command(&invalid_program).is_err());
+
+        let invalid_arg = StartupCommand {
+            program: "tool".to_string(),
+            args: vec!["bad\0arg".to_string()],
+            env: BTreeMap::new(),
+        };
+        assert!(validate_startup_command(&invalid_arg).is_err());
     }
 
     #[test]
@@ -1016,8 +1000,7 @@ mod tests {
                 LaunchOpts {
                     command: Some("/bin/sh".to_string()),
                     args: vec!["-c".to_string(), "exit 0".to_string()],
-                    env: BTreeMap::new(),
-                    inherit_shell_path: false,
+                    startup: None,
                     cwd: None,
                     rows: 24,
                     cols: 80,

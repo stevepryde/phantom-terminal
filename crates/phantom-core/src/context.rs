@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
-use crate::pty::LaunchOpts;
+use crate::pty::{LaunchOpts, StartupCommand};
 
 pub const CONTEXT_MANIFEST_FILE: &str = ".phantom.yml";
 pub const MANIFEST_PLUGIN_ID: &str = "phantom-manifest";
@@ -532,10 +532,9 @@ pub fn resolve_trusted_task(
         None => (None, Vec::new(), BTreeMap::new()),
     };
     Ok(LaunchOpts {
-        command,
-        args,
-        env,
-        inherit_shell_path: task.run.is_some(),
+        command: None,
+        args: Vec::new(),
+        startup: command.map(|program| StartupCommand { program, args, env }),
         cwd: Some(task.cwd.clone()),
         rows,
         cols,
@@ -913,10 +912,13 @@ tabs:
         assert!(Path::new(&trusted.tasks[0].cwd).is_absolute());
 
         let launch = resolve_trusted_task(&trusted, &dir.0, VALID, "api", 40, 120).unwrap();
-        assert_eq!(launch.command.as_deref(), Some("cargo"));
-        assert_eq!(launch.args, ["run"]);
-        assert_eq!(launch.env.get("RUST_LOG").map(String::as_str), Some("info"));
-        assert!(launch.inherit_shell_path);
+        let startup = launch.startup.as_ref().unwrap();
+        assert_eq!(startup.program, "cargo");
+        assert_eq!(startup.args, ["run"]);
+        assert_eq!(
+            startup.env.get("RUST_LOG").map(String::as_str),
+            Some("info")
+        );
         assert_eq!((launch.rows, launch.cols), (40, 120));
     }
 
@@ -943,10 +945,7 @@ tabs:
         let dir = TestDir::new();
         let trusted = trust_context_manifest(&dir.0, VALID.to_string()).unwrap();
         let launch = resolve_trusted_task(&trusted, &dir.0, VALID, "deploy", 24, 80).unwrap();
-        assert_eq!(launch.command, None);
-        assert!(launch.args.is_empty());
-        assert!(launch.env.is_empty());
-        assert!(!launch.inherit_shell_path);
+        assert!(launch.startup.is_none());
     }
 
     #[test]

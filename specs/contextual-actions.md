@@ -104,11 +104,14 @@ validated-execution posture.
 - **CTX-027 (correctness):** Errors and other global notices render in egui's
   topmost layer after every panel, sidebar, palette, and popup. Contextual UI
   must never obscure an error.
-- **CTX-028 (correctness):** Explicit contextual programs are resolved from the
-  same login-shell-initialized PATH used by ordinary Ctrl+T and titlebar `+`
-  tabs. Resolution is lazy, retains the normalized GUI-safe fallback, and never
-  interpolates project data into a shell command. The fallback includes
-  `~/bin`, `~/.cargo/bin`, and `~/.local/bin`.
+- **CTX-028 (correctness):** Explicit contextual programs run only after the
+  same validated default shell profile and login/interactive startup used by
+  ordinary Ctrl+T and titlebar `+` tabs. Project programs, arguments, and
+  environment values remain structured positional data behind compiled-in
+  fixed shell source and are never interpolated into a shell command. This
+  gives the task the shell-initialized environment, including PATH, while the
+  normalized GUI-safe fallback still includes `~/bin`, `~/.cargo/bin`, and
+  `~/.local/bin`.
 - **CTX-029 (confirmed):** `phantom context validate [directory]` must validate
   the `.phantom.yml` in the supplied directory, defaulting to the current
   directory. It must use the same strict parser, canonical-root binding, and
@@ -121,6 +124,14 @@ validated-execution posture.
 - **CTX-031 (correctness):** A missing manifest, invalid directory, malformed or
   unsupported YAML, or task cwd that is missing or escapes the canonical root
   must produce a concise error and a non-zero process exit status.
+- **CTX-032 (architecture, non-negotiable):** Every feature that creates a tab
+  MUST use the app's single `NewTabRequest` -> `spawn_new_tab` pipeline. That
+  pipeline first resolves the same stored, validated shell profile used by
+  Ctrl+T, then constructs the PTY, emulator, tab state, persistence, focus,
+  cwd polling, and contextual discovery. Sidebar tasks, Deploy, directory
+  actions, palette actions, restored tabs, and all future new-tab features may
+  add only typed request data; they must not spawn a PTY, push a `Tab`, or
+  reproduce any part of tab construction through a parallel path.
 
 ## `.phantom.yml` version 1
 
@@ -182,6 +193,11 @@ a shell command string. Omitting `run` opens the default validated shell.
 - **AC-CTX-L:** Run `phantom context validate` against valid, missing, malformed,
   and path-escaping fixtures. Only the valid fixture exits zero, and none of the
   runs create a trust record, launch a process, or start a window.
+- **AC-CTX-M:** A regression test compares a plain Ctrl+T request with a
+  contextual startup request and proves both resolve the identical shell
+  profile, profile args, cwd, dimensions, and base terminal launch; only the
+  contextual request's typed startup payload may differ. Code review must reject
+  any second new-tab constructor or feature-level `PtyManager::spawn`/`Tab::new`.
 
 ## Non-goals
 

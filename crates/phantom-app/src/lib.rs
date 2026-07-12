@@ -43,7 +43,7 @@ use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
     default_home_dir, load_context_manifest, resolve_launch_opts, resolve_trusted_task,
     trust_context_manifest, AppConfig, LaunchContext, LaunchOpts, PtyManager, PtySink,
-    SessionStore, TabRecord, MAX_TAB_TITLE_LEN,
+    SessionStore, StartupCommand, TabRecord, MAX_TAB_TITLE_LEN,
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
@@ -78,6 +78,44 @@ const MAX_FATAL_PRESENTS: u32 = 10;
 /// Logical px the tab strip scrolls per wheel notch line.
 const TAB_STRIP_WHEEL_PX: f32 = 24.0;
 const TAB_DRAG_TOLERANCE_PX: f32 = 8.0;
+
+/// The only supported entry point for creating a terminal tab. Every caller,
+/// including contextual actions, starts from the same validated shell profile
+/// resolution used by Ctrl+T and may only add typed startup behavior.
+struct NewTabRequest {
+    profile_id: Option<String>,
+    cwd: Option<String>,
+    startup: Option<StartupCommand>,
+    title: Option<String>,
+    return_to_shell: bool,
+    persist: bool,
+}
+
+impl NewTabRequest {
+    fn shell(profile_id: Option<String>, cwd: Option<String>, persist: bool) -> Self {
+        Self {
+            profile_id,
+            cwd,
+            startup: None,
+            title: None,
+            return_to_shell: false,
+            persist,
+        }
+    }
+}
+
+fn resolve_new_tab_launch(
+    config: &AppConfig,
+    profile_id: Option<&str>,
+    cwd: Option<String>,
+    startup: Option<StartupCommand>,
+    rows: u16,
+    cols: u16,
+) -> phantom_core::AppResult<LaunchOpts> {
+    let mut launch = resolve_launch_opts(config, profile_id, cwd, rows, cols)?;
+    launch.startup = startup;
+    Ok(launch)
+}
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 
@@ -909,7 +947,7 @@ impl App {
     }
 
     fn spawn_tab(&mut self, profile_id: Option<String>, cwd: Option<String>) {
-        self.spawn_tab_with_persistence(profile_id, cwd, true);
+        self.spawn_new_tab(NewTabRequest::shell(profile_id, cwd, true));
     }
 
     /// Spawn a tab; returns whether a tab was actually added.
@@ -919,29 +957,25 @@ impl App {
         cwd: Option<String>,
         persist: bool,
     ) -> bool {
-        let (rows, cols) = self.viewport_grid();
-        let launch =
-            match resolve_launch_opts(&self.config, profile_id.as_deref(), cwd.clone(), rows, cols)
-            {
-                Ok(launch) => launch,
-                Err(e) => {
-                    self.show_notice(format!("Could not resolve shell profile: {e}"));
-                    return false;
-                }
-            };
-        self.spawn_resolved_tab(launch, profile_id, None, false, persist)
+        self.spawn_new_tab(NewTabRequest::shell(profile_id, cwd, persist))
     }
 
-    /// Spawn a previously validated structured launch. Contextual tasks use
-    /// this path only after their stored trust record has been revalidated.
-    fn spawn_resolved_tab(
-        &mut self,
-        launch: LaunchOpts,
-        profile_id: Option<String>,
-        title: Option<String>,
-        return_to_shell: bool,
-        persist: bool,
-    ) -> bool {
+    fn spawn_new_tab(&mut self, request: NewTabRequest) -> bool {
+        let (rows, cols) = self.viewport_grid();
+        let launch = match resolve_new_tab_launch(
+            &self.config,
+            request.profile_id.as_deref(),
+            request.cwd,
+            request.startup,
+            rows,
+            cols,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.show_notice(format!("Could not resolve shell profile: {error}"));
+                return false;
+            }
+        };
         let (rows, cols) = (launch.rows, launch.cols);
         let start_cwd = launch
             .cwd
@@ -969,18 +1003,23 @@ impl App {
             self.config.scrollback_lines,
             cursor_shape(&self.config.cursor_style),
         );
-        self.tabs
-            .push(Tab::new(tab_id, core, pty_id, start_cwd, profile_id));
+        self.tabs.push(Tab::new(
+            tab_id,
+            core,
+            pty_id,
+            start_cwd,
+            request.profile_id,
+        ));
         if let Some(tab) = self.tabs.last_mut() {
-            tab.return_to_shell = return_to_shell;
+            tab.return_to_shell = request.return_to_shell;
         }
-        if let (Some(tab), Some(title)) = (self.tabs.last_mut(), title) {
+        if let (Some(tab), Some(title)) = (self.tabs.last_mut(), request.title) {
             tab.custom_title = title;
         }
         self.active = self.tabs.len() - 1;
         self.tab_scroll_into_view = Some(self.active);
         self.arm_cwd_polling(CWD_STARTUP_POLL_WINDOW);
-        if persist {
+        if request.persist {
             self.mark_dirty();
         }
         self.schedule_context_discovery();
@@ -1474,8 +1513,15 @@ impl App {
         let original_len = self.tabs.len();
         let original_active = self.active;
         for (launch, title) in launches {
-            let return_to_shell = launch.command.is_some();
-            if !self.spawn_resolved_tab(launch, None, Some(title), return_to_shell, false) {
+            let return_to_shell = launch.startup.is_some();
+            if !self.spawn_new_tab(NewTabRequest {
+                profile_id: None,
+                cwd: launch.cwd,
+                startup: launch.startup,
+                title: Some(title),
+                return_to_shell,
+                persist: false,
+            }) {
                 while self.tabs.len() > original_len {
                     if let Some(tab) = self.tabs.pop() {
                         let _ = self.pty.kill(tab.pty_id);
@@ -1540,9 +1586,8 @@ impl App {
             return;
         }
         let config_path = canonical_config.expect("validated canonical spdeploy config");
-        let (rows, cols) = self.viewport_grid();
-        let launch = LaunchOpts {
-            command: Some("spdeploy".to_string()),
+        let startup = StartupCommand {
+            program: "spdeploy".to_string(),
             args: vec![
                 "--config".to_string(),
                 config_path.to_string_lossy().into_owned(),
@@ -1551,20 +1596,17 @@ impl App {
                 "--no-ui".to_string(),
             ],
             env: Default::default(),
-            inherit_shell_path: true,
+        };
+        self.spawn_new_tab(NewTabRequest {
+            profile_id: None,
             cwd: config_path
                 .parent()
                 .map(|parent| parent.to_string_lossy().into_owned()),
-            rows,
-            cols,
-        };
-        self.spawn_resolved_tab(
-            launch,
-            None,
-            Some(format!("spdeploy: {operation}")),
-            true,
-            true,
-        );
+            startup: Some(startup),
+            title: Some(format!("spdeploy: {operation}")),
+            return_to_shell: true,
+            persist: true,
+        });
     }
 
     fn save_config(&mut self) {
@@ -3439,6 +3481,46 @@ mod tests {
         assert_eq!(launch.command.as_deref(), Some("/bin/custom-shell"));
         assert_eq!(launch.args, ["--login"]);
         assert_eq!(launch.cwd.as_deref(), Some(project.tasks[0].cwd.as_str()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn contextual_startup_uses_the_same_launch_resolution_as_ctrl_t() {
+        let root = std::env::temp_dir().join(format!(
+            "phantom-running-context-{}-{:?}",
+            std::process::id(),
+            Instant::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = "version: 1\nname: Test\ntabs:\n  - id: test\n    title: Test\n    cwd: .\n    run:\n      program: cargo\n      args: [test]\n";
+        let project = trust_context_manifest(&root, source.to_string()).unwrap();
+        let trusted = resolve_trusted_task(&project, &root, source, "test", 31, 117).unwrap();
+        let config = AppConfig {
+            shell_profiles: vec![phantom_core::ShellProfile {
+                id: "custom".to_string(),
+                name: "Custom".to_string(),
+                command: "/bin/zsh".to_string(),
+                args: vec!["--login".to_string()],
+                cwd: None,
+            }],
+            default_shell_profile_id: "custom".to_string(),
+            ..AppConfig::default()
+        };
+        let cwd = trusted.cwd.clone();
+
+        let ctrl_t = resolve_new_tab_launch(&config, None, cwd.clone(), None, 31, 117).unwrap();
+        let contextual =
+            resolve_new_tab_launch(&config, None, cwd, trusted.startup, 31, 117).unwrap();
+
+        assert_eq!(contextual.command, ctrl_t.command);
+        assert_eq!(contextual.args, ctrl_t.args);
+        assert_eq!(contextual.cwd, ctrl_t.cwd);
+        assert_eq!(contextual.rows, ctrl_t.rows);
+        assert_eq!(contextual.cols, ctrl_t.cols);
+        let startup = contextual.startup.unwrap();
+        assert_eq!(startup.program, "cargo");
+        assert_eq!(startup.args, ["test"]);
+        assert!(ctrl_t.startup.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
