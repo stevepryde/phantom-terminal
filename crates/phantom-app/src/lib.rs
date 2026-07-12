@@ -1530,6 +1530,7 @@ impl App {
                 "--no-ui".to_string(),
             ],
             env: Default::default(),
+            inherit_shell_path: true,
             cwd: config_path
                 .parent()
                 .map(|parent| parent.to_string_lossy().into_owned()),
