@@ -29,6 +29,7 @@ const SIDEBAR_TOOLBAR_HEIGHT: f32 = 30.0;
 const FLOATING_ICON_INSET: f32 = 8.0;
 const MAX_VIEWPORT_FRACTION: f32 = 0.50;
 const RESIZE_GRAB_RADIUS: f32 = 7.0;
+const START_ALL_TASKS_LABEL: &str = "Start all (new tabs)";
 
 #[derive(Default)]
 pub(crate) struct ContextUi {
@@ -491,22 +492,17 @@ impl ContextUi {
     }
 
     fn draw_manifest(&mut self, ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
+        if manifest.trust == ManifestTrustState::Trusted {
+            return draw_trusted_manifest(ui, manifest);
+        }
+
         let details_key = format!("manifest:{}", manifest.root.display());
         let mut expanded = self.details.contains(&details_key);
-        let prompt = match manifest.trust {
-            ManifestTrustState::NeedsTrust => {
-                format!(
-                    "{} tab{} need review",
-                    manifest.tabs.len(),
-                    if manifest.tabs.len() == 1 { "" } else { "s" }
-                )
-            }
-            ManifestTrustState::Trusted => format!(
-                "{} tab{}",
-                manifest.tabs.len(),
-                if manifest.tabs.len() == 1 { "" } else { "s" }
-            ),
-        };
+        let prompt = format!(
+            "{} tab{} need review",
+            manifest.tabs.len(),
+            if manifest.tabs.len() == 1 { "" } else { "s" }
+        );
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(prompt)
@@ -514,12 +510,7 @@ impl ContextUi {
                     .color(Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if manifest.trust == ManifestTrustState::NeedsTrust {
-                    "Review"
-                } else {
-                    "Details"
-                };
-                if details_button(ui, expanded, label).clicked() {
+                if details_button(ui, expanded, "Review").clicked() {
                     expanded = !expanded;
                 }
             });
@@ -533,10 +524,7 @@ impl ContextUi {
                 &manifest.manifest_path.display().to_string(),
             );
         }
-        match manifest.trust {
-            ManifestTrustState::NeedsTrust => draw_manifest_review(ui, manifest, expanded),
-            ManifestTrustState::Trusted => draw_trusted_manifest(ui, manifest, expanded),
-        }
+        draw_manifest_review(ui, manifest, expanded)
     }
 }
 
@@ -943,17 +931,13 @@ fn detail_value(ui: &mut Ui, name: &str, value: &str) {
     });
 }
 
-fn draw_trusted_manifest(
-    ui: &mut Ui,
-    manifest: &ManifestSection,
-    expanded: bool,
-) -> Option<ContextRequest> {
+fn draw_trusted_manifest(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut request = full_width_row(ui, Sense::click(), |ui, rect, color| {
         ui.painter().text(
             egui::pos2(rect.left() + 8.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            "Open all tabs",
+            START_ALL_TASKS_LABEL,
             FontId::proportional(12.0),
             color,
         );
@@ -968,7 +952,7 @@ fn draw_trusted_manifest(
             ui.painter().text(
                 egui::pos2(rect.left() + 8.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                &tab.title,
+                task_start_label(&tab.title),
                 FontId::proportional(12.0),
                 color,
             );
@@ -981,30 +965,12 @@ fn draw_trusted_manifest(
                 tab_id: tab.id.clone(),
             });
         }
-        if expanded {
-            let detail = match &tab.task {
-                Some(task) => task.program.as_str(),
-                None => "Shell only",
-            };
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(detail)
-                            .size(11.0)
-                            .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
-                    );
-                    ui.label(
-                        RichText::new(tab.cwd.display().to_string())
-                            .monospace()
-                            .size(11.0)
-                            .color(Color32::from_rgba_unmultiplied(255, 255, 255, 95)),
-                    );
-                });
-            });
-        }
     }
     request
+}
+
+fn task_start_label(title: &str) -> String {
+    format!("Start {title}")
 }
 
 fn spdeploy_dropdown(
@@ -1504,6 +1470,13 @@ mod tests {
             }),
         };
         assert_eq!(section_label(&directories), "Directories");
+    }
+
+    #[test]
+    fn trusted_task_actions_use_compact_start_labels() {
+        assert_eq!(START_ALL_TASKS_LABEL, "Start all (new tabs)");
+        assert_eq!(task_start_label("Soulfire API"), "Start Soulfire API");
+        assert_eq!(task_start_label("Soulfire UI"), "Start Soulfire UI");
     }
 
     #[test]
