@@ -9,7 +9,7 @@ alacritty_terminal = "=0.26.0"
 arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
 directories = "6"
-egui = "0.34.3"
+egui = "0.35.0"
 egui-wgpu = "0.34.3"
 egui-winit = { version = "0.34.3", default-features = false }
 epaint_default_fonts = "=0.34.3"
