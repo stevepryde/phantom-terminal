@@ -652,7 +652,7 @@ mod tests {
             .map(|plugin| plugin.order)
             .collect();
 
-        assert_eq!(orders, [0, 100, 200]);
+        assert_eq!(orders, [0, 50, 100, 200]);
     }
 
     #[test]
