@@ -20,6 +20,7 @@ These rules capture deliberate product decisions and should not be changed casua
 | Autosave | Settings save immediately on change. Do not add a save button for settings panes. |
 | Native dialogs | Do not use native `confirm`, `alert`, or `prompt` for app UI. Use inline confirmation, in-app dialogs, or toasts. |
 | Native app control UI | The native Rust app uses egui for non-terminal controls and contextual panels. The terminal viewport stays custom-rendered by `phantom-gfx`; do not rebuild settings, sidebars, forms, sliders, or inspectors as ad-hoc terminal-renderer widgets. |
+| Context sidebar plugins | Trusted, runnable plugins show actions only. Never show item counts, Details/Hide controls, source paths, commands, working directories, or explanatory metadata in their steady state. |
 
 ## Palette
 
@@ -219,7 +220,7 @@ directory and leave supporting implementation details out of the steady state.
 | Default content | Show executable actions only. Do not repeat counts, project names, manifest or config paths, commands, working directories, descriptions, or help text already implied by the section header and action labels. |
 | Action labels | Begin with a clear verb and name the result, for example `Start API`, `Start all (new tabs)`, or `Run in new tab`. Distinguish actions that create several tabs or otherwise have a broader effect in the label itself. |
 | Density | Render actions as contiguous `28px` full-width rows with `12px` text, no inter-row gaps, and a full-row hover/focus fill. Keep one compact inset around the action group; do not wrap each action in a card. |
-| Progressive disclosure | Add details only when they are required for a security decision, recovery from an error, or resolving ambiguity before an action. Do not add a Details/Hide toggle to trusted, runnable steady-state content. |
+| Progressive disclosure | Never add item counts or Details/Hide toggles. Security details appear directly only while an executable source is untrusted; error details appear only with an actionable recovery path. |
 | Trust review | Untrusted executable sources are the exception to action-only content: show the exact bounded source, program, arguments, environment, and working directory before enabling Trust. Once trusted, return to action-only content. |
 | Empty and error states | Use one concise muted empty-state line or one concise error with a recovery action. Do not leave disabled controls or explanatory scaffolding in an otherwise empty plugin. |
 | Future plugin test | Before shipping, verify that every visible line either performs an action, is essential to a pending security decision, or explains an error the user can act on. Remove everything else. |

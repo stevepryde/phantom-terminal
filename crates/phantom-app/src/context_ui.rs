@@ -1,12 +1,12 @@
 //! Non-modal egui presentation for directory-aware contextual actions.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
 use egui::{
-    Align2, Area, Button, Color32, ComboBox, FontId, Frame, Id, Margin, Order, RichText, Sense, Ui,
+    Align2, Area, Color32, ComboBox, FontId, Frame, Id, Margin, Order, RichText, Sense, Ui,
     UiBuilder,
 };
 use phantom_core::{
@@ -36,8 +36,6 @@ pub(crate) struct ContextUi {
     /// Selected spdeploy operation per section. Discovery results are immutable;
     /// selection is ephemeral and resets when an operation disappears.
     selections: BTreeMap<String, SpdeploySelection>,
-    /// Expanded progressive-disclosure regions, keyed by provider/project.
-    details: BTreeSet<String>,
     /// True only while a contextual widget has focus or its dropdown is open.
     owns_keyboard: bool,
     /// Owns the divider gesture until the primary pointer is released. This
@@ -496,35 +494,12 @@ impl ContextUi {
             return draw_trusted_manifest(ui, manifest);
         }
 
-        let details_key = format!("manifest:{}", manifest.root.display());
-        let mut expanded = self.details.contains(&details_key);
-        let prompt = format!(
-            "{} tab{} need review",
-            manifest.tabs.len(),
-            if manifest.tabs.len() == 1 { "" } else { "s" }
+        detail_value(
+            ui,
+            "Manifest",
+            &manifest.manifest_path.display().to_string(),
         );
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(prompt)
-                    .size(12.0)
-                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if details_button(ui, expanded, "Review").clicked() {
-                    expanded = !expanded;
-                }
-            });
-        });
-        set_detail_expanded(&mut self.details, details_key, expanded);
-
-        if expanded {
-            detail_value(
-                ui,
-                "Manifest",
-                &manifest.manifest_path.display().to_string(),
-            );
-        }
-        draw_manifest_review(ui, manifest, expanded)
+        draw_manifest_review(ui, manifest)
     }
 }
 
@@ -804,19 +779,6 @@ fn sidebar_frame(alpha: u8, margin: i8) -> Frame {
         .inner_margin(Margin::same(margin))
 }
 
-fn details_button(ui: &mut Ui, expanded: bool, label: &str) -> egui::Response {
-    let text = if expanded { "Hide" } else { label };
-    ui.add(Button::new(RichText::new(text).size(11.0)).min_size(egui::vec2(0.0, 28.0)))
-}
-
-fn set_detail_expanded(details: &mut BTreeSet<String>, key: String, expanded: bool) {
-    if expanded {
-        details.insert(key);
-    } else {
-        details.remove(&key);
-    }
-}
-
 fn section_is_enabled(config: &AppConfig, section: &ContextSection) -> bool {
     config
         .context_actions
@@ -859,14 +821,7 @@ fn context_icon_button(ui: &mut Ui, open: bool) -> egui::Response {
     })
 }
 
-fn draw_manifest_review(
-    ui: &mut Ui,
-    manifest: &ManifestSection,
-    expanded: bool,
-) -> Option<ContextRequest> {
-    if !expanded {
-        return None;
-    }
+fn draw_manifest_review(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
     ui.colored_label(
         Color32::from_rgb(250, 204, 21),
         "Verify these exact tasks before trusting.",
@@ -1193,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_untrusted_manifest_does_not_expose_trust_before_review() {
+    fn untrusted_manifest_review_does_not_trust_without_explicit_click() {
         let ctx = Context::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1209,7 +1164,7 @@ mod tests {
         let mut request = None;
 
         let _ = ctx.run_ui(input, |ui| {
-            request = draw_manifest_review(ui, manifest, false);
+            request = draw_manifest_review(ui, manifest);
         });
 
         assert!(request.is_none());
