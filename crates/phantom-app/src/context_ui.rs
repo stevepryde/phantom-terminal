@@ -28,7 +28,7 @@ const SECTION_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_TOOLBAR_HEIGHT: f32 = 30.0;
 const FLOATING_ICON_INSET: f32 = 8.0;
 const MAX_VIEWPORT_FRACTION: f32 = 0.50;
-const RESIZE_GRAB_RADIUS: f32 = 7.0;
+const RESIZE_GRAB_WIDTH: f32 = 6.0;
 const START_ALL_TASKS_LABEL: &str = "Start all (new tabs)";
 
 #[derive(Default)]
@@ -201,16 +201,7 @@ impl ContextUi {
         let mut sidebar_width = preferred_width.clamp(MIN_CONTEXT_SIDEBAR_WIDTH as f32, max_width);
         let mut width_changed_by_drag = false;
         let resize_id = Id::new("phantom_context_actions_resize");
-        let initial_resize_rect = egui::Rect::from_min_max(
-            egui::pos2(
-                content_rect.right() - sidebar_width - RESIZE_GRAB_RADIUS,
-                content_rect.top(),
-            ),
-            egui::pos2(
-                content_rect.right() - sidebar_width + RESIZE_GRAB_RADIUS,
-                content_rect.bottom(),
-            ),
-        );
+        let initial_resize_rect = sidebar_resize_rect(content_rect, sidebar_width);
         let (pointer_pos, primary_pressed, primary_down) = root_ui.input(|input| {
             (
                 input.pointer.interact_pos(),
@@ -240,13 +231,7 @@ impl ContextUi {
             egui::pos2(content_rect.right() - sidebar_width, content_rect.top()),
             content_rect.max,
         );
-        let resize_rect = egui::Rect::from_min_max(
-            egui::pos2(panel_rect.left() - RESIZE_GRAB_RADIUS, content_rect.top()),
-            egui::pos2(
-                panel_rect.left() + RESIZE_GRAB_RADIUS,
-                content_rect.bottom(),
-            ),
-        );
+        let resize_rect = sidebar_resize_rect(content_rect, sidebar_width);
         let mut panel_ui = root_ui.new_child(
             UiBuilder::new()
                 .id_salt("context_actions_content_area")
@@ -540,6 +525,19 @@ impl ContextUi {
         );
         draw_manifest_review(ui, manifest)
     }
+}
+
+/// Keep the resize gesture on the sidebar side of the divider. The terminal
+/// side owns its full pointer area, including the scrollbar hit corridor.
+fn sidebar_resize_rect(content_rect: egui::Rect, sidebar_width: f32) -> egui::Rect {
+    let divider_x = content_rect.right() - sidebar_width;
+    egui::Rect::from_min_max(
+        egui::pos2(divider_x, content_rect.top()),
+        egui::pos2(
+            (divider_x + RESIZE_GRAB_WIDTH).min(content_rect.right()),
+            content_rect.bottom(),
+        ),
+    )
 }
 
 fn spdeploy_dropdown_entries(spdeploy: &SpdeploySection) -> Vec<SpdeployDropdownEntry> {
@@ -1165,6 +1163,20 @@ mod tests {
         assert!((rect.top() - 42.0).abs() <= 1.0);
         assert!((rect.bottom() - 800.0).abs() <= 1.0);
         assert!((rect.height() - 758.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn sidebar_resize_hitbox_stays_entirely_inside_sidebar() {
+        let content = egui::Rect::from_min_max(egui::pos2(0.0, 42.0), egui::pos2(1280.0, 800.0));
+        let sidebar_width = 260.0;
+        let divider_x = content.right() - sidebar_width;
+
+        let hitbox = sidebar_resize_rect(content, sidebar_width);
+
+        assert_eq!(hitbox.left(), divider_x);
+        assert_eq!(hitbox.right(), divider_x + RESIZE_GRAB_WIDTH);
+        assert!(!hitbox.contains(egui::pos2(divider_x - 0.5, 120.0)));
+        assert!(hitbox.contains(egui::pos2(divider_x, 120.0)));
     }
 
     #[test]
