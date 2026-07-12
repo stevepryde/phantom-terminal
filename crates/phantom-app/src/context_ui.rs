@@ -371,27 +371,42 @@ impl ContextUi {
             .plugin(&section.id)
             .is_some_and(|plugin| plugin.section_collapsed);
         let mut outcome = ContextUiOutcome::default();
+        let (_, header_rect) =
+            ui.allocate_space(egui::vec2(ui.available_width(), SECTION_HEADER_HEIGHT));
         let edit_rect = matches!(section.content, ContextSectionContent::Manifest(_)).then(|| {
-            let available = ui.available_rect_before_wrap();
             egui::Rect::from_min_max(
-                egui::pos2(available.right() - SECTION_HEADER_HEIGHT, available.top()),
-                egui::pos2(available.right(), available.top() + SECTION_HEADER_HEIGHT),
+                egui::pos2(
+                    header_rect.right() - SECTION_HEADER_HEIGHT,
+                    header_rect.top(),
+                ),
+                header_rect.right_bottom(),
             )
         });
-        let header = full_width_row_with_height(
-            ui,
-            SECTION_HEADER_HEIGHT,
-            Sense::click(),
-            |ui, rect, color| {
-                draw_section_chevron(ui, rect, !collapsed, color);
-                ui.painter().text(
-                    egui::pos2(rect.left() + 25.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    section_label(section),
-                    FontId::proportional(11.0),
-                    color,
-                );
-            },
+        let toggle_rect = edit_rect.map_or(header_rect, |rect| {
+            egui::Rect::from_min_max(
+                header_rect.min,
+                egui::pos2(rect.left(), header_rect.bottom()),
+            )
+        });
+        let header = ui
+            .interact(
+                toggle_rect,
+                Id::new(("context_section_toggle", section.id.as_str())),
+                Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let header_visuals = ui.style().interact(&header);
+        if header.hovered() || header.has_focus() {
+            ui.painter()
+                .rect_filled(toggle_rect, 0.0, header_visuals.weak_bg_fill);
+        }
+        draw_section_chevron(ui, header_rect, !collapsed, header_visuals.fg_stroke.color);
+        ui.painter().text(
+            egui::pos2(header_rect.left() + 25.0, header_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            section_label(section),
+            FontId::proportional(11.0),
+            header_visuals.fg_stroke.color,
         );
         let edit = edit_rect.map(|rect| {
             let response = ui
@@ -427,7 +442,10 @@ impl ContextUi {
                         ui.add_space(8.0);
                         ui.vertical(|ui| {
                             ui.set_width((ui.available_width() - 8.0).max(0.0));
-                            outcome.request = self.draw_manifest(ui, manifest);
+                            let request = self.draw_manifest(ui, manifest);
+                            if outcome.request.is_none() {
+                                outcome.request = request;
+                            }
                         });
                     });
                     ui.add_space(6.0);
@@ -1486,6 +1504,66 @@ mod tests {
             })
         );
         assert_eq!(edit_manifest_request(&snapshot.sections[1]), None);
+    }
+
+    #[test]
+    fn tasks_header_ellipsis_emits_edit_without_collapsing_section() {
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        let mut state = ContextUi::default();
+        let screen_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let mut initial = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                initial = Some(state.draw(ui, &mut config, &snapshot(), 42.0, 220));
+            },
+        );
+        initial.unwrap();
+        let ellipsis = ctx
+            .read_response(Id::new(("context_section_edit", MANIFEST_PLUGIN_ID)))
+            .unwrap()
+            .rect
+            .center();
+        let click_input = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                egui::Event::PointerMoved(ellipsis),
+                egui::Event::PointerButton {
+                    pos: ellipsis,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: ellipsis,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut clicked = None;
+        let _ = ctx.run_ui(click_input, |ui| {
+            clicked = Some(state.draw(ui, &mut config, &snapshot(), 42.0, 220));
+        });
+
+        assert!(matches!(
+            clicked.unwrap().request,
+            Some(ContextRequest::EditManifest { .. })
+        ));
+        assert!(
+            !config
+                .context_actions
+                .plugin(MANIFEST_PLUGIN_ID)
+                .unwrap()
+                .section_collapsed
+        );
     }
 
     #[test]
