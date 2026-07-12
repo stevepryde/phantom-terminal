@@ -401,7 +401,7 @@ impl ContextUi {
                     Sense::click(),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
-            draw_edit_icon(ui, rect, &response);
+            draw_ellipsis_icon(ui, rect, &response);
             response.on_hover_text("Edit .phantom.yml")
         });
         let edit_clicked = edit.as_ref().is_some_and(egui::Response::clicked);
@@ -690,34 +690,19 @@ fn draw_section_chevron(ui: &Ui, rect: egui::Rect, expanded: bool, color: Color3
         .line(points.to_vec(), egui::Stroke::new(1.2, color));
 }
 
-fn draw_edit_icon(ui: &Ui, rect: egui::Rect, response: &egui::Response) {
+fn draw_ellipsis_icon(ui: &Ui, rect: egui::Rect, response: &egui::Response) {
     let visuals = ui.style().interact(response);
     if response.hovered() || response.has_focus() {
         ui.painter().rect_filled(rect, 0.0, visuals.weak_bg_fill);
     }
     let center = rect.center();
-    let stroke = egui::Stroke::new(1.3, visuals.fg_stroke.color);
-    ui.painter().line_segment(
-        [
-            egui::pos2(center.x - 4.0, center.y + 4.0),
-            egui::pos2(center.x + 4.0, center.y - 4.0),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(center.x + 2.5, center.y - 5.5),
-            egui::pos2(center.x + 5.5, center.y - 2.5),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(center.x - 5.0, center.y + 5.0),
-            egui::pos2(center.x - 1.5, center.y + 4.0),
-        ],
-        stroke,
-    );
+    for offset in [-5.0, 0.0, 5.0] {
+        ui.painter().circle_filled(
+            egui::pos2(center.x + offset, center.y),
+            1.4,
+            visuals.fg_stroke.color,
+        );
+    }
 }
 
 fn edit_manifest_request(section: &ContextSection) -> Option<ContextRequest> {
