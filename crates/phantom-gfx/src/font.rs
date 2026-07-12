@@ -51,8 +51,7 @@ const SYMBOL_FONT_FALLBACKS: &[&str] = &[
 /// The generic `monospace` choice stays first because it lets the platform pick
 /// a sensible terminal face and keeps old configs valid on every machine.
 pub fn available_terminal_font_families() -> Vec<String> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+    let db = load_font_database();
     available_terminal_font_families_from_db(&db)
 }
 
@@ -121,8 +120,7 @@ impl FontSet {
     /// rebuild (font settings change, monitor scale change): a corrupt font
     /// file mid-session must surface as an error, not a panic.
     pub fn new(family: &str, size_px: f32, line_height: f32) -> Result<Self, String> {
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
+        let db = load_font_database();
 
         let mut faces = Vec::new();
         let regular_id =
@@ -239,6 +237,60 @@ impl FontSet {
             glyph_id,
         })
     }
+}
+
+fn load_font_database() -> fontdb::Database {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    #[cfg(target_os = "linux")]
+    ensure_linux_monospace(&mut db);
+
+    db
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_monospace(db: &mut fontdb::Database) {
+    let generic = [fontdb::Family::Monospace];
+    if query_face(db, &generic, fontdb::Weight::NORMAL, fontdb::Style::Normal)
+        .is_some_and(|id| face_is_usable_monospace(db, id))
+    {
+        return;
+    }
+
+    // Some Linux fontconfig configurations expose font directories but omit
+    // a usable `monospace` alias. Honor the installed database before falling
+    // back to an embedded face.
+    let installed_family = db.faces().find_map(|face| {
+        if face.monospaced && face_is_parseable(db, face.id) {
+            face.families.first().map(|family| family.0.clone())
+        } else {
+            None
+        }
+    });
+    if let Some(family) = installed_family {
+        db.set_monospace_family(family);
+        return;
+    }
+
+    // Minimal distributions and containers may ship no fonts at all. Hack is
+    // already present in the locked egui dependency tree and gives the
+    // terminal a deterministic, offline-safe last resort.
+    db.load_font_data(epaint_default_fonts::HACK_REGULAR.to_vec());
+    db.set_monospace_family("Hack");
+}
+
+#[cfg(target_os = "linux")]
+fn face_is_usable_monospace(db: &fontdb::Database, id: fontdb::ID) -> bool {
+    db.face(id).is_some_and(|face| face.monospaced) && face_is_parseable(db, id)
+}
+
+#[cfg(target_os = "linux")]
+fn face_is_parseable(db: &fontdb::Database, id: fontdb::ID) -> bool {
+    db.with_face_data(id, |data, index| {
+        FontRef::from_index(data, index as usize).is_some()
+    })
+    .unwrap_or(false)
 }
 
 fn rasterize_font(
@@ -553,5 +605,21 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(families.len(), unique.len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_without_system_fonts_gets_embedded_monospace_fallback() {
+        let mut db = fontdb::Database::new();
+        ensure_linux_monospace(&mut db);
+
+        let generic = [fontdb::Family::Monospace];
+        let id = query_face(&db, &generic, fontdb::Weight::NORMAL, fontdb::Style::Normal)
+            .expect("embedded Linux fallback should resolve");
+
+        assert!(face_is_usable_monospace(&db, id));
+        assert!(db
+            .face(id)
+            .is_some_and(|face| face.families.iter().any(|family| family.0 == "Hack")));
     }
 }

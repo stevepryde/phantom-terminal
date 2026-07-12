@@ -22,6 +22,11 @@ unicode-width = { workspace = true }
 # Only used by the optional headless offscreen-render harness; not in the app.
 pollster = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already in the locked egui tree. Provides a known-good terminal face when a
+# minimal Linux install has no usable system monospace font.
+epaint_default_fonts = { workspace = true }
+
 [features]
 # Offscreen render-to-image harness (`phantom_gfx::headless`) for pixel tests and
 # snapshot dumps. Off by default so the shipped app build never pulls pollster.
