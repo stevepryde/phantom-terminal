@@ -101,6 +101,13 @@ validated-execution posture.
   Nested submenu breadcrumbs appear as non-selectable group headings. Dispatch
   still uses the validated operation name and exact declaring config, including
   when different submenu files declare operations with the same name.
+- **CTX-027 (correctness):** Errors and other global notices render in egui's
+  topmost layer after every panel, sidebar, palette, and popup. Contextual UI
+  must never obscure an error.
+- **CTX-028 (correctness):** Explicit contextual programs are resolved from the
+  normalized GUI-safe PATH before PTY spawn. The fallback includes `~/bin`,
+  `~/.cargo/bin`, and `~/.local/bin`, so Finder-launched builds can run trusted
+  tools without inheriting a login shell's environment.
 
 ## `.phantom.yml` version 1
 

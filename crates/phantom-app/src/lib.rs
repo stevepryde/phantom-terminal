@@ -31,7 +31,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use egui_ui::{EguiLayer, UiState};
+use egui_ui::{EguiLayer, UiFrameContext, UiState};
 use event::{AppInput, Mods};
 use gpu::{GpuContext, PresentStatus};
 use keybindings::{Action, Keymap};
@@ -2521,14 +2521,18 @@ impl App {
             _ => 0.0,
         };
         let context_config_before = self.config.context_actions.clone();
+        let global_notice = self.notice.as_ref().map(|notice| notice.text.as_str());
         let ui_outcome = match (self.gpu.as_ref(), self.egui.as_mut()) {
             (Some(gpu), Some(egui)) => egui.run_with_context(
                 &gpu.window,
                 &mut self.ui,
                 &mut self.config,
                 &mut self.palette,
-                &self.context_snapshot,
-                context_top_inset_points,
+                UiFrameContext {
+                    snapshot: &self.context_snapshot,
+                    top_inset_points: context_top_inset_points,
+                    global_notice,
+                },
             ),
             _ => Default::default(),
         };
@@ -2660,27 +2664,6 @@ impl App {
                 renderer.text(&gpu.queue, px, py, &self.preedit, colors.text);
                 renderer.fill_rect(px, py + ch - 2.0, width, 2.0, colors.accent);
             }
-        }
-        if let Some(notice) = self.notice.as_ref() {
-            renderer.begin_overlay();
-            let pad = 10.0;
-            let cell_h = renderer.cell_size().1;
-            let text_w = renderer.text_width(&notice.text);
-            let available_w = (w as f32 - pad * 2.0).max(40.0);
-            let min_w = available_w.min(120.0);
-            let box_w = (text_w + pad * 2.0).clamp(min_w, available_w);
-            let box_h = cell_h + pad * 2.0;
-            let x = ((w as f32 - box_w) / 2.0).max(pad);
-            let y = (h as f32 - box_h - pad).max(pad);
-            renderer.fill_rect(x, y, box_w, box_h, [12, 16, 22, 235]);
-            renderer.fill_rect(x, y, 3.0, box_h, colors.accent);
-            renderer.text(
-                &gpu.queue,
-                x + pad,
-                y + pad,
-                &truncate_to_fit(&notice.text, renderer, box_w - pad * 2.0),
-                colors.text,
-            );
         }
         renderer.end(&gpu.device, &gpu.queue);
         let present_status = if let Some(egui) = self.egui.as_mut() {
@@ -3215,20 +3198,6 @@ fn truncate_to_chars(value: &str, max_bytes: usize) -> String {
         }
         out.push(ch);
     }
-    out
-}
-
-fn truncate_to_fit(value: &str, renderer: &Renderer, max_width: f32) -> String {
-    let cell_w = renderer.cell_size().0.max(1.0);
-    let max_chars = (max_width / cell_w).floor().max(1.0) as usize;
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-    let mut out: String = value.chars().take(max_chars - 1).collect();
-    out.push('…');
     out
 }
 

@@ -5,8 +5,8 @@
 //! surfaces.
 
 use egui::{
-    Area, Button, Color32, ComboBox, Context, Frame, Id, Key as EguiKey, LayerId, Margin, Order,
-    Panel, RichText, Slider, TextEdit, Ui, ViewportId,
+    Align2, Area, Button, Color32, ComboBox, Context, Frame, Id, Key as EguiKey, LayerId, Margin,
+    Order, Panel, RichText, Slider, TextEdit, Ui, ViewportId,
 };
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use phantom_core::{
@@ -106,6 +106,13 @@ pub struct UiState {
     blur_regions: Vec<egui::Rect>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct UiFrameContext<'a> {
+    pub snapshot: &'a ContextSnapshot,
+    pub top_inset_points: f32,
+    pub global_notice: Option<&'a str>,
+}
+
 impl UiState {
     pub fn new(config: &AppConfig) -> Self {
         Self {
@@ -164,8 +171,7 @@ impl UiState {
         ui: &mut Ui,
         config: &mut AppConfig,
         palette: &mut PaletteState,
-        context: &ContextSnapshot,
-        context_top_inset_points: f32,
+        frame: UiFrameContext<'_>,
     ) -> UiOutcome {
         let mut outcome = UiOutcome::default();
         self.context_ui.begin_frame();
@@ -202,9 +208,13 @@ impl UiState {
             self.panel_width_px = 0.0;
         }
         if self.active_panel.is_none() && !palette.open {
-            let context_overlay =
-                self.context_ui
-                    .draw(ui, config, context, context_top_inset_points, context_alpha);
+            let context_overlay = self.context_ui.draw(
+                ui,
+                config,
+                frame.snapshot,
+                frame.top_inset_points,
+                context_alpha,
+            );
             self.context_sidebar_width_px =
                 context_overlay.reserved_width_points * ui.ctx().pixels_per_point();
             outcome.config_changed |= context_overlay.config_changed;
@@ -224,6 +234,9 @@ impl UiState {
             if let Some(rect) = palette.rect {
                 self.blur_regions.push(rect);
             }
+        }
+        if let Some(notice) = frame.global_notice {
+            global_notice_overlay(ui.ctx(), notice);
         }
         outcome
     }
@@ -548,13 +561,12 @@ impl EguiLayer {
         ui_state: &mut UiState,
         config: &mut AppConfig,
         palette: &mut PaletteState,
-        context: &ContextSnapshot,
-        context_top_inset_points: f32,
+        frame: UiFrameContext<'_>,
     ) -> UiOutcome {
         let raw_input = self.state.take_egui_input(window);
         let mut outcome = UiOutcome::default();
         let full_output = self.ctx.run_ui(raw_input, |ui| {
-            outcome = ui_state.draw(ui, config, palette, context, context_top_inset_points);
+            outcome = ui_state.draw(ui, config, palette, frame);
         });
         self.state
             .handle_platform_output(window, full_output.platform_output);
@@ -650,6 +662,32 @@ fn active_blur_regions(regions: &[BlurRegion], suppressed: bool) -> &[BlurRegion
     } else {
         regions
     }
+}
+
+fn global_notice_order() -> Order {
+    Order::Tooltip
+}
+
+fn global_notice_overlay(ctx: &Context, notice: &str) {
+    let content = ctx.content_rect();
+    let position = egui::pos2(content.center().x, content.bottom() - 16.0);
+    let max_width = (content.width() - 24.0).clamp(40.0, 720.0);
+    Area::new(Id::new("phantom_global_notice"))
+        .order(global_notice_order())
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(position)
+        .interactable(false)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 245))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(56, 189, 248)))
+                .corner_radius(4)
+                .inner_margin(Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.set_max_width(max_width);
+                    ui.add(egui::Label::new(RichText::new(notice).size(12.0)).wrap());
+                });
+        });
 }
 
 /// Convert an egui rect (points) to a physical-pixel [`BlurRegion`], clamped to
@@ -1165,8 +1203,11 @@ mod tests {
                 ui,
                 config,
                 palette,
-                &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
-                0.0,
+                UiFrameContext {
+                    snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    top_inset_points: 0.0,
+                    global_notice: None,
+                },
             );
         });
         output
@@ -1259,6 +1300,11 @@ mod tests {
 
         assert_eq!(active_blur_regions(&regions, false), &regions);
         assert!(active_blur_regions(&regions, true).is_empty());
+    }
+
+    #[test]
+    fn global_notices_use_the_topmost_egui_layer() {
+        assert_eq!(global_notice_order(), Order::Tooltip);
     }
 
     #[test]
