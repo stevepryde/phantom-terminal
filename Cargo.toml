@@ -9,10 +9,10 @@ alacritty_terminal = "=0.26.0"
 arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
 directories = "6"
-egui = "0.34.3"
-egui-wgpu = "0.34.3"
-egui-winit = { version = "0.34.3", default-features = false }
-epaint_default_fonts = "=0.34.3"
+egui = "0.35.0"
+egui-wgpu = "0.35.0"
+egui-winit = { version = "0.35.0", default-features = false }
+epaint_default_fonts = "=0.35.0"
 fontique = { version = "0.11", features = ["fontconfig-dlopen"] }
 image = { version = "0.25.10", default-features = false, features = ["webp"] }
 libc = "0.2"
@@ -22,8 +22,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRe
 phantom-core = { version = "0.1.2", path = "crates/phantom-core" }
 phantom-emu = { version = "0.1.2", path = "crates/phantom-emu" }
 phantom-gfx = { version = "0.1.2", path = "crates/phantom-gfx" }
-png = "0.17"
-pollster = "0.4.0"
+png = "0.18"
+pollster = "1.0.1"
 portable-pty = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +32,7 @@ swash = "0.2"
 thiserror = "2"
 # Already in the tree via alacritty_terminal; same version, no new supply chain.
 unicode-width = "0.2"
+# Keep aligned with egui-wgpu so both renderers share one Device/Queue type.
 wgpu = "29"
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
 
