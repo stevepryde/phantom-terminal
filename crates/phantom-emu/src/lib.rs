@@ -70,6 +70,24 @@ pub trait VtCore {
     /// The selected text, if any.
     fn selection_text(&self) -> Option<String>;
 
+    /// The selected terminal-cell range, in absolute scrollback coordinates.
+    ///
+    /// This is intended for capturing a stable selection-only search scope.
+    fn selection_range(&self) -> Option<SearchRange>;
+
+    /// Search the finite in-memory buffer in stable buffer order.
+    fn search_scrollback(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        range: Option<SearchRange>,
+    ) -> Result<Vec<SearchMatch>, SearchError>;
+
+    /// Set the temporary active find match and scroll it into view.
+    ///
+    /// This does not replace or mutate the user's ordinary terminal selection.
+    fn set_active_search_match(&mut self, search_match: Option<SearchMatch>);
+
     /// The application's requested mouse-reporting mode.
     fn mouse_mode(&self) -> MouseMode;
 
@@ -139,6 +157,8 @@ pub struct SnapCell {
     pub width: u8,
     /// True when the cell is within the active text selection.
     pub selected: bool,
+    /// True when the cell is within the active find match.
+    pub search_match: bool,
 }
 
 impl Default for SnapCell {
@@ -150,9 +170,69 @@ impl Default for SnapCell {
             attrs: CellAttrs::default(),
             width: 1,
             selected: false,
+            search_match: false,
         }
     }
 }
+
+/// A cell in the terminal's finite buffer, using Alacritty-compatible absolute
+/// line coordinates. History lines are negative and visible screen lines start
+/// at zero when the viewport is at the live prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BufferPoint {
+    pub line: i32,
+    pub column: usize,
+}
+
+/// An inclusive, ordered terminal-cell range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchRange {
+    pub start: BufferPoint,
+    pub end: BufferPoint,
+}
+
+impl SearchRange {
+    pub fn new(a: BufferPoint, b: BufferPoint) -> Self {
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        Self { start, end }
+    }
+
+    pub fn contains(self, point: BufferPoint) -> bool {
+        self.start <= point && point <= self.end
+    }
+}
+
+/// Independent constraints applied to literal or regular-expression search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+}
+
+/// One inclusive match in terminal-cell coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub range: SearchRange,
+}
+
+/// A search query which could not be compiled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchError {
+    InvalidRegex(String),
+}
+
+impl std::fmt::Display for SearchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRegex(message) => {
+                write!(formatter, "invalid regular expression: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SearchError {}
 
 /// Which half of a cell a selection anchor is on (affects which cell the anchor
 /// includes).

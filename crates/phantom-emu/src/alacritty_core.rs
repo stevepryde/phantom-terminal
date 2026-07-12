@@ -15,6 +15,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     self, Color as AnsiColor, CursorShape as AnsiCursorShape, CursorStyle as AnsiCursorStyle,
@@ -22,8 +23,9 @@ use alacritty_terminal::vte::ansi::{
 };
 
 use crate::{
-    CellAttrs, CellColor, CursorShape, CursorState, MouseMode, MouseProtocol, NamedColor,
-    ScrollState, SelSide, SelectionKind, SnapCell, Snapshot, VtCore,
+    BufferPoint, CellAttrs, CellColor, CursorShape, CursorState, MouseMode, MouseProtocol,
+    NamedColor, ScrollState, SearchError, SearchMatch, SearchOptions, SearchRange, SelSide,
+    SelectionKind, SnapCell, Snapshot, VtCore,
 };
 
 const PHANTOM_SEMANTIC_ESCAPE_CHARS: &str = "\t !\"#$%&'()*+,./:;<=>?@[\\]^`{|}~│";
@@ -76,6 +78,7 @@ pub struct AlacrittyCore {
     parser: ansi::Processor,
     responses: Rc<RefCell<Vec<u8>>>,
     size: TermDimensions,
+    active_search_match: Option<SearchRange>,
 }
 
 impl AlacrittyCore {
@@ -102,16 +105,22 @@ impl AlacrittyCore {
             parser: ansi::Processor::new(),
             responses,
             size,
+            active_search_match: None,
         }
     }
 }
 
 impl VtCore for AlacrittyCore {
     fn advance(&mut self, bytes: &[u8]) {
+        // Output can rotate or reflow absolute grid coordinates. The app will
+        // recompute live search results after advancing the terminal.
+        self.active_search_match = None;
         self.parser.advance(&mut self.term, bytes);
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
+        // Reflow changes the coordinate mapping even when the text is stable.
+        self.active_search_match = None;
         self.size = TermDimensions::new(cols as usize, rows as usize);
         self.term.resize(self.size);
     }
@@ -148,6 +157,9 @@ impl VtCore for AlacrittyCore {
                 1
             };
             let selected = selection.is_some_and(|range| range.contains(indexed.point));
+            let search_match = self
+                .active_search_match
+                .is_some_and(|range| range.contains(from_point(indexed.point)));
             cells[row as usize * cols_us + col] = SnapCell {
                 c: cell.c,
                 fg: map_color(cell.fg),
@@ -155,6 +167,7 @@ impl VtCore for AlacrittyCore {
                 attrs: map_attrs(cell.flags),
                 width,
                 selected,
+                search_match,
             };
         }
 
@@ -233,6 +246,67 @@ impl VtCore for AlacrittyCore {
         self.term.selection_to_string().filter(|s| !s.is_empty())
     }
 
+    fn selection_range(&self) -> Option<SearchRange> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        Some(SearchRange::new(
+            from_point(range.start),
+            from_point(range.end),
+        ))
+    }
+
+    fn search_scrollback(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        range: Option<SearchRange>,
+    ) -> Result<Vec<SearchMatch>, SearchError> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pattern = search_pattern(query, options);
+        let mut regex = RegexSearch::new(&pattern)
+            .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
+        let range = self.clamp_search_range(range.unwrap_or_else(|| self.full_search_range()));
+        let start = to_point(range.start);
+        let end = to_point(range.end);
+        if start > end {
+            return Ok(Vec::new());
+        }
+
+        let mut matches = Vec::new();
+        let mut origin = start;
+        while origin <= end {
+            let Some(found) = self.term.regex_search_right(&mut regex, origin, end) else {
+                break;
+            };
+            let found_start = *found.start();
+            let found_end = *found.end();
+            if found_start < start || found_end > end {
+                break;
+            }
+            let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
+            if !options.whole_word || self.is_whole_word_match(found_range) {
+                matches.push(SearchMatch { range: found_range });
+            }
+
+            let Some(next) = self.point_after(found_end, end) else {
+                break;
+            };
+            origin = next;
+        }
+
+        Ok(matches)
+    }
+
+    fn set_active_search_match(&mut self, search_match: Option<SearchMatch>) {
+        self.active_search_match = search_match.map(|search_match| {
+            let range = self.clamp_search_range(search_match.range);
+            self.scroll_range_into_view(range);
+            range
+        });
+    }
+
     fn mouse_mode(&self) -> MouseMode {
         let mode = self.term.mode();
         let protocol = if mode.contains(TermMode::MOUSE_MOTION) {
@@ -263,6 +337,177 @@ impl AlacrittyCore {
         let max_col = self.size.columns.saturating_sub(1);
         Point::new(Line(row as i32 - offset), Column(col.min(max_col)))
     }
+
+    fn full_search_range(&self) -> SearchRange {
+        SearchRange::new(
+            BufferPoint {
+                line: self.term.topmost_line().0,
+                column: 0,
+            },
+            BufferPoint {
+                line: self.term.bottommost_line().0,
+                column: self.size.columns.saturating_sub(1),
+            },
+        )
+    }
+
+    fn clamp_search_range(&self, range: SearchRange) -> SearchRange {
+        let full = self.full_search_range();
+        SearchRange::new(
+            BufferPoint {
+                line: range.start.line.clamp(full.start.line, full.end.line),
+                column: range.start.column.min(full.end.column),
+            },
+            BufferPoint {
+                line: range.end.line.clamp(full.start.line, full.end.line),
+                column: range.end.column.min(full.end.column),
+            },
+        )
+    }
+
+    fn point_after(&self, point: Point, limit: Point) -> Option<Point> {
+        let next = if point.column.0 + 1 < self.size.columns {
+            Point::new(point.line, point.column + 1)
+        } else {
+            Point::new(point.line + 1, Column(0))
+        };
+        (next <= limit).then_some(next)
+    }
+
+    fn scroll_range_into_view(&mut self, range: SearchRange) {
+        let viewport_rows = self.size.screen_lines as i32;
+        let current_offset = self.term.grid().display_offset() as i32;
+        let viewport_top = -current_offset;
+        let viewport_bottom = viewport_top + viewport_rows - 1;
+        let target_line = if range.start.line < viewport_top {
+            range.start.line
+        } else if range.end.line > viewport_bottom {
+            range.end.line - viewport_rows + 1
+        } else {
+            return;
+        };
+        self.scroll_to_offset(target_line.saturating_neg() as usize);
+    }
+
+    fn is_whole_word_match(&self, range: SearchRange) -> bool {
+        let start = to_point(range.start);
+        let end = to_point(range.end);
+        let starts_with_word = regex_syntax::is_word_character(self.term.grid()[start].c);
+        let ends_with_word = regex_syntax::is_word_character(self.term.grid()[end].c);
+        let word_before = self
+            .previous_text_point(start)
+            .is_some_and(|point| regex_syntax::is_word_character(self.term.grid()[point].c));
+        let word_after = self
+            .next_text_point(end)
+            .is_some_and(|point| regex_syntax::is_word_character(self.term.grid()[point].c));
+        starts_with_word != word_before && ends_with_word != word_after
+    }
+
+    fn previous_text_point(&self, point: Point) -> Option<Point> {
+        let mut line = point.line;
+        let mut column = point.column.0;
+        if column == 0 {
+            if line <= self.term.topmost_line() {
+                return None;
+            }
+            let previous_line = line - 1;
+            let last_column = Column(self.size.columns.saturating_sub(1));
+            if !self.term.grid()[Point::new(previous_line, last_column)]
+                .flags
+                .contains(Flags::WRAPLINE)
+            {
+                return None;
+            }
+            line = previous_line;
+            column = self.size.columns;
+        }
+
+        while column > 0 {
+            column -= 1;
+            let candidate = Point::new(line, Column(column));
+            if !self.term.grid()[candidate]
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn next_text_point(&self, point: Point) -> Option<Point> {
+        let grid = self.term.grid();
+        let mut line = point.line;
+        let mut column = point.column.0
+            + if grid[point].flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+
+        loop {
+            if column >= self.size.columns {
+                let last_column = Column(self.size.columns.saturating_sub(1));
+                if line >= self.term.bottommost_line()
+                    || !grid[Point::new(line, last_column)]
+                        .flags
+                        .contains(Flags::WRAPLINE)
+                {
+                    return None;
+                }
+                line += 1;
+                column = 0;
+            }
+
+            let candidate = Point::new(line, Column(column));
+            if !grid[candidate]
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                return Some(candidate);
+            }
+            column += 1;
+        }
+    }
+}
+
+fn from_point(point: Point) -> BufferPoint {
+    BufferPoint {
+        line: point.line.0,
+        column: point.column.0,
+    }
+}
+
+fn to_point(point: BufferPoint) -> Point {
+    Point::new(Line(point.line), Column(point.column))
+}
+
+fn search_pattern(query: &str, options: SearchOptions) -> String {
+    let query = if options.regex {
+        query.to_owned()
+    } else {
+        escape_regex(query)
+    };
+    let query = format!("(?:{query})");
+    if options.case_sensitive {
+        format!("(?-i:{query})")
+    } else {
+        format!("(?i:{query})")
+    }
+}
+
+fn escape_regex(literal: &str) -> String {
+    let mut escaped = String::with_capacity(literal.len());
+    for character in literal.chars() {
+        if matches!(
+            character,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn map_side(side: SelSide) -> Side {
@@ -581,5 +826,153 @@ mod tests {
         assert!(mode.reports());
         assert!(mode.sgr);
         assert!(term.bracketed_paste());
+    }
+
+    #[test]
+    fn literal_search_is_case_insensitive_and_escapes_regex_syntax() {
+        let mut term = core(4, 40, 100);
+        term.advance(b"Alpha ALPHA alpha a.*b");
+
+        let matches = term
+            .search_scrollback("ALPHA", SearchOptions::default(), None)
+            .unwrap();
+        assert_eq!(matches.len(), 3);
+
+        let literal = term
+            .search_scrollback("a.*b", SearchOptions::default(), None)
+            .unwrap();
+        assert_eq!(literal.len(), 1);
+        assert_eq!(literal[0].range.start.column, 18);
+        assert_eq!(literal[0].range.end.column, 21);
+    }
+
+    #[test]
+    fn case_sensitive_and_unicode_whole_word_are_independent() {
+        let mut term = core(4, 40, 100);
+        term.advance("café caféine CAFÉ".as_bytes());
+
+        let whole_word = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::default()
+        };
+        assert_eq!(
+            term.search_scrollback("café", whole_word, None)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let exact = SearchOptions {
+            case_sensitive: true,
+            ..whole_word
+        };
+        assert_eq!(
+            term.search_scrollback("café", exact, None).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn regex_search_reports_invalid_patterns_without_literal_fallback() {
+        let mut term = core(4, 40, 100);
+        term.advance(b"item-12 item-345");
+        let regex = SearchOptions {
+            regex: true,
+            ..SearchOptions::default()
+        };
+
+        assert_eq!(
+            term.search_scrollback(r"item-\d+", regex, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            term.search_scrollback("[", regex, None),
+            Err(SearchError::InvalidRegex(_))
+        ));
+    }
+
+    #[test]
+    fn search_maps_wrapped_wide_unicode_and_scrollback_cells() {
+        let mut term = core(2, 5, 100);
+        term.advance("abc世界z\r\nother\r\ntail".as_bytes());
+
+        let wrapped = term
+            .search_scrollback("c世界", SearchOptions::default(), None)
+            .unwrap();
+        assert_eq!(wrapped.len(), 1);
+        assert!(wrapped[0].range.start.line < wrapped[0].range.end.line);
+
+        let history = term
+            .search_scrollback("abc", SearchOptions::default(), None)
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].range.start.line < 0);
+    }
+
+    #[test]
+    fn captured_selection_limits_search_without_mutating_selection() {
+        let mut term = core(4, 30, 100);
+        term.advance(b"find outside find");
+        term.selection_start(0, 0, SelSide::Left);
+        term.selection_update(0, 3, SelSide::Right);
+        let captured = term.selection_range().unwrap();
+
+        let matches = term
+            .search_scrollback("find", SearchOptions::default(), Some(captured))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+
+        assert_eq!(term.selection_range(), Some(captured));
+        assert_eq!(term.selection_text().as_deref(), Some("find"));
+    }
+
+    #[test]
+    fn live_selection_scope_rotates_with_output_and_expires_with_history() {
+        let mut term = core(2, 20, 2);
+        term.advance(b"target");
+        term.selection_start(0, 0, SelSide::Left);
+        term.selection_update(0, 5, SelSide::Right);
+        let initial = term.selection_range().unwrap();
+
+        term.advance(b"\r\nnext\r\nline");
+        let rotated = term.selection_range().unwrap();
+        assert_ne!(rotated, initial);
+        assert_eq!(
+            term.search_scrollback("target", SearchOptions::default(), Some(rotated))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        term.advance(b"\r\nthree\r\nfour\r\nfive");
+        assert!(term.selection_range().is_none());
+    }
+
+    #[test]
+    fn active_search_match_highlight_is_separate_and_scrolls_into_view() {
+        let mut term = core(2, 20, 100);
+        term.advance(b"selected\r\nline1\r\nline2\r\nline3\r\ntarget");
+        let target = term
+            .search_scrollback("selected", SearchOptions::default(), None)
+            .unwrap()[0];
+        term.set_active_search_match(Some(target));
+        term.selection_start(0, 0, SelSide::Left);
+        term.selection_update(0, 7, SelSide::Right);
+        let captured = term.selection_range().unwrap();
+
+        assert!(term.scroll_state().offset > 0);
+        let snapshot = term.snapshot();
+        assert!(snapshot.cells.iter().any(|cell| cell.search_match));
+        assert!(snapshot.cells.iter().any(|cell| cell.selected));
+        assert_eq!(term.selection_range(), Some(captured));
+
+        term.set_active_search_match(None);
+        assert!(!term.snapshot().cells.iter().any(|cell| cell.search_match));
+
+        term.set_active_search_match(Some(target));
+        term.advance(b"x");
+        assert!(!term.snapshot().cells.iter().any(|cell| cell.search_match));
     }
 }

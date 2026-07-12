@@ -20,6 +20,7 @@ mod context_actions;
 mod context_ui;
 mod egui_ui;
 mod external_editor;
+mod find;
 mod frequent_commands;
 mod gpu;
 mod input;
@@ -37,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui_ui::{EguiLayer, UiFrameContext, UiState};
 use event::{AppInput, Mods};
+use find::{FindError as FindUiError, FindNavigation, FindResultSummary};
 use gpu::{GpuContext, PresentStatus};
 use keybindings::{Action, Keymap};
 use palette::{PaletteAction, PaletteOutcome, PaletteState};
@@ -47,7 +49,7 @@ use phantom_core::{
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
-    MouseProtocol, ScrollState, SelSide, SelectionKind, VtCore,
+    MouseProtocol, ScrollState, SearchMatch, SearchOptions, SelSide, SelectionKind, VtCore,
 };
 use phantom_gfx::Renderer;
 use tab::Tab;
@@ -549,6 +551,8 @@ pub struct App {
 
     palette: PaletteState,
     ui: UiState,
+    find_matches: Vec<SearchMatch>,
+    find_active: usize,
     notice: Option<Notice>,
     context_snapshot: ContextSnapshot,
     context_generation: u64,
@@ -639,6 +643,8 @@ impl App {
             exit_requested: false,
             palette: PaletteState::default(),
             ui,
+            find_matches: Vec::new(),
+            find_active: 0,
             notice: None,
             context_snapshot: ContextSnapshot::empty(PathBuf::new()),
             context_generation: 0,
@@ -714,6 +720,11 @@ impl App {
         match event {
             AppEvent::PtyBytes { tab, bytes } => {
                 let mut response = None;
+                let refresh_find = self.ui.find_open()
+                    && self
+                        .tabs
+                        .get(self.active)
+                        .is_some_and(|active| active.id == tab);
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.advance_pty(&bytes);
                     let out = t.core.take_pty_output();
@@ -723,6 +734,9 @@ impl App {
                 }
                 if let Some((pty_id, out)) = response {
                     let _ = self.pty.write(pty_id, &out);
+                }
+                if refresh_find {
+                    self.refresh_find();
                 }
                 self.request_redraw();
             }
@@ -792,6 +806,10 @@ impl App {
         self.rename.is_some()
     }
 
+    pub fn find_open(&self) -> bool {
+        self.ui.find_open()
+    }
+
     pub fn notice_text(&self) -> Option<&str> {
         self.notice.as_ref().map(|notice| notice.text.as_str())
     }
@@ -815,6 +833,122 @@ impl App {
 
     fn horizontal(&self) -> bool {
         self.config.tab_layout != "vertical"
+    }
+
+    fn open_find(&mut self) {
+        if self.ui.find_open() {
+            self.ui.request_find_focus();
+            self.request_redraw();
+            return;
+        }
+
+        self.palette.close();
+        self.ui.close_panel();
+        self.rename = None;
+        let selection_available = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.core.selection_range())
+            .is_some();
+        self.find_matches.clear();
+        self.find_active = 0;
+        self.ui.open_find(selection_available);
+        self.refresh_find();
+        self.request_redraw();
+    }
+
+    fn close_find(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.set_active_search_match(None);
+        }
+        self.ui.close_find();
+        self.find_matches.clear();
+        self.find_active = 0;
+        self.request_redraw();
+    }
+
+    fn refresh_find(&mut self) {
+        if !self.ui.find_open() {
+            return;
+        }
+        let state = self.ui.find_state();
+        let query = state.query().to_owned();
+        let options = state.options();
+        // Alacritty keeps its live selection coordinates synchronized as
+        // history rotates. Re-read that range on every refresh instead of
+        // searching a stale copied coordinate after new PTY output.
+        let scope = options.selection_only.then(|| {
+            self.tabs
+                .get(self.active)
+                .and_then(|tab| tab.core.selection_range())
+        });
+        let scope = scope.flatten();
+        let result = if options.selection_only && scope.is_none() {
+            Ok(Vec::new())
+        } else {
+            self.tabs.get(self.active).map_or_else(
+                || Ok(Vec::new()),
+                |tab| {
+                    tab.core.search_scrollback(
+                        &query,
+                        SearchOptions {
+                            case_sensitive: options.case_sensitive,
+                            whole_word: options.whole_word,
+                            regex: options.regex,
+                        },
+                        scope,
+                    )
+                },
+            )
+        };
+
+        let error = match result {
+            Ok(matches) => {
+                self.find_matches = matches;
+                self.find_active = self
+                    .find_active
+                    .min(self.find_matches.len().saturating_sub(1));
+                None
+            }
+            Err(error) => {
+                self.find_matches.clear();
+                self.find_active = 0;
+                Some(FindUiError::InvalidRegex(error.to_string()))
+            }
+        };
+        let active_match = (!self.find_matches.is_empty()).then_some(self.find_active);
+        let search_match = active_match.and_then(|index| self.find_matches.get(index).copied());
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.set_active_search_match(search_match);
+        }
+        self.ui.set_find_results(FindResultSummary {
+            match_count: self.find_matches.len(),
+            active_match,
+            error,
+        });
+    }
+
+    fn navigate_find(&mut self, direction: FindNavigation) {
+        if self.find_matches.is_empty() {
+            return;
+        }
+        self.find_active = match direction {
+            FindNavigation::Previous => self
+                .find_active
+                .checked_sub(1)
+                .unwrap_or(self.find_matches.len() - 1),
+            FindNavigation::Next => (self.find_active + 1) % self.find_matches.len(),
+        };
+        let search_match = self.find_matches.get(self.find_active).copied();
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.set_active_search_match(search_match);
+        }
+        self.ui.set_find_results(FindResultSummary {
+            match_count: self.find_matches.len(),
+            active_match: Some(self.find_active),
+            error: None,
+        });
+        self.request_redraw();
     }
 
     fn window_chrome(&self) -> chrome::WindowChrome {
@@ -967,6 +1101,9 @@ impl App {
     }
 
     fn spawn_new_tab(&mut self, request: NewTabRequest) -> bool {
+        if self.ui.find_open() {
+            self.close_find();
+        }
         let (rows, cols) = self.viewport_grid();
         let launch = match resolve_new_tab_launch(
             &self.config,
@@ -1038,6 +1175,9 @@ impl App {
             return;
         }
         let closed_active = index == self.active;
+        if closed_active && self.ui.find_open() {
+            self.close_find();
+        }
         let tab = self.tabs.remove(index);
         let _ = self.pty.kill(tab.pty_id);
         if self.tabs.is_empty() {
@@ -1126,15 +1266,7 @@ impl App {
             Action::SwitchTab(n) => {
                 let i = (n as usize).saturating_sub(1);
                 if i < self.tabs.len() {
-                    if i != self.active {
-                        // A scrollbar drag in progress belongs to the previous tab.
-                        self.scroll_drag = None;
-                    }
-                    self.active = i;
-                    self.tab_scroll_into_view = Some(i);
-                    self.mark_dirty();
-                    self.schedule_context_discovery();
-                    self.request_redraw();
+                    self.switch_tab(i);
                 }
             }
             Action::RenameTab => {
@@ -1737,6 +1869,10 @@ impl App {
 
     /// Route a key press (after the winit adapter has normalized it).
     fn handle_key_input(&mut self, key: Key, text: Option<&str>) {
+        if find_shortcut(key, self.mods) {
+            self.open_find();
+            return;
+        }
         // Command palette captures all keys while open.
         if self.palette.open {
             if self.keymap.lookup(key, self.mods) == Some(Action::TogglePalette) {
@@ -1893,6 +2029,9 @@ impl App {
         match hit {
             Some(Hit::New) => self.spawn_tab(None, None),
             Some(Hit::Settings) => {
+                if self.ui.find_open() {
+                    self.close_find();
+                }
                 self.ui.toggle_settings(&self.config);
                 self.request_redraw();
             }
@@ -1925,6 +2064,9 @@ impl App {
             return;
         }
         if index != self.active {
+            if self.ui.find_open() {
+                self.close_find();
+            }
             // A scrollbar drag in progress belongs to the previous tab.
             self.scroll_drag = None;
         }
@@ -2580,6 +2722,9 @@ impl App {
             let _ = self.pty.resize(tab.pty_id, rows, cols);
         }
         self.last_terminal_grid = Some((rows, cols));
+        if self.ui.find_open() {
+            self.refresh_find();
+        }
     }
 
     fn flush_pending_terminal_resize(&mut self) {
@@ -2684,21 +2829,27 @@ impl App {
     fn render(&mut self) {
         self.redraw_queued = false;
         self.sync_surface_to_window_size();
-        let context_top_inset_points = match (self.gpu.as_ref(), self.renderer.as_ref()) {
-            (Some(gpu), Some(renderer)) => {
-                let (width, height) = gpu.size();
-                let layout = chrome::compute_layout_scaled(
-                    width.max(1) as f32,
-                    height as f32,
-                    renderer.cell_size().1,
-                    self.config.tab_layout != "vertical",
-                    chrome::WindowChrome::from_config(&self.applied_window_chrome),
-                    gpu.scale_factor(),
-                );
-                chrome::terminal_pane(&layout).y / gpu.scale_factor()
-            }
-            _ => 0.0,
-        };
+        let (context_top_inset_points, terminal_left_points, terminal_right_points) =
+            match (self.gpu.as_ref(), self.renderer.as_ref()) {
+                (Some(gpu), Some(renderer)) => {
+                    let (width, height) = gpu.size();
+                    let layout = chrome::compute_layout_scaled(
+                        width.max(1) as f32,
+                        height as f32,
+                        renderer.cell_size().1,
+                        self.config.tab_layout != "vertical",
+                        chrome::WindowChrome::from_config(&self.applied_window_chrome),
+                        gpu.scale_factor(),
+                    );
+                    let pane = chrome::terminal_pane(&layout);
+                    (
+                        pane.y / gpu.scale_factor(),
+                        pane.x / gpu.scale_factor(),
+                        (pane.x + pane.w) / gpu.scale_factor(),
+                    )
+                }
+                _ => (0.0, 0.0, 0.0),
+            };
         let context_config_before = self.config.context_actions.clone();
         let frequent_commands = self
             .tabs
@@ -2716,6 +2867,8 @@ impl App {
                     snapshot: &self.context_snapshot,
                     frequent_commands: &frequent_commands,
                     top_inset_points: context_top_inset_points,
+                    terminal_left_points,
+                    terminal_right_points,
                     global_notice,
                 },
             ),
@@ -2747,6 +2900,17 @@ impl App {
         }
         if let Some(request) = ui_outcome.context_request {
             self.dispatch_context_request(request);
+        }
+        if ui_outcome.find.close_requested {
+            self.close_find();
+        } else {
+            if ui_outcome.find.query_or_options_changed {
+                self.find_active = 0;
+                self.refresh_find();
+            }
+            if let Some(direction) = ui_outcome.find.navigation {
+                self.navigate_find(direction);
+            }
         }
         if let Some(egui) = self.egui.as_mut() {
             // Rebuilding full-surface blur textures for every intermediate
@@ -2983,6 +3147,17 @@ fn terminal_owns_keyboard(
     context_owns_keyboard: bool,
 ) -> bool {
     !palette_open && !renaming && !settings_open && !context_owns_keyboard
+}
+
+fn find_shortcut(key: Key, mods: Mods) -> bool {
+    matches!(key, Key::Char('f' | 'F')) && !mods.alt && !mods.shift && (mods.ctrl || mods.sup)
+}
+
+fn app_input_is_find_shortcut(input: &AppInput) -> bool {
+    matches!(
+        input,
+        AppInput::Key { key, mods, .. } if find_shortcut(*key, *mods)
+    )
 }
 
 fn context_discovery_config_changed(
@@ -3284,7 +3459,10 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(input) = input {
             let egui_overlay_owns_input =
                 self.egui.is_some() && (self.palette.open || self.ui.context_owns_keyboard());
-            if app_input_bypasses_egui_overlay(&input) || (!consumed && !egui_overlay_owns_input) {
+            if app_input_bypasses_egui_overlay(&input)
+                || app_input_is_find_shortcut(&input)
+                || (!consumed && !egui_overlay_owns_input)
+            {
                 self.handle_input(input);
             }
         }
@@ -3482,6 +3660,61 @@ mod tests {
         assert!(!terminal_owns_keyboard(false, true, false, false));
         assert!(!terminal_owns_keyboard(false, false, true, false));
         assert!(!terminal_owns_keyboard(false, false, false, true));
+    }
+
+    #[test]
+    fn ctrl_f_and_cmd_f_are_reserved_for_scrollback_find() {
+        assert!(find_shortcut(
+            Key::Char('f'),
+            Mods {
+                ctrl: true,
+                ..Mods::default()
+            }
+        ));
+        assert!(find_shortcut(
+            Key::Char('f'),
+            Mods {
+                sup: true,
+                ..Mods::default()
+            }
+        ));
+        assert!(!find_shortcut(Key::Char('f'), Mods::default()));
+        assert!(!find_shortcut(
+            Key::Char('f'),
+            Mods {
+                ctrl: true,
+                shift: true,
+                ..Mods::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn find_opens_for_active_tab_and_closes_when_switching_tabs() {
+        let mut app = test_app();
+        for id in 0..2 {
+            app.tabs.push(Tab::new(
+                id,
+                AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+                u32::MAX,
+                String::new(),
+                None,
+            ));
+        }
+        app.tabs[0].advance_pty(b"find me");
+
+        app.handle_input(AppInput::Key {
+            key: Key::Char('f'),
+            text: Some("f".to_string()),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+        });
+
+        assert!(app.find_open());
+        app.switch_tab(1);
+        assert!(!app.find_open());
     }
 
     #[test]

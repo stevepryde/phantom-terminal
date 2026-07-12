@@ -433,6 +433,7 @@ impl Renderer {
         let default_bg = self.palette.background();
         let cursor_color = self.palette.cursor();
         let selection_color = self.palette.selection();
+        let search_match_color = [cursor_color[0], cursor_color[1], cursor_color[2], 92];
         let cursor = snap.cursor;
         let show_cursor = cursor.visible && cursor_on;
         let rows = (snap.rows as usize).min(max_grid.0);
@@ -481,6 +482,21 @@ impl Renderer {
                 // Selection highlight (over the bg, under the glyph).
                 if cell.selected {
                     self.fill_rect(x, y, cw * wide, ch, selection_color);
+                }
+
+                // Find is intentionally distinct from the ordinary terminal
+                // selection so selection-only search never destroys what the
+                // user selected for copying.
+                if cell.search_match {
+                    self.fill_rect(x, y, cw * wide, ch, search_match_color);
+                    let underline_height = (ch * 0.10).max(1.0);
+                    self.fill_rect(
+                        x,
+                        y + ch - underline_height,
+                        cw * wide,
+                        underline_height,
+                        cursor_color,
+                    );
                 }
 
                 // Glyph.

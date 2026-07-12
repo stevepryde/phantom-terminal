@@ -78,6 +78,10 @@ pub(crate) struct ContextUiOutcome {
     pub request: Option<ContextRequest>,
     pub rect: Option<egui::Rect>,
     pub reserved_width_points: f32,
+    /// Right edge available to top-right terminal overlays. This is the
+    /// sidebar's left edge when expanded and the launcher's left edge when
+    /// collapsed, so overlays never obscure either control.
+    pub find_overlay_right_edge_points: Option<f32>,
 }
 
 impl ContextUi {
@@ -172,6 +176,7 @@ impl ContextUi {
             request: None,
             rect: Some(panel.response.rect),
             reserved_width_points: 0.0,
+            find_overlay_right_edge_points: Some(panel.response.rect.left() - FLOATING_ICON_INSET),
         }
     }
 
@@ -341,6 +346,7 @@ impl ContextUi {
         ContextUiOutcome {
             rect: Some(panel_rect),
             reserved_width_points: sidebar_width,
+            find_overlay_right_edge_points: Some(panel_rect.left() - FLOATING_ICON_INSET),
             ..outcome
         }
     }
@@ -1160,6 +1166,10 @@ mod tests {
         let outcome = outcome.unwrap();
         assert!((outcome.reserved_width_points - 260.0).abs() <= 1.0);
         let rect = outcome.rect.unwrap();
+        assert_eq!(
+            outcome.find_overlay_right_edge_points,
+            Some(rect.left() - FLOATING_ICON_INSET)
+        );
         assert!((rect.top() - 42.0).abs() <= 1.0);
         assert!((rect.bottom() - 800.0).abs() <= 1.0);
         assert!((rect.height() - 758.0).abs() <= 1.0);
@@ -1374,6 +1384,10 @@ mod tests {
         assert!(!output.shapes.is_empty());
         assert_eq!(outcome.reserved_width_points, 0.0);
         let rect = outcome.rect.unwrap();
+        assert_eq!(
+            outcome.find_overlay_right_edge_points,
+            Some(rect.left() - FLOATING_ICON_INSET)
+        );
         assert!(rect.top() >= 50.0);
         assert!(rect.width() <= 40.0);
         assert!(rect.height() <= 40.0);
