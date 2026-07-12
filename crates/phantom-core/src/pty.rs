@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -22,6 +23,9 @@ const MAX_LIVE_PTY_SESSIONS: usize = 256;
 /// blocking.
 const WRITE_CHUNK_BYTES: usize = 4096;
 const WRITE_QUEUE_CHUNKS: usize = 256;
+const MAX_LAUNCH_ENV_VARS: usize = 128;
+const MAX_LAUNCH_ENV_KEY_LEN: usize = 128;
+const MAX_LAUNCH_ENV_VALUE_LEN: usize = 16 * 1024;
 
 /// Consumer of a PTY session's output.
 ///
@@ -56,6 +60,9 @@ pub struct LaunchOpts {
     /// Executable to run. Empty/None falls back to the user's `$SHELL`.
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// Validated per-task environment additions. Reserved terminal/account
+    /// variables are owned by Phantom and cannot be supplied by manifests.
+    pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
     pub rows: u16,
     pub cols: u16,
@@ -133,6 +140,7 @@ impl PtyManager {
     /// Spawn a shell in a new PTY. Output bytes are delivered to `sink` from a
     /// dedicated reader thread until the shell exits or the pipe closes.
     pub fn spawn<S: PtySink>(&self, opts: LaunchOpts, mut sink: S) -> AppResult<u32> {
+        validate_launch_env(&opts.env)?;
         let reservation = self.reserve_session()?;
         let size = PtySize {
             rows: opts.rows.max(1),
@@ -170,6 +178,7 @@ impl PtyManager {
         apply_terminal_env(&mut cmd);
         cmd.env("PATH", &env.path);
         apply_account_env(&mut cmd, account);
+        apply_launch_env(&mut cmd, &opts.env);
 
         let child = pair
             .slave
@@ -401,6 +410,63 @@ fn apply_account_env(cmd: &mut CommandBuilder, account: &AccountEnv) {
         cmd.env("USER", user);
         cmd.env("LOGNAME", user);
     }
+}
+
+fn apply_launch_env(cmd: &mut CommandBuilder, env: &BTreeMap<String, String>) {
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+}
+
+/// Revalidate task environment additions at the final PTY boundary so callers
+/// cannot bypass the trusted-manifest policy by constructing `LaunchOpts`.
+pub(crate) fn validate_launch_env(env: &BTreeMap<String, String>) -> AppResult<()> {
+    if env.len() > MAX_LAUNCH_ENV_VARS {
+        return Err(AppError::InvalidConfig(format!(
+            "launch environment may contain no more than {MAX_LAUNCH_ENV_VARS} variables"
+        )));
+    }
+    for (key, value) in env {
+        let mut chars = key.chars();
+        let valid_key = !key.is_empty()
+            && key.len() <= MAX_LAUNCH_ENV_KEY_LEN
+            && chars
+                .next()
+                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+            && chars.all(|character| character == '_' || character.is_ascii_alphanumeric());
+        if !valid_key {
+            return Err(AppError::InvalidConfig(format!(
+                "invalid launch environment key '{key}'"
+            )));
+        }
+        let upper = key.to_ascii_uppercase();
+        let reserved = matches!(
+            upper.as_str(),
+            "PATH"
+                | "HOME"
+                | "USER"
+                | "LOGNAME"
+                | "SHELL"
+                | "TERM"
+                | "COLORTERM"
+                | "TERM_PROGRAM"
+                | "TERM_PROGRAM_VERSION"
+                | "CLICOLOR"
+                | "LSCOLORS"
+        ) || upper.starts_with("LD_")
+            || upper.starts_with("DYLD_");
+        if reserved {
+            return Err(AppError::InvalidConfig(format!(
+                "launch environment may not override reserved variable '{key}'"
+            )));
+        }
+        if value.len() > MAX_LAUNCH_ENV_VALUE_LEN || value.chars().any(char::is_control) {
+            return Err(AppError::InvalidConfig(format!(
+                "launch environment value for '{key}' is invalid"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn process_env() -> &'static ProcessEnv {
@@ -722,6 +788,35 @@ mod tests {
     }
 
     #[test]
+    fn apply_launch_env_sets_validated_task_values() {
+        let mut cmd = CommandBuilder::new("/bin/true");
+        let env = BTreeMap::from([
+            ("RUST_LOG".to_string(), "phantom=debug".to_string()),
+            ("SOULFIRE_MODE".to_string(), "local".to_string()),
+        ]);
+
+        apply_launch_env(&mut cmd, &env);
+
+        assert_eq!(
+            cmd.get_env("RUST_LOG"),
+            Some(std::ffi::OsStr::new("phantom=debug"))
+        );
+        assert_eq!(
+            cmd.get_env("SOULFIRE_MODE"),
+            Some(std::ffi::OsStr::new("local"))
+        );
+    }
+
+    #[test]
+    fn final_launch_boundary_rejects_reserved_or_control_environment() {
+        let reserved = BTreeMap::from([("PATH".to_string(), "/tmp".to_string())]);
+        assert!(validate_launch_env(&reserved).is_err());
+
+        let control = BTreeMap::from([("RUST_LOG".to_string(), "info\nPATH=/tmp".to_string())]);
+        assert!(validate_launch_env(&control).is_err());
+    }
+
+    #[test]
     fn process_env_is_cached_for_process_lifetime() {
         let first = process_env() as *const ProcessEnv;
         let second = process_env() as *const ProcessEnv;
@@ -771,6 +866,7 @@ mod tests {
                 LaunchOpts {
                     command: Some("/bin/sh".to_string()),
                     args: vec!["-c".to_string(), "exit 0".to_string()],
+                    env: BTreeMap::new(),
                     cwd: None,
                     rows: 24,
                     cols: 80,

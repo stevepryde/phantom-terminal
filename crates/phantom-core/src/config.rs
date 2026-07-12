@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::{ContextActionsConfig, TrustedProject, MAX_TRUSTED_PROJECTS};
 use crate::error::{AppError, AppResult};
 
 const MIN_FONT_SIZE: u16 = 8;
@@ -219,6 +220,11 @@ pub struct AppConfig {
     /// Lines of scrollback kept per terminal. In-memory only — never written to
     /// disk, so terminal output never persists across relaunch.
     pub scrollback_lines: u32,
+    /// Contextual directory integrations and their persistent UI state.
+    pub context_actions: ContextActionsConfig,
+    /// Project manifests explicitly trusted by their canonical root and exact
+    /// source. A source edit invalidates trust until it is reviewed again.
+    pub trusted_projects: Vec<TrustedProject>,
 }
 
 impl Default for AppConfig {
@@ -247,6 +253,8 @@ impl Default for AppConfig {
             tab_layout: "horizontal".to_string(),
             window_chrome: DEFAULT_WINDOW_CHROME.to_string(),
             scrollback_lines: 10_000,
+            context_actions: ContextActionsConfig::default(),
+            trusted_projects: Vec::new(),
         }
     }
 }
@@ -327,6 +335,8 @@ impl AppConfig {
         self.theme.validate()?;
         validate_profiles(&self.shell_profiles, &self.default_shell_profile_id)?;
         validate_keybindings(&self.keybindings)?;
+        self.context_actions.validate()?;
+        validate_trusted_projects(&self.trusted_projects)?;
         Ok(())
     }
 
@@ -340,6 +350,7 @@ impl AppConfig {
         {
             self.theme.selection = DEFAULT_SELECTION.to_string();
         }
+        self.context_actions.ensure_built_in_plugins();
         self.validate()?;
         Ok(self)
     }
@@ -353,6 +364,25 @@ impl AppConfig {
             })
             .or_else(|| self.shell_profiles.first())
     }
+}
+
+fn validate_trusted_projects(projects: &[TrustedProject]) -> AppResult<()> {
+    if projects.len() > MAX_TRUSTED_PROJECTS {
+        return Err(AppError::InvalidConfig(format!(
+            "no more than {MAX_TRUSTED_PROJECTS} trusted projects are allowed"
+        )));
+    }
+    let mut roots = HashSet::new();
+    for project in projects {
+        project.validate()?;
+        if !roots.insert(project.root.as_str()) {
+            return Err(AppError::InvalidConfig(format!(
+                "duplicate trusted project root '{}'",
+                project.root
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn default_keybindings() -> Vec<Keybinding> {
@@ -586,8 +616,91 @@ mod tests {
     }
 
     #[test]
+    fn validated_registers_new_built_in_context_plugins() {
+        let mut config = AppConfig::default();
+        config
+            .context_actions
+            .plugins
+            .retain(|plugin| plugin.id != crate::context::RECENT_DIRECTORIES_PLUGIN_ID);
+
+        let validated = config.validated().unwrap();
+
+        assert!(validated
+            .context_actions
+            .plugin(crate::context::RECENT_DIRECTORIES_PLUGIN_ID)
+            .is_some_and(|plugin| plugin.enabled));
+    }
+
+    #[test]
+    fn validated_migrates_plugin_orders_from_older_configs() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        let plugins = value
+            .get_mut("context_actions")
+            .and_then(|context| context.get_mut("plugins"))
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        for plugin in plugins {
+            plugin.as_object_mut().unwrap().remove("order");
+        }
+
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+        let validated = config.validated().unwrap();
+        let orders: Vec<_> = validated
+            .context_actions
+            .plugins
+            .iter()
+            .map(|plugin| plugin.order)
+            .collect();
+
+        assert_eq!(orders, [0, 100, 200]);
+    }
+
+    #[test]
     fn resolves_profile_with_default_fallback() {
         let config = AppConfig::default();
         assert_eq!(config.profile(Some("missing")).unwrap().id, "default");
+    }
+
+    #[test]
+    fn older_serialized_config_defaults_context_settings() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("context_actions");
+        object.remove("trusted_projects");
+
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+
+        assert_eq!(config.context_actions, ContextActionsConfig::default());
+        assert!(config.trusted_projects.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn earlier_context_config_defaults_sidebar_width() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value
+            .get_mut("context_actions")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("sidebar_width");
+
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            config.context_actions.sidebar_width,
+            crate::DEFAULT_CONTEXT_SIDEBAR_WIDTH
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_context_plugin_ids() {
+        let mut config = AppConfig::default();
+        config
+            .context_actions
+            .plugins
+            .push(config.context_actions.plugins[0].clone());
+
+        assert!(config.validate().is_err());
     }
 }

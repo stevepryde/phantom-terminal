@@ -12,6 +12,7 @@ the VT core. No webview, no web stack.
 - It's a terminal app.
 - Horizontal or vertical tab layouts, custom tab names, and keyboard shortcuts.
 - Theme, font, cursor, shell profile, and session settings.
+- Trusted, directory-aware task tabs and local spdeploy actions.
 - Scrollback is memory-only, nothing gets written to disk except settings.
 
 ## Why
@@ -58,6 +59,56 @@ force the usual remembered-tabs launch even when another launcher supplies
 ```sh
 phantom --normal
 ```
+
+## Contextual project tasks
+
+Add a `.phantom.yml` to a project directory to describe the tabs you commonly
+open there:
+
+```yaml
+version: 1
+name: Soulfire
+tabs:
+  - id: api
+    title: Soulfire API
+    cwd: soulfire-api
+    run:
+      program: cargo
+      args: [run]
+      env:
+        RUST_LOG: info,soulfire=debug
+  - id: ui
+    title: Soulfire UI
+    cwd: soulfire-ui
+    run:
+      program: ./serve.sh
+  - id: deploy
+    title: Deploy
+    cwd: .
+```
+
+When the active tab enters that directory, Phantom shows a translucent,
+resizable contextual sidebar on the right of the terminal content, below the
+full-width titlebar. It reserves terminal text space while the terminal backdrop
+continues behind it. The first visit offers an exact task review. Nothing runs
+until you choose **Trust project tasks**, and any manifest edit requires approval
+again. After approval you can open all declared tabs or one at a time. A tab
+without `run` opens the default shell.
+
+The sidebar stays open across directory changes, including directories with no
+project-specific actions. Closing it restores the full terminal width and leaves
+a floating reopen icon in the content area's top-right. Each provider section is
+a collapsible accordion, and its state—along with sidebar width/open state and
+global provider enablement in **Settings → Context Actions**—is remembered across
+restarts. Directories stays first in the stable provider order. It combines the
+five most recently used and five most frequently used directories, removes
+duplicates, and displays them alphabetically in dense rows with the home prefix
+shown as `~`; click a row to `cd` in the current session or Shift-click it to
+open a new tab. The sidebar always remains translucent over the terminal
+backdrop. If the current directory contains
+`deploy.yml`, the spdeploy provider lists its runnable actions and can open a
+selected action in a new tab. Discovery is local-only and never executes a
+project task.
 
 ## Build & Install Locally
 

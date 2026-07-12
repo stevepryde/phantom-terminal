@@ -117,7 +117,9 @@ Settings forms should group related fields with `12px` gaps and avoid nesting ca
 | --- | --- | --- |
 | Control height | `32px` minimum | Inputs, dropdowns, compact buttons |
 | Icon button | `28px` or larger | Toolbar and inline actions |
-| Row hit target | `40px` minimum | Clickable list rows |
+| Row hit target | `40px` minimum | General clickable list rows; contextual sidebar rows use the compact desktop exception below |
+| Context action row | `28px` | Task and deploy actions in the persistent sidebar |
+| Context directory row | `24px` | Single-line directory navigation with 12px text |
 | Settings sidebar | `160px` to `400px` | Resizable navigation |
 | Tab sidebar | `144px` to `360px` | Resizable vertical terminal tabs |
 | Settings content | `672px` max | Keeps form rows readable |
@@ -162,7 +164,7 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 | Contrast | Primary text and controls must remain readable against dark surfaces |
 | Keyboard | Buttons, dropdowns, resize handles, and rows must be keyboard reachable |
 | Focus | Focus states must be visible and not rely on color alone where practical |
-| Hit targets | Interactive rows should be at least `40px`; compact icon buttons at least `28px` |
+| Hit targets | Interactive rows should normally be at least `40px`; dense desktop context actions may use `28px` action rows and `24px` single-line directory rows; compact icon buttons remain at least `28px` |
 | Labels | Inputs and custom controls require visible labels or accessible names |
 
 ## Motion
@@ -195,10 +197,11 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | --- | --- |
 | Control plane | egui is the default UI for all non-terminal native surfaces |
 | Command palette | Render as a centered egui foreground overlay with a dimmed terminal backdrop, search input, keyboard selection, and clickable command rows. Keep command execution in app state; the terminal renderer should not own palette widgets. |
-| Panel placement | Prefer a wide right overlay panel for contextual tools and settings. Settings should float above the terminal instead of resizing the terminal grid; reserve terminal-resizing panels for explicit future workflow surfaces. |
+| Panel placement | Settings float above the terminal. Persistent contextual workflows may use an edge-attached sidebar that intentionally reserves terminal grid space while preserving the full-window backdrop. |
 | Panel navigation | Multi-section panels use a fixed vertical tab rail at the left of the panel. Keep the rail wide enough for readable labels and keep the active tab visually selected. |
 | Styling | Use Phantom dark surfaces, compact spacing, low rounding, and cyan accent focus/selection states via egui `Visuals` and `Style`. Settings panels may be subtly translucent, but stay near-opaque enough for form readability. |
 | Settings | Autosave on change through validated `AppConfig`; edit drafts may exist inside widgets, but committed config must still validate in Rust |
 | Numeric controls | Use sliders, drag values, or paired steppers/text input; never rely on single-click increment-only behavior |
 | Contextual panels | Model future panels as typed app state such as Settings, Search, Shell Profile, Command Details, or Task Output |
+| Contextual actions | Directory-aware actions use an edge-attached egui sidebar on the right of the main content area only; the titlebar and horizontal tab chrome always continue to the window's right edge. The open sidebar remains visible even when the current directory has no actions, reserves terminal glyph, cursor, selection, mouse, and scrollbar space, and leaves the full-window backdrop visible through its translucent surface. Sidebar opacity is capped below opaque even when other panels are configured to 100%, so the backdrop cannot disappear accidentally. Its default width remains compact, but the user may resize it freely from `100px` up to `50%` of the live viewport. Viewport clamping is presentation-only and must never overwrite the persisted preferred width during maximize, restore, or live window resizing. The entire left divider is a generous drag handle with resize cursor and hover/active emphasis; open/closed state and width persist. Closing it removes the reserved space and leaves a floating icon at the content area's top-right that reopens it. Sections are dense accordions separated by one thin horizontal divider. Each plugin has a validated numeric order independent of discovery timing; `Directories` is always first, followed by stable slots for contextual `Tasks` and `Deploy` sections even when either is absent. Each header is a fixed `26px` full-width row with an `11px` plugin label and a small leading chevron: right when collapsed and down when expanded. Built-in labels are `Tasks`, `Deploy`, and `Directories`; do not substitute project names or paths for these headings. The selected recent/frequent directory set is displayed in case-insensitive alphanumeric path order, never recency order. Directory rows are fixed `24px`; other action rows are fixed `28px`. Both retain 12px primary text, no inter-row gaps, full-row hover fills, and full-row clicks. Paths beneath the user's home directory display with a leading `~`; long paths keep their ending visible by eliding from the start. Default content is action-first with no redundant panel heading or help text. The Deploy section contains only the unlabeled operation dropdown and run action: do not repeat the project/directory name, add a Details row, or add an `Operation` field label. Selectable leaves read `name: description` (or just `name` without a description). Nested submenu breadcrumbs appear as muted, non-selectable group headings and must never masquerade as operations. Task trust review may reveal paths, commands, arguments, and environment values without shrinking body text below `11px`; untrusted manifests expose Trust only after their exact details are expanded for review. An idle sidebar must not capture terminal typing. During native live window resizing, keep the translucent surface but temporarily suppress the full-surface blur pass; restore blur once at the settled size. |
 | Terminal boundary | egui panels may overlay the terminal and capture input while open, but must not own terminal glyph rendering or PTY state. Do not resize the terminal grid for settings overlays. |

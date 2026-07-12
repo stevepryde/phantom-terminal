@@ -1025,6 +1025,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1349,6 +1351,19 @@ name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
+name = "noyalib"
+version = "0.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9014fb34654ac4f54a4ff52d5207b1e4a764604fced568c3a1d71ee99d1fc300"
+dependencies = [
+ "indexmap",
+ "memchr",
+ "rustc-hash 2.1.2",
+ "serde",
+ "smallvec",
+]
 
 [[package]]
 name = "num-traits"
@@ -1779,12 +1794,14 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "libc",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "phantom-core",
  "phantom-emu",
  "phantom-gfx",
  "pollster",
+ "serde_json",
  "wgpu",
  "winit",
 ]
@@ -1795,6 +1812,7 @@ version = "0.1.2"
 dependencies = [
  "directories",
  "libc",
+ "noyalib",
  "portable-pty",
  "rusqlite",
  "serde",

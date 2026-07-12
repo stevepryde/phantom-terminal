@@ -16,6 +16,7 @@ epaint_default_fonts = "=0.34.3"
 fontdb = "0.23"
 image = { version = "0.25.10", default-features = false, features = ["webp"] }
 libc = "0.2"
+noyalib = { version = "0.0.15", default-features = false, features = ["minimal"] }
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSResponder", "NSView", "NSWindow"] }
 phantom-core = { version = "0.1.2", path = "crates/phantom-core" }

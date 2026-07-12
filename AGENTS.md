@@ -39,12 +39,18 @@ This is the project's defining characteristic. Preserve every item here.
   build if any workspace crate adds a network-capable (HTTP-client/websocket)
   dependency. Updates happen by rebuilding from source
   (`scripts/install-native.sh`).
-- **Shell profiles are the reviewed execution path.** The app never launches an
-  arbitrary command string. `pty_spawn` resolves the command/args from a
-  **stored, validated `ShellProfile`** by id (see `phantom-core/src/spawn.rs` and
-  `config.rs`). Config is read from disk, which a local attacker could tamper
-  with, so treat any change to profile validation or spawn resolution as
-  security-sensitive and keep the validation exhaustive.
+- **Execution authorities are stored and typed.** Normal tabs resolve
+  command/args from a **stored, validated `ShellProfile`** by id (see
+  `phantom-core/src/spawn.rs` and `config.rs`). Contextual project tasks are the
+  single approved extension: `.phantom.yml` is inert until its exact bounded
+  source and canonical root are explicitly trusted and stored as validated,
+  structured program/args/env task records. A changed source invalidates trust.
+  Built-in contextual providers may launch only a provider-owned fixed
+  executable/flag shape after an explicit user action. The app never executes
+  shell command strings from discovery and never injects synthesized commands
+  into a PTY. Config is read from disk, which a local attacker could tamper
+  with, so treat any change to profile/task validation or spawn resolution as
+  security-sensitive and keep validation exhaustive.
 - **All config is validated in Rust before use or storage.**
   `AppConfig::validate()` in `phantom-core/src/config.rs` bounds every field
   (lengths, ranges, enums, hex colors, NUL bytes, profile/keybinding counts).
@@ -129,8 +135,9 @@ you did not run.
   `#[serde(default)]` and a sane default), **add bounds validation in
   `AppConfig::validate()`**, and surface it in the egui settings (`egui_ui.rs`)
   if user-facing.
-- New execution behavior → it must resolve through a validated `ShellProfile`;
-  never add an arbitrary-command spawn path.
+- New execution behavior → it must resolve through a validated `ShellProfile`,
+  an exact-source-bound trusted project task, or a reviewed built-in provider's
+  fixed structured argv contract. Never add an arbitrary shell-command path.
 - New backdrop / embedded asset → place it under the embedding crate's `assets/`
   dir and reference it with `include_bytes!`; keep the backdrop enum validated in
   Rust (no arbitrary paths or remote URLs through config).

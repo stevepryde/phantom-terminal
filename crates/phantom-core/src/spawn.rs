@@ -7,6 +7,7 @@
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 use crate::pty::LaunchOpts;
+use std::collections::BTreeMap;
 
 const MAX_SPAWN_CWD_LEN: usize = 4096;
 
@@ -45,6 +46,7 @@ pub fn resolve_launch_opts(
             Some(profile.command.clone())
         },
         args: profile.args.clone(),
+        env: BTreeMap::new(),
         cwd,
         rows,
         cols,
