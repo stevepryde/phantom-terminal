@@ -19,6 +19,7 @@ use winit::window::Window;
 
 use crate::context_actions::{ContextRequest, ContextSnapshot};
 use crate::context_ui::ContextUi;
+use crate::find::{FindResultSummary, FindState, FindUiOutcome};
 use crate::gpu::{BlurRegion, FrameOverlay};
 use crate::keybindings::{parse_combo, Combo, ComboKey};
 use crate::palette::{PaletteAction, PaletteState};
@@ -87,6 +88,7 @@ pub struct UiOutcome {
     pub config_changed: bool,
     pub palette_action: Option<PaletteAction>,
     pub context_request: Option<ContextRequest>,
+    pub find: FindUiOutcome,
 }
 
 pub struct UiState {
@@ -101,6 +103,7 @@ pub struct UiState {
     /// `AppConfig::validate()` is committed to the live config.
     settings_draft: Option<AppConfig>,
     context_ui: ContextUi,
+    find: FindState,
     /// Rects (egui points) of panels drawn translucent this frame, whose
     /// backdrop should be frosted. Rebuilt every `draw`.
     blur_regions: Vec<egui::Rect>,
@@ -111,6 +114,8 @@ pub(crate) struct UiFrameContext<'a> {
     pub snapshot: &'a ContextSnapshot,
     pub frequent_commands: &'a [String],
     pub top_inset_points: f32,
+    pub terminal_left_points: f32,
+    pub terminal_right_points: f32,
     pub global_notice: Option<&'a str>,
 }
 
@@ -125,6 +130,7 @@ impl UiState {
             notice: None,
             settings_draft: None,
             context_ui: ContextUi::default(),
+            find: FindState::default(),
             blur_regions: Vec::new(),
         }
     }
@@ -168,7 +174,31 @@ impl UiState {
     }
 
     pub fn context_owns_keyboard(&self) -> bool {
-        self.context_ui.owns_keyboard()
+        self.find.is_open() || self.context_ui.owns_keyboard()
+    }
+
+    pub fn open_find(&mut self, selection_available: bool) {
+        self.find.open(selection_available);
+    }
+
+    pub fn close_find(&mut self) {
+        self.find.close();
+    }
+
+    pub fn find_open(&self) -> bool {
+        self.find.is_open()
+    }
+
+    pub fn request_find_focus(&mut self) {
+        self.find.request_focus();
+    }
+
+    pub fn find_state(&self) -> &FindState {
+        &self.find
+    }
+
+    pub fn set_find_results(&mut self, results: FindResultSummary) {
+        self.find.set_results(results);
     }
 
     pub fn terminal_right_inset_px(&self) -> f32 {
@@ -216,6 +246,7 @@ impl UiState {
         } else {
             self.panel_width_px = 0.0;
         }
+        let mut find_right_boundary = frame.terminal_right_points;
         if self.active_panel.is_none() && !palette.open {
             let context_overlay = self.context_ui.draw_with_commands(
                 ui,
@@ -232,6 +263,16 @@ impl UiState {
             if let Some(rect) = context_overlay.rect {
                 self.blur_regions.push(rect);
             }
+            find_right_boundary = context_overlay
+                .find_overlay_right_edge_points
+                .unwrap_or(find_right_boundary);
+            let terminal_rect = egui::Rect::from_min_max(
+                egui::pos2(frame.terminal_left_points, frame.top_inset_points),
+                egui::pos2(frame.terminal_right_points, ui.max_rect().bottom()),
+            );
+            outcome.find =
+                self.find
+                    .draw(ui.ctx(), terminal_rect, find_right_boundary, context_alpha);
         }
         let toggle_combo = config
             .keybindings
@@ -1242,6 +1283,8 @@ mod tests {
                     snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
                     frequent_commands: &[],
                     top_inset_points: 0.0,
+                    terminal_left_points: 0.0,
+                    terminal_right_points: 1280.0,
                     global_notice: None,
                 },
             );

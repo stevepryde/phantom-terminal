@@ -26,6 +26,7 @@ png = "0.18"
 pollster = "1.0.1"
 portable-pty = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
+regex-syntax = "=0.8.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 swash = "0.2"

@@ -13,3 +13,6 @@ edition = "2021"
 # no API-stability guarantee.
 [dependencies]
 alacritty_terminal = { workspace = true }
+# Already present through alacritty_terminal; used only for its Unicode `\w`
+# classification when enforcing whole-word boundaries around cell matches.
+regex-syntax = { workspace = true }

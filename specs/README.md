@@ -9,6 +9,8 @@ for the areas it owns:
 - [`contextual-actions.md`](contextual-actions.md) owns directory-aware actions.
 - [`skill-distribution.md`](skill-distribution.md) owns the bundled AI authoring
   skill and its local installer.
+- [`scrollback-search.md`](scrollback-search.md) owns interactive in-memory
+  terminal find behavior and its compact overlay.
 - [`architecture.md`](architecture.md) records the relevant system boundaries.
 
 Status labels in these documents distinguish confirmed user requirements from
