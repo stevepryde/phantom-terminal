@@ -20,6 +20,7 @@ mod context_actions;
 mod context_ui;
 mod egui_ui;
 mod frequent_commands;
+mod external_editor;
 mod gpu;
 mod input;
 mod keybindings;
@@ -1160,6 +1161,7 @@ impl App {
     fn dispatch_context_request(&mut self, request: ContextRequest) {
         let provider = match &request {
             ContextRequest::TrustManifest { .. }
+            | ContextRequest::EditManifest { .. }
             | ContextRequest::OpenManifestAll { .. }
             | ContextRequest::OpenManifestTab { .. } => context_actions::MANIFEST_PROVIDER_ID,
             ContextRequest::RunSpdeploy { .. } => context_actions::SPDEPLOY_PROVIDER_ID,
@@ -1181,6 +1183,10 @@ impl App {
                 root,
                 manifest_source,
             } => self.trust_manifest(root, manifest_source),
+            ContextRequest::EditManifest {
+                root,
+                manifest_source,
+            } => self.edit_manifest(root, manifest_source),
             ContextRequest::OpenManifestAll {
                 root,
                 manifest_source,
@@ -1391,6 +1397,21 @@ impl App {
         self.config = candidate;
         self.mark_config_dirty();
         self.schedule_context_discovery();
+    }
+
+    fn edit_manifest(&mut self, root: PathBuf, manifest_source: String) {
+        let loaded = match self.revalidate_manifest_request(&root, &manifest_source) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.show_notice(format!("Could not edit project tasks: {error}"));
+                self.schedule_context_discovery();
+                return;
+            }
+        };
+        let path = loaded.root.join(phantom_core::CONTEXT_MANIFEST_FILE);
+        if let Err(error) = external_editor::open(&path) {
+            self.show_notice(format!("Could not open .phantom.yml: {error}"));
+        }
     }
 
     fn open_manifest_tasks(

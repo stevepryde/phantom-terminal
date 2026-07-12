@@ -24,7 +24,7 @@ use crate::context_actions::{
 const ACTION_ROW_HEIGHT: f32 = 28.0;
 const DIRECTORY_ROW_HEIGHT: f32 = 24.0;
 const DIRECTORY_TEXT_SIZE: f32 = 12.0;
-const SECTION_HEADER_HEIGHT: f32 = 26.0;
+const SECTION_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_TOOLBAR_HEIGHT: f32 = 30.0;
 const FLOATING_ICON_INSET: f32 = 8.0;
 const MAX_VIEWPORT_FRACTION: f32 = 0.50;
@@ -371,6 +371,13 @@ impl ContextUi {
             .plugin(&section.id)
             .is_some_and(|plugin| plugin.section_collapsed);
         let mut outcome = ContextUiOutcome::default();
+        let edit_rect = matches!(section.content, ContextSectionContent::Manifest(_)).then(|| {
+            let available = ui.available_rect_before_wrap();
+            egui::Rect::from_min_max(
+                egui::pos2(available.right() - SECTION_HEADER_HEIGHT, available.top()),
+                egui::pos2(available.right(), available.top() + SECTION_HEADER_HEIGHT),
+            )
+        });
         let header = full_width_row_with_height(
             ui,
             SECTION_HEADER_HEIGHT,
@@ -386,7 +393,22 @@ impl ContextUi {
                 );
             },
         );
-        if header.clicked() {
+        let edit = edit_rect.map(|rect| {
+            let response = ui
+                .interact(
+                    rect,
+                    Id::new(("context_section_edit", section.id.as_str())),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            draw_edit_icon(ui, rect, &response);
+            response.on_hover_text("Edit .phantom.yml")
+        });
+        let edit_clicked = edit.as_ref().is_some_and(egui::Response::clicked);
+        if edit_clicked {
+            outcome.request = edit_manifest_request(section);
+        }
+        if header.clicked() && !edit_clicked {
             if let Some(plugin) = config.context_actions.plugin_mut(&section.id) {
                 plugin.section_collapsed = !plugin.section_collapsed;
                 outcome.config_changed = true;
@@ -666,6 +688,46 @@ fn draw_section_chevron(ui: &Ui, rect: egui::Rect, expanded: bool, color: Color3
     };
     ui.painter()
         .line(points.to_vec(), egui::Stroke::new(1.2, color));
+}
+
+fn draw_edit_icon(ui: &Ui, rect: egui::Rect, response: &egui::Response) {
+    let visuals = ui.style().interact(response);
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, 0.0, visuals.weak_bg_fill);
+    }
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.3, visuals.fg_stroke.color);
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x - 4.0, center.y + 4.0),
+            egui::pos2(center.x + 4.0, center.y - 4.0),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x + 2.5, center.y - 5.5),
+            egui::pos2(center.x + 5.5, center.y - 2.5),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x - 5.0, center.y + 5.0),
+            egui::pos2(center.x - 1.5, center.y + 4.0),
+        ],
+        stroke,
+    );
+}
+
+fn edit_manifest_request(section: &ContextSection) -> Option<ContextRequest> {
+    let ContextSectionContent::Manifest(manifest) = &section.content else {
+        return None;
+    };
+    Some(ContextRequest::EditManifest {
+        root: manifest.root.clone(),
+        manifest_source: manifest.manifest_source.clone(),
+    })
 }
 
 fn thin_separator(ui: &mut Ui) {
@@ -1425,6 +1487,20 @@ mod tests {
             }),
         };
         assert_eq!(section_label(&directories), "Directories");
+    }
+
+    #[test]
+    fn tasks_header_edit_request_uses_the_discovered_manifest_identity() {
+        let snapshot = snapshot();
+
+        assert_eq!(
+            edit_manifest_request(&snapshot.sections[0]),
+            Some(ContextRequest::EditManifest {
+                root: "/projects/soulfire".into(),
+                manifest_source: "version: 1\nname: Soulfire\n".to_string(),
+            })
+        );
+        assert_eq!(edit_manifest_request(&snapshot.sections[1]), None);
     }
 
     #[test]

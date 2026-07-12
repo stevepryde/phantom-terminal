@@ -144,6 +144,10 @@ pub enum ContextRequest {
         root: PathBuf,
         manifest_source: String,
     },
+    EditManifest {
+        root: PathBuf,
+        manifest_source: String,
+    },
     OpenManifestAll {
         root: PathBuf,
         manifest_source: String,
