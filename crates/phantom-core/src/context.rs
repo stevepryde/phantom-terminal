@@ -433,25 +433,32 @@ pub fn parse_context_manifest(source: &str) -> AppResult<ContextManifest> {
     Ok(manifest)
 }
 
+/// Validate the manifest in `root` through task cwd resolution without
+/// creating or storing a trust record.
+pub fn validate_context_manifest(root: &Path) -> AppResult<LoadedContextManifest> {
+    let loaded = load_context_manifest(root)?.ok_or_else(|| {
+        AppError::InvalidConfig(format!(
+            "{} does not contain {CONTEXT_MANIFEST_FILE}",
+            root.display()
+        ))
+    })?;
+    validated_trusted_project(&loaded.root, loaded.source.clone(), loaded.manifest.clone())?;
+    Ok(loaded)
+}
+
 /// Bind an exact manifest source and its typed tasks to a canonical root.
 pub fn trust_context_manifest(root: &Path, source: String) -> AppResult<TrustedProject> {
     let root = canonical_directory(root, "context project root")?;
     let manifest = parse_context_manifest(&source)?;
-    let tasks = manifest
-        .tabs
-        .iter()
-        .map(|tab| {
-            Ok(TrustedContextTab {
-                id: tab.id.clone(),
-                title: tab.title.clone(),
-                cwd: resolve_task_cwd(&root, &tab.cwd)?
-                    .to_string_lossy()
-                    .into_owned(),
-                source_cwd: tab.cwd.clone(),
-                run: tab.run.clone(),
-            })
-        })
-        .collect::<AppResult<Vec<_>>>()?;
+    validated_trusted_project(&root, source, manifest)
+}
+
+fn validated_trusted_project(
+    root: &Path,
+    source: String,
+    manifest: ContextManifest,
+) -> AppResult<TrustedProject> {
+    let tasks = resolve_context_tabs(root, &manifest)?;
     let trusted = TrustedProject {
         root: root.to_string_lossy().into_owned(),
         manifest_source: source,
@@ -460,6 +467,27 @@ pub fn trust_context_manifest(root: &Path, source: String) -> AppResult<TrustedP
     };
     trusted.validate()?;
     Ok(trusted)
+}
+
+fn resolve_context_tabs(
+    root: &Path,
+    manifest: &ContextManifest,
+) -> AppResult<Vec<TrustedContextTab>> {
+    manifest
+        .tabs
+        .iter()
+        .map(|tab| {
+            Ok(TrustedContextTab {
+                id: tab.id.clone(),
+                title: tab.title.clone(),
+                cwd: resolve_task_cwd(root, &tab.cwd)?
+                    .to_string_lossy()
+                    .into_owned(),
+                source_cwd: tab.cwd.clone(),
+                run: tab.run.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Resolve a trusted task directly to structured process launch options.
@@ -808,6 +836,24 @@ tabs:
         assert_eq!(manifest.name, "Soulfire");
         assert_eq!(manifest.tabs.len(), 2);
         assert_eq!(manifest.tabs[0].run.as_ref().unwrap().program, "cargo");
+    }
+
+    #[test]
+    fn read_only_validation_resolves_every_task_directory() {
+        let dir = TestDir::new();
+        fs::write(dir.0.join(CONTEXT_MANIFEST_FILE), VALID).unwrap();
+        let loaded = validate_context_manifest(&dir.0).unwrap();
+        assert_eq!(loaded.manifest.name, "Soulfire");
+        assert_eq!(loaded.manifest.tabs.len(), 2);
+
+        fs::remove_dir_all(dir.0.join("soulfire-api")).unwrap();
+        assert!(validate_context_manifest(&dir.0).is_err());
+    }
+
+    #[test]
+    fn read_only_validation_requires_a_manifest() {
+        let dir = TestDir::new();
+        assert!(validate_context_manifest(&dir.0).is_err());
     }
 
     #[test]

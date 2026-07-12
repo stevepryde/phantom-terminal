@@ -11,6 +11,7 @@
 //! drains. The winit event loop ([`run`]) is a thin adapter, which also makes
 //! the whole app drivable headlessly in tests.
 
+pub mod cli;
 pub mod event;
 
 mod blur;
@@ -22,6 +23,7 @@ mod gpu;
 mod input;
 mod keybindings;
 mod palette;
+mod skill_install;
 mod tab;
 mod themes;
 

@@ -71,7 +71,7 @@ name: Soulfire
 tabs:
   - id: api
     title: Soulfire API
-    cwd: soulfire-api
+    cwd: soulfire/bins/soulfire-api
     run:
       program: cargo
       args: [run]
@@ -79,7 +79,7 @@ tabs:
         RUST_LOG: info,soulfire=debug
   - id: ui
     title: Soulfire UI
-    cwd: soulfire-ui
+    cwd: soulfire/bins/soulfire-ui
     run:
       program: ./serve.sh
   - id: deploy
@@ -94,6 +94,27 @@ continues behind it. The first visit offers an exact task review. Nothing runs
 until you choose **Trust project tasks**, and any manifest edit requires approval
 again. After approval you can open all declared tabs or one at a time. A tab
 without `run` opens the default shell.
+
+Validate a manifest through the same strict parser and canonical cwd checks
+without opening Phantom, granting trust, or running a task:
+
+```sh
+phantom context validate /path/to/project
+```
+
+Phantom also bundles an AI authoring skill that inspects a project, creates or
+updates this structured YAML, and runs the read-only validator. Install or
+update it for both Codex and Claude with:
+
+```sh
+phantom skill install
+```
+
+Use `--target codex` or `--target claude` for one agent. Phantom-managed skill
+updates are automatic; an unmanaged or locally modified collision is preserved
+unless you explicitly rerun with `--force`. The skill cannot trust a manifest
+or execute its tasks—new or changed YAML still requires exact review in the
+sidebar.
 
 The sidebar stays open across directory changes, including directories with no
 project-specific actions. Closing it restores the full terminal width and leaves
@@ -121,6 +142,15 @@ tools):
 ```sh
 git pull
 ./scripts/install-native.sh
+```
+
+On macOS the source installer also maintains `~/.local/bin/phantom` as a link
+to the installed app binary, so the validation and skill commands are available
+from a shell. If you copied the `.app` from the DMG instead, invoke the embedded
+CLI directly once (or create your own PATH link):
+
+```sh
+"/Applications/Phantom Terminal.app/Contents/MacOS/phantom" skill install
 ```
 
 - **macOS** — assembles `Phantom Terminal.app` around the `phantom` binary, gives

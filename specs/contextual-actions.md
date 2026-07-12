@@ -108,6 +108,18 @@ validated-execution posture.
   normalized GUI-safe PATH before PTY spawn. The fallback includes `~/bin`,
   `~/.cargo/bin`, and `~/.local/bin`, so Finder-launched builds can run trusted
   tools without inheriting a login shell's environment.
+- **CTX-029 (confirmed):** `phantom context validate [directory]` must validate
+  the `.phantom.yml` in the supplied directory, defaulting to the current
+  directory. It must use the same strict parser, canonical-root binding, and
+  task-directory resolution used by the app, exit successfully only for a
+  launchable manifest, and report the canonical manifest path, project name,
+  and tab count on success.
+- **CTX-030 (security):** Context validation from the CLI must be read-only. It
+  must not start the GUI, store trust, mutate app configuration, or execute any
+  project-provided program.
+- **CTX-031 (correctness):** A missing manifest, invalid directory, malformed or
+  unsupported YAML, or task cwd that is missing or escapes the canonical root
+  must produce a concise error and a non-zero process exit status.
 
 ## `.phantom.yml` version 1
 
@@ -117,7 +129,7 @@ name: Soulfire
 tabs:
   - id: api
     title: Soulfire API
-    cwd: soulfire-api
+    cwd: soulfire/bins/soulfire-api
     run:
       program: cargo
       args: [run]
@@ -125,7 +137,7 @@ tabs:
         RUST_LOG: info,soulfire=debug
   - id: ui
     title: Soulfire UI
-    cwd: soulfire-ui
+    cwd: soulfire/bins/soulfire-ui
     run:
       program: ./serve.sh
   - id: deploy
@@ -166,6 +178,9 @@ a shell command string. Omitting `run` opens the default validated shell.
 - **AC-CTX-K:** Revisiting and repeatedly using fixture directories produces a
   deduplicated combined recent/frequent list. A click changes the active shell's
   directory; Shift-click creates a new tab at the same path.
+- **AC-CTX-L:** Run `phantom context validate` against valid, missing, malformed,
+  and path-escaping fixtures. Only the valid fixture exits zero, and none of the
+  runs create a trust record, launch a process, or start a window.
 
 ## Non-goals
 

@@ -6,7 +6,8 @@
   trust records, filesystem discovery, and process launch specifications.
 - `phantom-app` owns active-tab context, the built-in contextual plugin
   registry, background discovery orchestration, egui presentation, and action
-  dispatch.
+  dispatch. Its binary entrypoint also owns non-GUI CLI routing and installation
+  of application-bundled agent assets.
 - `phantom-gfx` remains responsible only for terminal rendering. Contextual
   controls are an egui right sidebar below full-width titlebar chrome; its
   measured width reduces only the terminal grid while the backdrop renderer
@@ -27,6 +28,21 @@ injection is the Recent directories provider's fixed `cd '<canonical path>'`
 shape: the path comes from validated internal history, is re-canonicalized at
 dispatch, and is POSIX single-quoted before submission. Selecting an action is
 always explicit; discovery itself remains read-only.
+
+The context validator is a read-only projection of this boundary. It calls the
+same `phantom-core` manifest loading and trust-binding validation used before
+launch, but discards the resulting typed value. It cannot grant trust or reach
+the PTY manager.
+
+## Bundled agent assets
+
+The `phantom-app` crate embeds the complete `phantom-workflows` skill at compile
+time. The CLI installer performs local filesystem writes only and never fetches
+skill content from the network. Codex and Claude receive identical `SKILL.md`
+instructions; product-specific metadata may be ignored by clients that do not
+consume it. Installed skill files are an authoring aid only: they can create or
+update `.phantom.yml`, but only Phantom's existing review and exact-source trust
+flow can authorize execution.
 
 ## State and data flow
 

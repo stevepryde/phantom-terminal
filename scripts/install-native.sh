@@ -15,6 +15,8 @@
 #     a Developer ID signature + notarization ticket. For your own machine an
 #     ad-hoc signature plus stripping the quarantine flag is enough.
 #   - Installs to /Applications/Phantom Terminal.app (override with INSTALL_DIR).
+#   - Links the bundled CLI to ~/.local/bin/phantom (override with
+#     CLI_INSTALL_DIR) when that path is free or already Phantom-owned.
 #   - Also writes a drag-to-Applications .dmg to target/native-bundle/ (--no-dmg
 #     to skip). Built with the built-in hdiutil - no network, no extra tooling.
 #
@@ -160,7 +162,28 @@ PLIST
     # so the app never trips the "unidentified developer" prompt.
     xattr -dr com.apple.quarantine "$APP_DST" 2>/dev/null || true
 
+    CLI_INSTALL_DIR="${CLI_INSTALL_DIR:-$HOME/.local/bin}"
+    cli_dst="$CLI_INSTALL_DIR/$BIN_NAME"
+    cli_target="$APP_DST/Contents/MacOS/$BIN_NAME"
+    mkdir -p "$CLI_INSTALL_DIR"
+    if [ -L "$cli_dst" ]; then
+      existing_target="$(readlink "$cli_dst")"
+      case "$existing_target" in
+        *"/$PRODUCT_NAME.app/Contents/MacOS/$BIN_NAME")
+          ln -sfn "$cli_target" "$cli_dst"
+          note "Updated CLI link: $cli_dst"
+          ;;
+        *) warn "$cli_dst is an unrelated symlink; leaving it unchanged." ;;
+      esac
+    elif [ -e "$cli_dst" ]; then
+      warn "$cli_dst already exists and is not a Phantom app link; leaving it unchanged."
+    else
+      ln -s "$cli_target" "$cli_dst"
+      note "Installed CLI link: $cli_dst"
+    fi
+
     note "Done. Launch with: open -a \"$PRODUCT_NAME\""
+    case ":$PATH:" in *":$CLI_INSTALL_DIR:"*) ;; *) warn "$CLI_INSTALL_DIR is not on your PATH.";; esac
     ;;
 
   Linux)

@@ -22,14 +22,14 @@ pub mod spawn;
 pub use config::{AppConfig, Keybinding, ShellProfile, Theme, UI_THEMES};
 pub use context::{
     load_context_manifest, parse_context_manifest, resolve_trusted_task, trust_context_manifest,
-    ContextActionsConfig, ContextManifest, ContextPluginConfig, ContextRun, ContextTab,
-    DirectoryHistoryEntry, LoadedContextManifest, TrustedContextTab, TrustedProject,
-    BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE, DEFAULT_CONTEXT_SIDEBAR_WIDTH,
-    DIRECTORY_SELECTION_PER_SIGNAL, MANIFEST_PLUGIN_ID, MANIFEST_PLUGIN_ORDER,
-    MAX_CONTEXT_MANIFEST_BYTES, MAX_CONTEXT_PLUGINS, MAX_CONTEXT_PLUGIN_ORDER,
-    MAX_CONTEXT_SIDEBAR_WIDTH, MAX_CONTEXT_TABS, MAX_DIRECTORY_HISTORY, MAX_TRUSTED_PROJECTS,
-    MIN_CONTEXT_SIDEBAR_WIDTH, RECENT_DIRECTORIES_PLUGIN_ID, RECENT_DIRECTORIES_PLUGIN_ORDER,
-    SPDEPLOY_PLUGIN_ID, SPDEPLOY_PLUGIN_ORDER,
+    validate_context_manifest, ContextActionsConfig, ContextManifest, ContextPluginConfig,
+    ContextRun, ContextTab, DirectoryHistoryEntry, LoadedContextManifest, TrustedContextTab,
+    TrustedProject, BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE,
+    DEFAULT_CONTEXT_SIDEBAR_WIDTH, DIRECTORY_SELECTION_PER_SIGNAL, MANIFEST_PLUGIN_ID,
+    MANIFEST_PLUGIN_ORDER, MAX_CONTEXT_MANIFEST_BYTES, MAX_CONTEXT_PLUGINS,
+    MAX_CONTEXT_PLUGIN_ORDER, MAX_CONTEXT_SIDEBAR_WIDTH, MAX_CONTEXT_TABS, MAX_DIRECTORY_HISTORY,
+    MAX_TRUSTED_PROJECTS, MIN_CONTEXT_SIDEBAR_WIDTH, RECENT_DIRECTORIES_PLUGIN_ID,
+    RECENT_DIRECTORIES_PLUGIN_ORDER, SPDEPLOY_PLUGIN_ID, SPDEPLOY_PLUGIN_ORDER,
 };
 pub use error::{AppError, AppResult};
 pub use launch::{LaunchContext, LaunchState};

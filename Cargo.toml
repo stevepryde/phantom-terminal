@@ -13,7 +13,7 @@ egui = "0.34.3"
 egui-wgpu = "0.34.3"
 egui-winit = { version = "0.34.3", default-features = false }
 epaint_default_fonts = "=0.34.3"
-fontdb = "0.23"
+fontique = { version = "0.11", features = ["fontconfig-dlopen"] }
 image = { version = "0.25.10", default-features = false, features = ["webp"] }
 libc = "0.2"
 noyalib = { version = "0.0.15", default-features = false, features = ["minimal"] }
@@ -33,4 +33,11 @@ thiserror = "2"
 # Already in the tree via alacritty_terminal; same version, no new supply chain.
 unicode-width = "0.2"
 wgpu = "29"
-winit = "0.30"
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
+
+[patch.crates-io]
+# wayland-scanner 0.31.10 on crates.io still pins vulnerable quick-xml 0.39.
+# This local copy ports upstream's quick-xml 0.41 dependency and parser
+# compatibility changes; see vendor/wayland-scanner/PHANTOM_PATCH.md.
+# Remove it when the next crates.io wayland-scanner release includes them.
+wayland-scanner = { path = "vendor/wayland-scanner" }
