@@ -22,6 +22,7 @@ const MAC_TRAFFIC_LIGHT_SPACE: f32 = 76.0;
 const LINUX_WINDOW_BUTTON_W: f32 = 42.0;
 const WINDOW_BORDER_W: f32 = 1.0;
 const CUSTOM_TAB_DRAG_HANDLE_W: f32 = 12.0;
+const DRAG_REGION_SHADE_ALPHA: u8 = 80;
 const SCROLLBAR_W: f32 = 4.0;
 const SCROLLBAR_HOVER_W: f32 = 10.0;
 const SCROLLBAR_HIT_W: f32 = 14.0;
@@ -435,6 +436,7 @@ pub enum ChromeHoverTarget {
     None,
     Tab(usize),
     Close(usize),
+    NewTab,
     Settings,
     WindowControl(WindowControl),
 }
@@ -450,6 +452,7 @@ pub struct ChromeAnimationState {
     hover: ChromeHoverTarget,
     tab_hover: Vec<f32>,
     close_hover: Vec<f32>,
+    new_tab_hover: f32,
     settings_hover: f32,
     last_tick: Option<Instant>,
 }
@@ -487,6 +490,12 @@ impl ChromeAnimationState {
             animating |= ease_value(&mut self.tab_hover[index], tab_target, amount);
             animating |= ease_value(&mut self.close_hover[index], close_target, amount);
         }
+        let new_tab_target = if self.hover == ChromeHoverTarget::NewTab {
+            1.0
+        } else {
+            0.0
+        };
+        animating |= ease_value(&mut self.new_tab_hover, new_tab_target, amount);
         let settings_target = if self.hover == ChromeHoverTarget::Settings {
             1.0
         } else {
@@ -504,6 +513,10 @@ impl ChromeAnimationState {
         self.close_hover.get(index).copied().unwrap_or_default()
     }
 
+    fn new_tab(&self) -> f32 {
+        self.new_tab_hover
+    }
+
     fn settings(&self) -> f32 {
         self.settings_hover
     }
@@ -518,6 +531,9 @@ impl TabBarHits {
         }
         if self.settings.contains(px, py) {
             return ChromeHoverTarget::Settings;
+        }
+        if self.new_tab.contains(px, py) {
+            return ChromeHoverTarget::NewTab;
         }
         for tab in &self.tabs {
             if tab.close.contains(px, py) {
@@ -690,7 +706,16 @@ pub fn draw_tab_bar(
             });
         }
         r.clear_clip();
-        draw_new_tab_button(r, queue, new_tab, colors);
+        if let Some(rect) = horizontal_drag_region_rect(layout, new_tab, settings) {
+            r.fill_rect(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                [0, 0, 0, DRAG_REGION_SHADE_ALPHA],
+            );
+        }
+        draw_new_tab_button(r, queue, new_tab, colors, animations.new_tab());
         if let Some(rect) = ephemeral_indicator {
             draw_ephemeral_indicator(r, rect, colors);
         }
@@ -820,6 +845,7 @@ pub fn draw_tab_bar(
             w: bar.w,
             h: row_h,
         };
+        draw_chrome_hover_fill(r, new_tab, colors, animations.new_tab());
         r.text(
             queue,
             new_tab.x + pad,
@@ -982,6 +1008,18 @@ fn horizontal_status_slot_w(layout: &Layout, ephemeral: bool) -> f32 {
     } else {
         0.0
     }
+}
+
+fn horizontal_drag_region_rect(layout: &Layout, new_tab: Rect, settings: Rect) -> Option<Rect> {
+    layout.titlebar?;
+    let x = new_tab.x + new_tab.w;
+    let w = settings.x - x;
+    (w > 0.0).then_some(Rect {
+        x,
+        y: new_tab.y,
+        w,
+        h: new_tab.h,
+    })
 }
 
 fn draw_drop_indicator(
@@ -1278,7 +1316,14 @@ fn draw_titlebar_controls(
     r.text(queue, x, y, text, with_alpha(colors.dim_text, 160));
 }
 
-fn draw_new_tab_button(r: &mut Renderer, queue: &wgpu::Queue, rect: Rect, colors: &ChromeColors) {
+fn draw_new_tab_button(
+    r: &mut Renderer,
+    queue: &wgpu::Queue,
+    rect: Rect,
+    colors: &ChromeColors,
+    hover: f32,
+) {
+    draw_chrome_hover_fill(r, rect, colors, hover);
     r.text(
         queue,
         rect.x + (rect.w - r.cell_size().0) * 0.5,
@@ -1318,6 +1363,7 @@ fn draw_settings_button(
     hover: f32,
 ) {
     let hover = hover.clamp(0.0, 1.0);
+    draw_chrome_hover_fill(r, rect, colors, hover);
     if active {
         r.fill_rect(
             rect.x + 4.0,
@@ -1345,6 +1391,19 @@ fn draw_settings_button(
         icon_size,
         color,
     );
+}
+
+fn draw_chrome_hover_fill(r: &mut Renderer, rect: Rect, colors: &ChromeColors, hover: f32) {
+    let hover = hover.clamp(0.0, 1.0);
+    if hover > 0.0 {
+        r.fill_rect(
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            with_alpha(colors.text, (22.0 * hover) as u8),
+        );
+    }
 }
 
 fn draw_ephemeral_indicator(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
@@ -1817,6 +1876,23 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_drag_hint_fills_only_gap_between_new_tab_and_settings() {
+        let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
+        let settings = titlebar_settings_rect(layout.titlebar.unwrap(), &layout);
+        let strip = horizontal_tab_layout(&layout, settings, 1, false, 0.0, None);
+        let hint = horizontal_drag_region_rect(&layout, strip.new_tab, settings)
+            .expect("custom titlebar has a drag hint");
+
+        assert_eq!(hint.x, strip.new_tab.x + strip.new_tab.w);
+        assert_eq!(hint.x + hint.w, settings.x);
+        assert_eq!(hint.y, layout.bar.y);
+        assert_eq!(hint.h, layout.bar.h);
+
+        let system = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::System);
+        assert!(horizontal_drag_region_rect(&system, strip.new_tab, settings).is_none());
+    }
+
+    #[test]
     fn custom_titlebar_excludes_tab_body_from_drag_region() {
         let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
         let tab = tab_hit(0, 96.0, layout.bar.y);
@@ -2082,6 +2158,7 @@ mod tests {
 
         assert_eq!(hits.hover_target(10.0, 10.0), ChromeHoverTarget::Tab(0));
         assert_eq!(hits.hover_target(90.0, 10.0), ChromeHoverTarget::Close(0));
+        assert_eq!(hits.hover_target(110.0, 10.0), ChromeHoverTarget::NewTab);
         assert_eq!(hits.hover_target(140.0, 10.0), ChromeHoverTarget::Settings);
     }
 
@@ -2143,8 +2220,12 @@ mod tests {
     fn chrome_animation_eases_toward_hover_target() {
         let now = Instant::now();
         let mut state = ChromeAnimationState::default();
-        assert!(state.set_hover(ChromeHoverTarget::Settings));
+        assert!(state.set_hover(ChromeHoverTarget::NewTab));
         assert!(state.advance(now, 1));
+        assert!(state.new_tab() > 0.0);
+
+        assert!(state.set_hover(ChromeHoverTarget::Settings));
+        assert!(state.advance(now + std::time::Duration::from_millis(16), 1));
         assert!(state.settings() > 0.0);
 
         assert!(state.set_hover(ChromeHoverTarget::None));
@@ -2157,6 +2238,7 @@ mod tests {
         assert!(!ChromeHoverTarget::None.is_clickable());
         assert!(ChromeHoverTarget::Tab(0).is_clickable());
         assert!(ChromeHoverTarget::Close(0).is_clickable());
+        assert!(ChromeHoverTarget::NewTab.is_clickable());
         assert!(ChromeHoverTarget::Settings.is_clickable());
     }
 
