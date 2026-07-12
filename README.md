@@ -107,8 +107,9 @@ shown as `~`; click a row to `cd` in the current session or Shift-click it to
 open a new tab. The sidebar always remains translucent over the terminal
 backdrop. If the current directory contains
 `deploy.yml`, the spdeploy provider lists its runnable actions and can open a
-selected action in a new tab. Discovery is local-only and never executes a
-project task.
+selected action in a new tab. Phantom parses the minimal listing fields from
+YAML itself, so discovery does not require or invoke the spdeploy CLI. Discovery
+is local-only and never executes a project task.
 
 ## Build & Install Locally
 

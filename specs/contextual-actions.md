@@ -27,8 +27,10 @@ validated-execution posture.
 - **CTX-007 (confirmed):** Settings must include Context Actions controls for
   globally enabling the feature and independently enabling built-in plugins.
 - **CTX-008 (confirmed):** A built-in spdeploy plugin must detect `deploy.yml`
-  in the exact active directory, list runnable operations in a dropdown, and
-  launch the selected operation in a new tab only after explicit user action.
+  in the exact active directory, internally parse only the project name,
+  operation names/descriptions, and single-stage submenu paths needed to build
+  the dropdown, and launch the selected operation in a new tab only after
+  explicit user action. Discovery must not require or invoke the spdeploy CLI.
 - **CTX-009 (confirmed):** Both trust review and approved action surfaces must
   remain non-modal. Terminal input must continue unless the user is directly
   interacting with a contextual control.
@@ -163,4 +165,5 @@ a shell command string. Omitting `run` opens the default validated shell.
 - Runtime-loaded third-party code or plugins.
 - Network discovery, telemetry, or package installation.
 - Automatic execution on `cd`, application startup, or manifest detection.
-- Parsing spdeploy YAML independently from spdeploy's own operation model.
+- Reimplementing spdeploy validation, variables, stage semantics, or execution;
+  Phantom's YAML reader extracts only the fields needed to list leaf actions.

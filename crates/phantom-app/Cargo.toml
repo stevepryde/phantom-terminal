@@ -21,13 +21,10 @@ phantom-core = { workspace = true }
 phantom-emu = { workspace = true }
 phantom-gfx = { workspace = true }
 pollster = { workspace = true }
-serde_json = { workspace = true }
+noyalib = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
 objc2-app-kit = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }

@@ -50,5 +50,7 @@ always explicit; discovery itself remains read-only.
 - A disabled plugin performs no discovery and renders no section.
 - An idle contextual sidebar does not capture terminal keyboard input.
 - Context task tabs are not restored as executable tasks after restart.
-- Spdeploy operation discovery and execution use fixed executable/flag shapes;
-  operation names come from spdeploy's structured listing output.
+- Spdeploy discovery reads bounded `deploy.yml` sources directly and extracts
+  only names, descriptions, and single-stage submenu paths. It never invokes a
+  discovery process. Explicit execution still uses the fixed spdeploy
+  executable/flag shape after rechecking every parsed config source.

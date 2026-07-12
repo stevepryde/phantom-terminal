@@ -1,32 +1,26 @@
 //! Directory-aware action discovery and the typed model consumed by egui.
 //!
 //! Providers in this module are compiled into Phantom. Discovery is read-only:
-//! it may inspect bounded local files or invoke a tool's documented listing
-//! interface, but it never launches a project task or deploy operation.
+//! it inspects bounded local files, but never launches a project task, deploy
+//! operation, or discovery subprocess.
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
+use noyalib::Value;
 use phantom_core::{
     load_context_manifest, trust_context_manifest, ContextActionsConfig, ContextRun,
     TrustedProject, BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE,
     RECENT_DIRECTORIES_PLUGIN_ID,
 };
-use serde_json::Value;
 
 pub const MANIFEST_PROVIDER_ID: &str = "phantom-manifest";
 pub const SPDEPLOY_PROVIDER_ID: &str = "spdeploy";
 
 const DEPLOY_FILE: &str = "deploy.yml";
-const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_CONFIG_SOURCE_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
+const MAX_CONFIG_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_CONFIGS: usize = 32;
 const MAX_DEPTH: usize = 8;
 const MAX_OPERATIONS: usize = 256;
@@ -170,28 +164,12 @@ pub enum DirectoryTarget {
 }
 
 /// Run every enabled compiled-in provider for `cwd`. This function is
-/// synchronous and side-effect free apart from bounded discovery subprocesses;
-/// callers should execute it on their background discovery worker.
+/// synchronous and read-only; callers execute it on the background discovery
+/// worker so bounded filesystem parsing never interrupts terminal rendering.
 pub fn discover_context(
     cwd: &Path,
     config: &ContextActionsConfig,
     trusted_projects: &[TrustedProject],
-) -> ContextSnapshot {
-    discover_context_with(
-        cwd,
-        config,
-        trusted_projects,
-        OsStr::new("spdeploy"),
-        DEFAULT_DISCOVERY_TIMEOUT,
-    )
-}
-
-pub fn discover_context_with(
-    cwd: &Path,
-    config: &ContextActionsConfig,
-    trusted_projects: &[TrustedProject],
-    spdeploy_executable: &OsStr,
-    timeout: Duration,
 ) -> ContextSnapshot {
     let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut snapshot = ContextSnapshot::empty(canonical_cwd.clone());
@@ -212,9 +190,7 @@ pub fn discover_context_with(
         }
         let section = match provider {
             MANIFEST_PROVIDER_ID => discover_manifest(&canonical_cwd, trusted_projects),
-            SPDEPLOY_PROVIDER_ID => {
-                discover_spdeploy_with(&canonical_cwd, spdeploy_executable, timeout)
-            }
+            SPDEPLOY_PROVIDER_ID => discover_spdeploy(&canonical_cwd),
             RECENT_DIRECTORIES_PLUGIN_ID => discover_recent_directories(config),
             _ => None,
         };
@@ -306,12 +282,7 @@ fn manifest_error(message: String) -> ContextSection {
     }
 }
 
-/// Injectable variant used by tests and background-discovery orchestration.
-pub fn discover_spdeploy_with(
-    cwd: &Path,
-    executable: &OsStr,
-    timeout: Duration,
-) -> Option<ContextSection> {
+pub fn discover_spdeploy(cwd: &Path) -> Option<ContextSection> {
     let candidate = cwd.join(DEPLOY_FILE);
     if !candidate.is_file() {
         return None;
@@ -339,10 +310,7 @@ pub fn discover_spdeploy_with(
         }
     };
 
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
-    match discover_spdeploy_tree(executable, &root, &config_path, deadline) {
+    match discover_spdeploy_tree(&root, &config_path) {
         Ok((project_name, operations, config_sources)) => Some(ContextSection {
             id: SPDEPLOY_PROVIDER_ID.to_string(),
             title: "spdeploy".to_string(),
@@ -358,20 +326,16 @@ pub fn discover_spdeploy_with(
 }
 
 fn discover_spdeploy_tree(
-    executable: &OsStr,
     root: &Path,
     config_path: &Path,
-    deadline: Instant,
 ) -> Result<(String, Vec<SpdeployOperation>, Vec<ConfigSourceStamp>), String> {
     let mut operations = Vec::new();
     let mut config_sources = Vec::new();
     let mut active_configs = HashSet::new();
     let mut config_count = 0;
     let project_name = collect_spdeploy_config(
-        executable,
         root,
         config_path,
-        deadline,
         0,
         &[],
         &mut active_configs,
@@ -385,10 +349,8 @@ fn discover_spdeploy_tree(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_spdeploy_config(
-    executable: &OsStr,
     root: &Path,
     config_path: &Path,
-    deadline: Instant,
     depth: usize,
     breadcrumbs: &[String],
     active_configs: &mut HashSet<PathBuf>,
@@ -409,45 +371,45 @@ fn collect_spdeploy_config(
 
     let result = (|| {
         stamp_config_source(config_path, config_sources)?;
-        let output = run_spdeploy_listing(executable, config_path, deadline)?;
-        verify_config_source(config_path, config_sources)?;
-        let value: Value = serde_json::from_slice(&output)
-            .map_err(|error| format!("spdeploy returned invalid JSON: {error}"))?;
+        let source = config_sources
+            .iter()
+            .find(|stamp| stamp.path == config_path)
+            .map(|stamp| stamp.source.as_slice())
+            .ok_or_else(|| "spdeploy config source stamp is missing".to_string())?;
+        let value: Value = noyalib::from_slice(source)
+            .map_err(|error| format!("Could not parse {}: {error}", config_path.display()))?;
         let object = value
-            .as_object()
-            .ok_or_else(|| "spdeploy listing must be a JSON object".to_string())?;
+            .as_mapping()
+            .ok_or_else(|| "spdeploy config must be a YAML mapping".to_string())?;
         let project_name =
             required_bounded_string(object.get("name"), "project name", MAX_NAME_BYTES)?;
         let listed = object
-            .get("operations")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "spdeploy listing has no operations array".to_string())?;
+            .get("operation")
+            .and_then(Value::as_mapping)
+            .ok_or_else(|| "spdeploy config has no operation mapping".to_string())?;
 
-        for operation in listed {
+        for (name, operation) in listed {
+            validate_tool_text(name, "operation name", MAX_NAME_BYTES)?;
             let operation = operation
-                .as_object()
+                .as_mapping()
                 .ok_or_else(|| "spdeploy operation must be an object".to_string())?;
-            let name =
-                required_bounded_string(operation.get("name"), "operation name", MAX_NAME_BYTES)?;
             let description = optional_bounded_string(
                 operation.get("description"),
                 "operation description",
                 MAX_DESCRIPTION_BYTES,
             )?;
             let stages = operation
-                .get("stages")
-                .and_then(Value::as_array)
+                .get("stage")
+                .and_then(Value::as_sequence)
                 .ok_or_else(|| format!("spdeploy operation '{name}' has no stages array"))?;
 
             if let Some(child) = submenu_path(stages)? {
                 let child_path = resolve_child_config(root, config_path, &child)?;
                 let mut child_breadcrumbs = breadcrumbs.to_vec();
-                child_breadcrumbs.push(name);
+                child_breadcrumbs.push(name.clone());
                 collect_spdeploy_config(
-                    executable,
                     root,
                     &child_path,
-                    deadline,
                     depth + 1,
                     &child_breadcrumbs,
                     active_configs,
@@ -462,7 +424,7 @@ fn collect_spdeploy_config(
                 return Err(format!("spdeploy operation count exceeds {MAX_OPERATIONS}"));
             }
             operations.push(SpdeployOperation {
-                name,
+                name: name.clone(),
                 breadcrumbs: breadcrumbs.to_vec(),
                 description,
                 config_path: config_path.to_path_buf(),
@@ -479,7 +441,7 @@ fn submenu_path(stages: &[Value]) -> Result<Option<String>, String> {
     if stages.len() != 1 {
         return Ok(None);
     }
-    let Some(stage) = stages[0].as_object() else {
+    let Some(stage) = stages[0].as_mapping() else {
         return Err("spdeploy stage must be an object".to_string());
     };
     if stage.get("type").and_then(Value::as_str) != Some("deploy")
@@ -535,7 +497,7 @@ fn stamp_config_source(
     Ok(())
 }
 
-/// Re-read every bounded config source used by a listing. App calls this at
+/// Re-read every bounded config source used by discovery. App calls this at
 /// dispatch so a changed root or nested config cannot reuse stale operations.
 pub fn verify_spdeploy_sources(section: &SpdeploySection) -> Result<(), String> {
     let stamped = |path: &Path| {
@@ -616,131 +578,6 @@ fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(source)
-}
-
-fn run_spdeploy_listing(
-    executable: &OsStr,
-    config_path: &Path,
-    deadline: Instant,
-) -> Result<Vec<u8>, String> {
-    if Instant::now() >= deadline {
-        return Err("spdeploy discovery timed out".to_string());
-    }
-    let mut command = Command::new(executable);
-    command
-        .args(["--config"])
-        .arg(config_path)
-        .args(["--list-operations", "--format", "json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start spdeploy: {error}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Could not capture spdeploy output".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Could not capture spdeploy errors".to_string())?;
-    let stdout_reader = thread::spawn(move || read_bounded(stdout));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr));
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // A listing process must not leave helpers holding our pipes.
-                // The direct child has exited, so terminate any descendants in
-                // its isolated group before joining the readers.
-                kill_discovery_process_group(child.id());
-                break status;
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                terminate_discovery_process(&mut child);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err("spdeploy discovery timed out".to_string());
-            }
-            Err(error) => {
-                terminate_discovery_process(&mut child);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!("Could not wait for spdeploy: {error}"));
-            }
-        }
-    };
-
-    let stdout = join_reader(stdout_reader, "output")?;
-    let stderr = join_reader(stderr_reader, "errors")?;
-    ensure_success(status, &stderr)?;
-    Ok(stdout)
-}
-
-fn terminate_discovery_process(child: &mut Child) {
-    kill_discovery_process_group(child.id());
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn kill_discovery_process_group(child_id: u32) {
-    #[cfg(not(unix))]
-    let _ = child_id;
-    #[cfg(unix)]
-    if let Ok(process_group) = i32::try_from(child_id) {
-        // The child was placed in a fresh process group before spawn. Killing
-        // the group closes stdout/stderr inherited by descendants, allowing the
-        // bounded reader threads to be joined without leaking after a timeout.
-        // SAFETY: `process_group` is the positive id returned for our child,
-        // which was spawned into a new group with that id. A negative argument
-        // to kill(2) targets only that process group.
-        unsafe {
-            libc::kill(-process_group, libc::SIGKILL);
-        }
-    }
-}
-
-fn read_bounded(reader: impl Read) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .take((MAX_TOOL_OUTPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_TOOL_OUTPUT_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "spdeploy output is too large",
-        ));
-    }
-    Ok(bytes)
-}
-
-fn join_reader(
-    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
-    stream: &str,
-) -> Result<Vec<u8>, String> {
-    handle
-        .join()
-        .map_err(|_| format!("spdeploy {stream} reader failed"))?
-        .map_err(|error| format!("Could not read spdeploy {stream}: {error}"))
-}
-
-fn ensure_success(status: ExitStatus, stderr: &[u8]) -> Result<(), String> {
-    if status.success() {
-        return Ok(());
-    }
-    let detail = bounded_text(&String::from_utf8_lossy(stderr), MAX_ERROR_BYTES);
-    if detail.is_empty() {
-        Err(format!("spdeploy exited with {status}"))
-    } else {
-        Err(format!("spdeploy exited with {status}: {detail}"))
-    }
 }
 
 fn required_bounded_string(
@@ -824,16 +661,6 @@ mod tests {
         fn path(&self) -> &Path {
             &self.0
         }
-
-        #[cfg(unix)]
-        fn executable(&self, source: &str) -> PathBuf {
-            use std::os::unix::fs::PermissionsExt;
-
-            let path = self.0.join("fake-spdeploy");
-            fs::write(&path, source).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            path
-        }
     }
 
     impl Drop for TestDir {
@@ -845,14 +672,7 @@ mod tests {
     #[test]
     fn missing_deploy_file_produces_no_section() {
         let temp = TestDir::new();
-        assert_eq!(
-            discover_spdeploy_with(
-                temp.path(),
-                OsStr::new("definitely-not-spdeploy"),
-                Duration::from_millis(50),
-            ),
-            None
-        );
+        assert_eq!(discover_spdeploy(temp.path()), None);
     }
 
     #[test]
@@ -869,13 +689,7 @@ mod tests {
             .record_directory_visit(Path::new("/projects/recent"), 20)
             .unwrap();
 
-        let snapshot = discover_context_with(
-            temp.path(),
-            &config,
-            &[],
-            OsStr::new("definitely-not-spdeploy"),
-            Duration::from_millis(50),
-        );
+        let snapshot = discover_context(temp.path(), &config, &[]);
         let section = snapshot
             .sections
             .iter()
@@ -942,13 +756,7 @@ tabs:
             .record_directory_visit(Path::new("/projects/alpha"), 1)
             .unwrap();
 
-        let snapshot = discover_context_with(
-            temp.path(),
-            &config,
-            &[],
-            OsStr::new("definitely-not-spdeploy"),
-            Duration::from_millis(50),
-        );
+        let snapshot = discover_context(temp.path(), &config, &[]);
         let ids: Vec<_> = snapshot
             .sections
             .iter()
@@ -988,54 +796,47 @@ tabs:
             ..ContextActionsConfig::default()
         };
 
-        let snapshot = discover_context_with(
-            temp.path(),
-            &config,
-            &[],
-            OsStr::new("definitely-not-spdeploy"),
-            Duration::from_millis(10),
-        );
+        let snapshot = discover_context(temp.path(), &config, &[]);
         assert!(snapshot.sections.is_empty());
     }
 
     #[test]
-    fn disabled_spdeploy_plugin_does_not_invoke_the_tool() {
+    fn disabled_spdeploy_plugin_skips_yaml_parsing() {
         let temp = TestDir::new();
         fs::write(temp.path().join(DEPLOY_FILE), "fixture").unwrap();
         let mut config = ContextActionsConfig::default();
         config.plugin_mut(SPDEPLOY_PROVIDER_ID).unwrap().enabled = false;
 
-        let snapshot = discover_context_with(
-            temp.path(),
-            &config,
-            &[],
-            OsStr::new("definitely-not-spdeploy"),
-            Duration::from_millis(10),
-        );
+        let snapshot = discover_context(temp.path(), &config, &[]);
         assert!(snapshot.sections.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn discovers_leaf_operations_from_structured_json() {
+    fn discovers_only_the_minimum_leaf_operation_fields_from_yaml() {
         let temp = TestDir::new();
-        fs::write(temp.path().join(DEPLOY_FILE), "fixture").unwrap();
-        let executable = temp.executable(
-            r#"#!/bin/sh
-printf '%s' '{"name":"Soulfire","operations":[{"name":"deploy","description":"Ship it","stages":[{"type":"script","path":"ship.sh"}]}]}'
-"#,
-        );
+        let source = r#"name: Soulfire
+vars:
+  ignored: value
+operation:
+  deploy:
+    description: Ship it
+    default: true
+    ignored: anything
+    stage:
+      - type: script
+        path: ship.sh
+        args: [ignored]
+"#;
+        fs::write(temp.path().join(DEPLOY_FILE), source).unwrap();
 
-        let section =
-            discover_spdeploy_with(temp.path(), executable.as_os_str(), Duration::from_secs(3))
-                .unwrap();
+        let section = discover_spdeploy(temp.path()).unwrap();
         let ContextSectionContent::Spdeploy(section) = section.content else {
             panic!("expected spdeploy section");
         };
         assert_eq!(section.project_name, "Soulfire");
         assert_eq!(section.operations.len(), 1);
         assert_eq!(section.config_sources.len(), 1);
-        assert_eq!(section.config_sources[0].source, b"fixture");
+        assert_eq!(section.config_sources[0].source, source.as_bytes());
         assert_eq!(section.operations[0].name, "deploy");
         assert!(section.operations[0].breadcrumbs.is_empty());
         assert_eq!(
@@ -1044,24 +845,21 @@ printf '%s' '{"name":"Soulfire","operations":[{"name":"deploy","description":"Sh
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn recursively_flattens_submenu_operations() {
         let temp = TestDir::new();
-        fs::write(temp.path().join(DEPLOY_FILE), "root").unwrap();
-        fs::write(temp.path().join("child.yml"), "child").unwrap();
-        let executable = temp.executable(
-            r#"#!/bin/sh
-case "$2" in
-  *child.yml) printf '%s' '{"name":"Child","operations":[{"name":"release","stages":[{"type":"script","path":"release.sh"}]}]}' ;;
-  *) printf '%s' '{"name":"Root","operations":[{"name":"service","stages":[{"type":"deploy","path":"child.yml"}]}]}' ;;
-esac
-"#,
-        );
+        fs::write(
+            temp.path().join(DEPLOY_FILE),
+            "name: Root\noperation:\n  service:\n    stage:\n      - type: deploy\n        path: child.yml\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("child.yml"),
+            "name: Child\noperation:\n  release:\n    description: Release service\n    stage:\n      - type: script\n        path: release.sh\n",
+        )
+        .unwrap();
 
-        let section =
-            discover_spdeploy_with(temp.path(), executable.as_os_str(), Duration::from_secs(3))
-                .unwrap();
+        let section = discover_spdeploy(temp.path()).unwrap();
         let ContextSectionContent::Spdeploy(section) = section.content else {
             panic!("expected spdeploy section");
         };
@@ -1071,131 +869,73 @@ esac
         assert_eq!(section.config_sources.len(), 2);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn reports_timeout_inside_provider_section() {
+    fn malformed_yaml_is_reported_inside_the_provider_section() {
         let temp = TestDir::new();
-        fs::write(temp.path().join(DEPLOY_FILE), "fixture").unwrap();
-        let executable = temp.executable("#!/bin/sh\nsleep 2\n");
+        fs::write(temp.path().join(DEPLOY_FILE), "name: [unterminated").unwrap();
 
-        let section = discover_spdeploy_with(
-            temp.path(),
-            executable.as_os_str(),
-            Duration::from_millis(30),
-        )
-        .unwrap();
+        let section = discover_spdeploy(temp.path()).unwrap();
         let ContextSectionContent::Error { message } = section.content else {
             panic!("expected error section");
         };
-        assert!(message.contains("timed out"));
+        assert!(message.contains("Could not parse"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn rejects_config_changed_while_listing() {
-        let temp = TestDir::new();
-        fs::write(temp.path().join(DEPLOY_FILE), "before").unwrap();
-        let executable = temp.executable(
-            r#"#!/bin/sh
-printf '%s' 'after' > "$2"
-printf '%s' '{"name":"Project","operations":[{"name":"deploy","stages":[{"type":"script","path":"ship.sh"}]}]}'
-"#,
-        );
-
-        let section =
-            discover_spdeploy_with(temp.path(), executable.as_os_str(), Duration::from_secs(3))
-                .unwrap();
-        let ContextSectionContent::Error { message } = section.content else {
-            panic!("expected error section");
-        };
-        assert!(message.contains("changed since spdeploy discovery"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dispatch_verification_rejects_config_changed_after_listing() {
+    fn dispatch_verification_rejects_config_changed_after_discovery() {
         let temp = TestDir::new();
         let config_path = temp.path().join(DEPLOY_FILE);
-        fs::write(&config_path, "before").unwrap();
-        let executable = temp.executable(
-            r#"#!/bin/sh
-printf '%s' '{"name":"Project","operations":[{"name":"deploy","stages":[{"type":"script","path":"ship.sh"}]}]}'
-"#,
-        );
-        let section =
-            discover_spdeploy_with(temp.path(), executable.as_os_str(), Duration::from_secs(3))
-                .unwrap();
+        fs::write(
+            &config_path,
+            "name: Project\noperation:\n  deploy:\n    stage:\n      - type: script\n        path: ship.sh\n",
+        )
+        .unwrap();
+        let section = discover_spdeploy(temp.path()).unwrap();
         let ContextSectionContent::Spdeploy(section) = section.content else {
             panic!("expected spdeploy section");
         };
         verify_spdeploy_sources(&section).unwrap();
 
-        fs::write(config_path, "after").unwrap();
+        fs::write(config_path, "name: changed\noperation: {}\n").unwrap();
         let error = verify_spdeploy_sources(&section).unwrap_err();
         assert!(error.contains("changed since spdeploy discovery"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn timeout_kills_descendants_holding_output_pipes() {
+    fn explicit_deploy_operation_is_a_leaf_not_a_submenu() {
         let temp = TestDir::new();
-        fs::write(temp.path().join(DEPLOY_FILE), "fixture").unwrap();
-        let executable = temp.executable("#!/bin/sh\n(sleep 5) &\nsleep 5\n");
-        let started = Instant::now();
-
-        let section = discover_spdeploy_with(
-            temp.path(),
-            executable.as_os_str(),
-            Duration::from_millis(30),
+        fs::write(
+            temp.path().join(DEPLOY_FILE),
+            "name: Root\noperation:\n  deploy-child:\n    stage:\n      - type: deploy\n        path: child.yml\n        operation: release\n",
         )
         .unwrap();
-        // Distinguish prompt process-group cleanup from the inherited five-
-        // second pipe lifetime without assuming the test host is otherwise idle.
-        assert!(started.elapsed() < Duration::from_secs(3));
-        let ContextSectionContent::Error { message } = section.content else {
-            panic!("expected error section");
+
+        let section = discover_spdeploy(temp.path()).unwrap();
+        let ContextSectionContent::Spdeploy(section) = section.content else {
+            panic!("expected spdeploy section");
         };
-        assert!(message.contains("timed out"));
+        assert_eq!(section.operations.len(), 1);
+        assert_eq!(section.operations[0].name, "deploy-child");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn exited_listing_cleans_up_descendants_holding_output_pipes() {
-        let temp = TestDir::new();
-        fs::write(temp.path().join(DEPLOY_FILE), "fixture").unwrap();
-        let executable = temp.executable("#!/bin/sh\n(sleep 5) &\nexit 0\n");
-        let started = Instant::now();
-
-        let section =
-            discover_spdeploy_with(temp.path(), executable.as_os_str(), Duration::from_secs(3))
-                .unwrap();
-        // Distinguish prompt process-group cleanup from the inherited five-
-        // second pipe lifetime without assuming the test host is otherwise idle.
-        assert!(started.elapsed() < Duration::from_secs(3));
-        let ContextSectionContent::Error { message } = section.content else {
-            panic!("expected error section");
-        };
-        assert!(message.contains("invalid JSON"));
-    }
-
-    #[cfg(unix)]
     #[test]
     fn rejects_submenus_that_escape_the_active_directory() {
         let temp = TestDir::new();
         let outside = TestDir::new();
-        fs::write(temp.path().join(DEPLOY_FILE), "root").unwrap();
         fs::write(outside.path().join("child.yml"), "child").unwrap();
         let relative = format!(
             "../{}/child.yml",
             outside.path().file_name().unwrap().to_string_lossy()
         );
-        let executable = temp.executable(&format!(
-            "#!/bin/sh\nprintf '%s' '{{\"name\":\"Root\",\"operations\":[{{\"name\":\"outside\",\"stages\":[{{\"type\":\"deploy\",\"path\":\"{relative}\"}}]}}]}}'\n"
-        ));
+        fs::write(
+            temp.path().join(DEPLOY_FILE),
+            format!(
+                "name: Root\noperation:\n  outside:\n    stage:\n      - type: deploy\n        path: {relative}\n"
+            ),
+        )
+        .unwrap();
 
-        let section =
-            discover_spdeploy_with(temp.path(), executable.as_os_str(), Duration::from_secs(3))
-                .unwrap();
+        let section = discover_spdeploy(temp.path()).unwrap();
         let ContextSectionContent::Error { message } = section.content else {
             panic!("expected error section");
         };
