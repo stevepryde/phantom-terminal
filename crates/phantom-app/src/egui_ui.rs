@@ -198,7 +198,7 @@ impl UiState {
                 .size_range(PANEL_MIN_WIDTH_POINTS..=PANEL_MAX_WIDTH_POINTS)
                 .resizable(true)
                 .frame(panel_frame(alpha))
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     self.panel_width_px = ui.max_rect().width() * ui.ctx().pixels_per_point();
                     outcome.config_changed |= self.settings_panel(ui, config);
                 });

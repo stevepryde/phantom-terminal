@@ -1009,7 +1009,7 @@ fn draw_trusted_manifest(
 
 fn spdeploy_dropdown(
     ui: &mut Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl egui::AsIdSalt,
     value: &mut SpdeploySelection,
     entries: &[SpdeployDropdownEntry],
 ) -> bool {
