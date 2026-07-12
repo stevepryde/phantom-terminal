@@ -10,7 +10,7 @@ arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
 directories = "6"
 egui = "0.34.3"
-egui-wgpu = "0.34.3"
+egui-wgpu = "0.35.0"
 egui-winit = { version = "0.34.3", default-features = false }
 epaint_default_fonts = "=0.34.3"
 fontique = { version = "0.11", features = ["fontconfig-dlopen"] }
