@@ -58,7 +58,13 @@ pub enum ContextSectionContent {
     Manifest(ManifestSection),
     Spdeploy(SpdeploySection),
     RecentDirectories(RecentDirectoriesSection),
+    FrequentCommands(FrequentCommandsSection),
     Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrequentCommandsSection {
+    pub commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +160,9 @@ pub enum ContextRequest {
     OpenDirectory {
         path: PathBuf,
         target: DirectoryTarget,
+    },
+    RunFrequentCommand {
+        command: String,
     },
 }
 

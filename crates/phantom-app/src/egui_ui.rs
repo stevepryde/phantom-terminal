@@ -10,8 +10,8 @@ use egui::{
 };
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use phantom_core::{
-    AppConfig, Keybinding, Theme, MANIFEST_PLUGIN_ID, RECENT_DIRECTORIES_PLUGIN_ID,
-    SPDEPLOY_PLUGIN_ID,
+    AppConfig, Keybinding, Theme, FREQUENT_COMMANDS_PLUGIN_ID, MANIFEST_PLUGIN_ID,
+    RECENT_DIRECTORIES_PLUGIN_ID, SPDEPLOY_PLUGIN_ID,
 };
 use phantom_gfx::available_terminal_font_families;
 use winit::event::WindowEvent;
@@ -109,6 +109,7 @@ pub struct UiState {
 #[derive(Clone, Copy)]
 pub(crate) struct UiFrameContext<'a> {
     pub snapshot: &'a ContextSnapshot,
+    pub frequent_commands: &'a [String],
     pub top_inset_points: f32,
     pub global_notice: Option<&'a str>,
 }
@@ -208,10 +209,11 @@ impl UiState {
             self.panel_width_px = 0.0;
         }
         if self.active_panel.is_none() && !palette.open {
-            let context_overlay = self.context_ui.draw(
+            let context_overlay = self.context_ui.draw_with_commands(
                 ui,
                 config,
                 frame.snapshot,
+                frame.frequent_commands,
                 frame.top_inset_points,
                 context_alpha,
             );
@@ -428,6 +430,14 @@ impl UiState {
                                 RECENT_DIRECTORIES_PLUGIN_ID,
                                 "Recent directories",
                                 "Quick access to recently and frequently used directories.",
+                            );
+                            ui.separator();
+                            changed |= context_plugin_toggle(
+                                ui,
+                                config,
+                                FREQUENT_COMMANDS_PLUGIN_ID,
+                                "Frequent commands",
+                                "Show this tab's three most frequently submitted commands.",
                             );
                             ui.separator();
                             changed |= context_plugin_toggle(
@@ -1205,6 +1215,7 @@ mod tests {
                 palette,
                 UiFrameContext {
                     snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    frequent_commands: &[],
                     top_inset_points: 0.0,
                     global_notice: None,
                 },

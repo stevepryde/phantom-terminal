@@ -10,13 +10,15 @@ use egui::{
     UiBuilder,
 };
 use phantom_core::{
-    default_home_dir, AppConfig, MANIFEST_PLUGIN_ID, MAX_CONTEXT_SIDEBAR_WIDTH,
-    MIN_CONTEXT_SIDEBAR_WIDTH, RECENT_DIRECTORIES_PLUGIN_ID, SPDEPLOY_PLUGIN_ID,
+    default_home_dir, AppConfig, FREQUENT_COMMANDS_PLUGIN_ID, MANIFEST_PLUGIN_ID,
+    MAX_CONTEXT_SIDEBAR_WIDTH, MIN_CONTEXT_SIDEBAR_WIDTH, RECENT_DIRECTORIES_PLUGIN_ID,
+    SPDEPLOY_PLUGIN_ID,
 };
 
 use crate::context_actions::{
     ContextRequest, ContextSection, ContextSectionContent, ContextSnapshot, DirectoryTarget,
-    ManifestSection, ManifestTab, ManifestTrustState, RecentDirectoriesSection, SpdeploySection,
+    FrequentCommandsSection, ManifestSection, ManifestTab, ManifestTrustState,
+    RecentDirectoriesSection, SpdeploySection,
 };
 
 const ACTION_ROW_HEIGHT: f32 = 28.0;
@@ -88,11 +90,24 @@ impl ContextUi {
         self.owns_keyboard
     }
 
+    #[cfg(test)]
     pub fn draw(
         &mut self,
         root_ui: &mut Ui,
         config: &mut AppConfig,
         snapshot: &ContextSnapshot,
+        top_inset_points: f32,
+        alpha: u8,
+    ) -> ContextUiOutcome {
+        self.draw_with_commands(root_ui, config, snapshot, &[], top_inset_points, alpha)
+    }
+
+    pub fn draw_with_commands(
+        &mut self,
+        root_ui: &mut Ui,
+        config: &mut AppConfig,
+        snapshot: &ContextSnapshot,
+        frequent_commands: &[String],
         top_inset_points: f32,
         alpha: u8,
     ) -> ContextUiOutcome {
@@ -104,7 +119,14 @@ impl ContextUi {
         let outcome = if config.context_actions.panel_collapsed {
             self.draw_collapsed(root_ui, config, top_inset_points, alpha)
         } else {
-            self.draw_expanded(root_ui, config, snapshot, top_inset_points, alpha)
+            self.draw_expanded(
+                root_ui,
+                config,
+                snapshot,
+                frequent_commands,
+                top_inset_points,
+                alpha,
+            )
         };
         self.owns_keyboard =
             ctx.memory(|memory| memory.focused().is_some()) || egui::Popup::is_any_open(&ctx);
@@ -159,6 +181,7 @@ impl ContextUi {
         root_ui: &mut Ui,
         config: &mut AppConfig,
         snapshot: &ContextSnapshot,
+        frequent_commands: &[String],
         top_inset_points: f32,
         alpha: u8,
     ) -> ContextUiOutcome {
@@ -252,9 +275,20 @@ impl ContextUi {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    let frequent_section =
+                        (!frequent_commands.is_empty()).then(|| ContextSection {
+                            id: FREQUENT_COMMANDS_PLUGIN_ID.to_string(),
+                            title: "Frequent Commands".to_string(),
+                            content: ContextSectionContent::FrequentCommands(
+                                FrequentCommandsSection {
+                                    commands: frequent_commands.to_vec(),
+                                },
+                            ),
+                        });
                     let mut visible_sections: Vec<_> = snapshot
                         .sections
                         .iter()
+                        .chain(frequent_section.iter())
                         .filter(|section| section_is_enabled(config, section))
                         .collect();
                     visible_sections.sort_by(|left, right| {
@@ -394,6 +428,9 @@ impl ContextUi {
             }
             ContextSectionContent::RecentDirectories(recent) => {
                 outcome.request = draw_recent_directories(ui, recent);
+            }
+            ContextSectionContent::FrequentCommands(frequent) => {
+                outcome.request = draw_frequent_commands(ui, frequent);
             }
             ContextSectionContent::Error { message } => {
                 ui.scope(|ui| {
@@ -583,6 +620,31 @@ fn draw_recent_directories(
     request
 }
 
+fn draw_frequent_commands(
+    ui: &mut Ui,
+    frequent: &FrequentCommandsSection,
+) -> Option<ContextRequest> {
+    for command in &frequent.commands {
+        let response = full_width_row(ui, Sense::click(), |ui, rect, color| {
+            let text = elide_text_end(ui, command, (rect.width() - 20.0).max(0.0));
+            ui.painter().text(
+                egui::pos2(rect.left() + 10.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                text,
+                FontId::monospace(DIRECTORY_TEXT_SIZE),
+                color,
+            );
+        })
+        .on_hover_text(command);
+        if response.clicked() {
+            return Some(ContextRequest::RunFrequentCommand {
+                command: command.clone(),
+            });
+        }
+    }
+    None
+}
+
 fn directory_target(shift: bool) -> DirectoryTarget {
     if shift {
         DirectoryTarget::NewTab
@@ -619,6 +681,7 @@ fn section_label(section: &ContextSection) -> &str {
         MANIFEST_PLUGIN_ID => "Tasks",
         SPDEPLOY_PLUGIN_ID => "Deploy",
         RECENT_DIRECTORIES_PLUGIN_ID => "Directories",
+        FREQUENT_COMMANDS_PLUGIN_ID => "Frequent Commands",
         _ => &section.title,
     }
 }
@@ -707,6 +770,40 @@ fn elide_path_start(ui: &Ui, path: &str, max_width: f32) -> String {
             .iter()
             .collect::<String>()
     )
+}
+
+fn elide_text_end(ui: &Ui, text: &str, max_width: f32) -> String {
+    let font = FontId::monospace(DIRECTORY_TEXT_SIZE);
+    let color = ui.visuals().text_color();
+    if ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), color)
+        .size()
+        .x
+        <= max_width
+    {
+        return text.to_string();
+    }
+
+    let characters: Vec<char> = text.chars().collect();
+    let mut low = 0;
+    let mut high = characters.len();
+    while low < high {
+        let keep = (low + high).div_ceil(2);
+        let candidate = format!("{}…", characters[..keep].iter().collect::<String>());
+        let fits = ui
+            .painter()
+            .layout_no_wrap(candidate, font.clone(), color)
+            .size()
+            .x
+            <= max_width;
+        if fits {
+            low = keep;
+        } else {
+            high = keep - 1;
+        }
+    }
+    format!("{}…", characters[..low].iter().collect::<String>())
 }
 
 fn sidebar_frame(alpha: u8, margin: i8) -> Frame {

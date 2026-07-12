@@ -17,12 +17,15 @@ pub const CONTEXT_MANIFEST_FILE: &str = ".phantom.yml";
 pub const MANIFEST_PLUGIN_ID: &str = "phantom-manifest";
 pub const SPDEPLOY_PLUGIN_ID: &str = "spdeploy";
 pub const RECENT_DIRECTORIES_PLUGIN_ID: &str = "recent-directories";
+pub const FREQUENT_COMMANDS_PLUGIN_ID: &str = "frequent-commands";
 pub const BUILT_IN_CONTEXT_PLUGIN_IDS: &[&str] = &[
     RECENT_DIRECTORIES_PLUGIN_ID,
+    FREQUENT_COMMANDS_PLUGIN_ID,
     MANIFEST_PLUGIN_ID,
     SPDEPLOY_PLUGIN_ID,
 ];
 pub const RECENT_DIRECTORIES_PLUGIN_ORDER: u16 = 0;
+pub const FREQUENT_COMMANDS_PLUGIN_ORDER: u16 = 50;
 pub const MANIFEST_PLUGIN_ORDER: u16 = 100;
 pub const SPDEPLOY_PLUGIN_ORDER: u16 = 200;
 pub const MAX_CONTEXT_PLUGIN_ORDER: u16 = 10_000;
@@ -66,6 +69,7 @@ impl Default for ContextActionsConfig {
             sidebar_width: DEFAULT_CONTEXT_SIDEBAR_WIDTH,
             plugins: vec![
                 ContextPluginConfig::new(RECENT_DIRECTORIES_PLUGIN_ID),
+                ContextPluginConfig::new(FREQUENT_COMMANDS_PLUGIN_ID),
                 ContextPluginConfig::new(MANIFEST_PLUGIN_ID),
                 ContextPluginConfig::new(SPDEPLOY_PLUGIN_ID),
             ],
@@ -260,6 +264,7 @@ impl ContextPluginConfig {
 fn built_in_plugin_order(id: &str) -> Option<u16> {
     match id {
         RECENT_DIRECTORIES_PLUGIN_ID => Some(RECENT_DIRECTORIES_PLUGIN_ORDER),
+        FREQUENT_COMMANDS_PLUGIN_ID => Some(FREQUENT_COMMANDS_PLUGIN_ORDER),
         MANIFEST_PLUGIN_ID => Some(MANIFEST_PLUGIN_ORDER),
         SPDEPLOY_PLUGIN_ID => Some(SPDEPLOY_PLUGIN_ORDER),
         _ => None,
@@ -996,6 +1001,7 @@ tabs:
             orders,
             [
                 RECENT_DIRECTORIES_PLUGIN_ORDER,
+                FREQUENT_COMMANDS_PLUGIN_ORDER,
                 MANIFEST_PLUGIN_ORDER,
                 SPDEPLOY_PLUGIN_ORDER,
             ]

@@ -2,6 +2,8 @@
 
 use phantom_emu::{AlacrittyCore, VtCore};
 
+use crate::frequent_commands::FrequentCommands;
+
 pub struct Tab {
     /// App-assigned id used to route PTY output back to this tab (independent of
     /// the OS pty id, which we only learn after spawning).
@@ -17,6 +19,9 @@ pub struct Tab {
     /// A one-shot contextual task returns to the default shell when it exits,
     /// preserving its output and leaving the tab useful.
     pub return_to_shell: bool,
+    /// Ephemeral input-derived command counts. This is intentionally absent
+    /// from session persistence and starts empty for every new tab.
+    pub(crate) frequent_commands: FrequentCommands,
 }
 
 impl Tab {
@@ -35,6 +40,7 @@ impl Tab {
             cwd,
             profile_id,
             return_to_shell: false,
+            frequent_commands: FrequentCommands::default(),
         }
     }
 
@@ -114,5 +120,15 @@ mod tests {
         assert_eq!(via_tab[0], "Step 1");
         assert_eq!(via_tab[1], "Step 2");
         assert_eq!(via_tab[2], "Step 3");
+    }
+
+    #[test]
+    fn new_tabs_start_without_frequent_commands() {
+        let mut populated = tab(4, 20);
+        populated.frequent_commands.prepare_line(true);
+        populated.frequent_commands.observe_text("cargo test\n");
+        assert_eq!(populated.frequent_commands.top(), ["cargo test"]);
+
+        assert!(tab(4, 20).frequent_commands.top().is_empty());
     }
 }

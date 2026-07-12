@@ -19,6 +19,7 @@ mod chrome;
 mod context_actions;
 mod context_ui;
 mod egui_ui;
+mod frequent_commands;
 mod gpu;
 mod input;
 mod keybindings;
@@ -1163,6 +1164,7 @@ impl App {
             | ContextRequest::OpenManifestTab { .. } => context_actions::MANIFEST_PROVIDER_ID,
             ContextRequest::RunSpdeploy { .. } => context_actions::SPDEPLOY_PROVIDER_ID,
             ContextRequest::OpenDirectory { .. } => phantom_core::RECENT_DIRECTORIES_PLUGIN_ID,
+            ContextRequest::RunFrequentCommand { .. } => phantom_core::FREQUENT_COMMANDS_PLUGIN_ID,
         };
         if !self.config.context_actions.enabled
             || !self
@@ -1195,7 +1197,33 @@ impl App {
             ContextRequest::OpenDirectory { path, target } => {
                 self.open_context_directory(path, target)
             }
+            ContextRequest::RunFrequentCommand { command } => self.run_frequent_command(&command),
         }
+    }
+
+    fn run_frequent_command(&mut self, command: &str) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.show_notice("No active terminal session");
+            return;
+        };
+        if !tab.frequent_commands.contains_top(command) {
+            self.show_notice("That command is no longer frequent in this tab");
+            return;
+        }
+        let pty_id = tab.pty_id;
+        // Clear any partially typed shell line first so the clicked action
+        // executes exactly the displayed command instead of concatenating it.
+        let input = frequent_command_input(command);
+        if let Err(error) = self.pty.write(pty_id, &input) {
+            self.show_notice(format!("Could not run command: {error}"));
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.frequent_commands.reset_input_line();
+            tab.frequent_commands.record_executed(command);
+        }
+        self.arm_cwd_polling(CWD_POLL_WINDOW);
+        self.request_redraw();
     }
 
     fn open_context_directory(&mut self, path: PathBuf, target: context_actions::DirectoryTarget) {
@@ -1615,9 +1643,12 @@ impl App {
             return;
         }
         self.reset_blink();
+        let at_shell_prompt = self.active_tab_at_shell_prompt();
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.core.scroll(-1_000_000);
             tab.core.selection_clear();
+            tab.frequent_commands.prepare_line(at_shell_prompt);
+            tab.frequent_commands.observe_text(text);
         }
         if let Some(tab) = self.tabs.get(self.active) {
             let _ = self.pty.write(tab.pty_id, text.as_bytes());
@@ -1697,10 +1728,22 @@ impl App {
         let bytes = encode_key(key, self.mods.emu(), app_cursor);
         if !bytes.is_empty() {
             self.reset_blink();
+            let at_shell_prompt = self.active_tab_at_shell_prompt();
             if let Some(t) = self.tabs.get_mut(self.active) {
                 // Typing snaps to the bottom and clears any selection.
                 t.core.scroll(-1_000_000);
                 t.core.selection_clear();
+                t.frequent_commands.observe_key(key, self.mods.ctrl);
+                if matches!(key, Key::Char(_))
+                    && !self.mods.ctrl
+                    && !self.mods.alt
+                    && !self.mods.sup
+                {
+                    if let Some(text) = text {
+                        t.frequent_commands.prepare_line(at_shell_prompt);
+                        t.frequent_commands.observe_text(text);
+                    }
+                }
             }
             if let Some(t) = self.tabs.get(self.active) {
                 let _ = self.pty.write(t.pty_id, &bytes);
@@ -2304,10 +2347,13 @@ impl App {
         let Some(text) = text.filter(|t| !t.is_empty()) else {
             return;
         };
-        let Some(tab) = self.tabs.get(self.active) else {
+        let at_shell_prompt = self.active_tab_at_shell_prompt();
+        let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
         let pty_id = tab.pty_id;
+        tab.frequent_commands.prepare_line(at_shell_prompt);
+        tab.frequent_commands.observe_text(&text);
         let mut bytes = Vec::new();
         if tab.core.bracketed_paste() {
             // Strip the end marker so pasted content can't break out of the
@@ -2323,6 +2369,21 @@ impl App {
         if text.contains('\n') || text.contains('\r') {
             self.arm_cwd_polling(CWD_POLL_WINDOW);
         }
+    }
+
+    fn active_tab_at_shell_prompt(&self) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let snapshot = tab.core.snapshot();
+        if !snapshot.cursor.visible {
+            return false;
+        }
+        let prefix: String = (0..snapshot.cursor.col)
+            .filter_map(|col| snapshot.cell(snapshot.cursor.row, col))
+            .map(|cell| cell.c)
+            .collect();
+        looks_like_shell_prompt(&prefix)
     }
 
     /// Detect a copy/paste shortcut: Cmd+C/V on macOS, Ctrl+Shift+C/V elsewhere
@@ -2523,6 +2584,11 @@ impl App {
             _ => 0.0,
         };
         let context_config_before = self.config.context_actions.clone();
+        let frequent_commands = self
+            .tabs
+            .get(self.active)
+            .map(|tab| tab.frequent_commands.top())
+            .unwrap_or_default();
         let global_notice = self.notice.as_ref().map(|notice| notice.text.as_str());
         let ui_outcome = match (self.gpu.as_ref(), self.egui.as_mut()) {
             (Some(gpu), Some(egui)) => egui.run_with_context(
@@ -2532,6 +2598,7 @@ impl App {
                 &mut self.palette,
                 UiFrameContext {
                     snapshot: &self.context_snapshot,
+                    frequent_commands: &frequent_commands,
                     top_inset_points: context_top_inset_points,
                     global_notice,
                 },
@@ -2821,6 +2888,21 @@ fn context_discovery_config_changed(
 
 fn posix_cd_command(path: &str) -> String {
     format!("cd '{}'\r", path.replace('\'', "'\\''"))
+}
+
+fn frequent_command_input(command: &str) -> Vec<u8> {
+    let mut input = Vec::with_capacity(command.len() + 2);
+    input.push(0x15); // Ctrl+U: readline/zle kill-whole-line.
+    input.extend_from_slice(command.as_bytes());
+    input.push(b'\r');
+    input
+}
+
+fn looks_like_shell_prompt(prefix: &str) -> bool {
+    matches!(
+        prefix.trim_end().chars().next_back(),
+        Some('$' | '%' | '#' | '>' | '❯' | '➜')
+    )
 }
 
 fn resolve_context_tab_launch(
@@ -3280,6 +3362,19 @@ mod tests {
             "cd '/projects/O'\\''Brien/soul fire'\r"
         );
         assert_eq!(posix_cd_command("/"), "cd '/'\r");
+    }
+
+    #[test]
+    fn frequent_command_click_clears_partial_input_and_submits_exact_command() {
+        assert_eq!(frequent_command_input("cargo test"), b"\x15cargo test\r");
+    }
+
+    #[test]
+    fn command_capture_requires_a_shell_like_prompt() {
+        assert!(looks_like_shell_prompt("steve@host ~/project % "));
+        assert!(looks_like_shell_prompt("PS C:\\project> "));
+        assert!(!looks_like_shell_prompt("Password: "));
+        assert!(!looks_like_shell_prompt("Confirm token: "));
     }
 
     #[test]
