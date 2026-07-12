@@ -35,10 +35,10 @@ security or correctness for speed.
 This is the project's defining characteristic. Preserve every item here.
 
 - **No outbound network, by design.** No HTTP client, no auto-updater, no
-  telemetry. Enforced in CI by `scripts/check-no-network.sh`, which fails the
-  build if any workspace crate adds a network-capable (HTTP-client/websocket)
-  dependency. Updates happen by rebuilding from source
-  (`scripts/install-native.sh`).
+  telemetry. Enforced during required local validation by
+  `scripts/check-no-network.sh`, which fails if any workspace crate adds a
+  network-capable (HTTP-client/websocket) dependency. Updates happen by
+  rebuilding from source (`scripts/install-native.sh`).
 - **Execution authorities are stored and typed.** Normal tabs resolve
   command/args from a **stored, validated `ShellProfile`** by id (see
   `phantom-core/src/spawn.rs` and `config.rs`). Contextual project tasks are the
@@ -61,15 +61,26 @@ This is the project's defining characteristic. Preserve every item here.
   (`phantom-core/src/session.rs`) is created `0600` in a `0700` dir, with
   `secure_delete=ON`. Only tab title / cwd / order is persisted. Terminal
   scrollback is in-memory only and is never written to disk. Keep it that way.
-- **Supply chain is gated.** Frozen `Cargo.lock`, `cargo-audit` + `cargo-deny` +
-  `osv-scanner`, SBOM generation, and GitHub Actions pinned to full commit SHAs.
-  The advisory ignore lists in `deny.toml` and `osv-scanner.toml` are currently
-  empty and must stay in sync; only ever add an *unmaintained/unsound*
-  informational advisory with a written justification, never a real
-  vulnerability. Strongly prefer Rust and dependency-free solutions over adding a
-  crate.
+- **Supply chain is gated locally.** Keep `Cargo.lock` frozen and run
+  `cargo-audit`, `cargo-deny`, `osv-scanner`, and SBOM generation from a trusted
+  local environment when applicable. The advisory ignore lists in `deny.toml`
+  and `osv-scanner.toml` are currently empty and must stay in sync; only ever
+  add an *unmaintained/unsound* informational advisory with a written
+  justification, never a real vulnerability. Strongly prefer Rust and
+  dependency-free solutions over adding a crate.
 
 If you believe a security control should change, stop and ask the user first.
+
+## Automation policy: no CI or GitHub Actions
+
+- This repository intentionally has no hosted continuous-integration service.
+- Do not add GitHub Actions workflows or any files under `.github/workflows/`.
+- Do not add another hosted CI provider as a substitute.
+- Required checks are run locally before changes are declared complete or
+  published. Report every check that was actually run and any local tooling
+  that was unavailable.
+- GitHub may host the repository, issues, and pull requests, but must not execute
+  repository code through Actions.
 
 ## Repository layout
 
@@ -94,7 +105,6 @@ assets/icons/     app icon, used by scripts/install-native.sh to build the bundl
 scripts/
   install-native.sh   build + install locally (macOS .app + .dmg, Linux binary + .desktop)
   check-no-network.sh no-network posture check
-.github/workflows/ci.yml   security-first CI (lint, audit, build, sbom)
 ui-design-language.md      the UI spec — read before any UI work
 ```
 
