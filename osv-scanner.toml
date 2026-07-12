@@ -9,4 +9,4 @@
 # advisory with a written reason — never to silence a real vulnerability. Keep in
 # sync with deny.toml.
 #
-# Passed to osv-scanner via `--config=osv-scanner.toml` in .github/workflows/ci.yml.
+# Use locally with: osv-scanner scan source --config=osv-scanner.toml .
