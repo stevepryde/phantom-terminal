@@ -21,6 +21,7 @@ phantom-core = { workspace = true }
 phantom-emu = { workspace = true }
 phantom-gfx = { workspace = true }
 pollster = { workspace = true }
+noyalib = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 

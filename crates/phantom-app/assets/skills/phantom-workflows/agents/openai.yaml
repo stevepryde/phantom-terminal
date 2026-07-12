@@ -1,0 +1,4 @@
+interface:
+  display_name: "Phantom Workflows"
+  short_description: "Create and validate Phantom project workflows"
+  default_prompt: "Use $phantom-workflows to create or update the Phantom workflow for this project."

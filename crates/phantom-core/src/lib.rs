@@ -5,10 +5,14 @@
 //! rendering dependencies; the native winit/wgpu app builds on top of it.
 //!
 //! Security note: every user-controlled config field is bounds-checked in
-//! [`AppConfig::validate`], and process spawning only ever resolves a stored,
-//! validated [`ShellProfile`] (never an ad-hoc command). See [`resolve_launch_opts`].
+//! [`AppConfig::validate`]. Normal process spawning resolves a stored,
+//! validated [`ShellProfile`]; contextual tasks require an exact-source-bound
+//! stored trust record and structured argv/environment validation. Neither path
+//! accepts an ad-hoc shell command string. See [`resolve_launch_opts`] and
+//! [`resolve_trusted_task`].
 
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod launch;
 pub mod pty;
@@ -16,6 +20,17 @@ pub mod session;
 pub mod spawn;
 
 pub use config::{AppConfig, Keybinding, ShellProfile, Theme, UI_THEMES};
+pub use context::{
+    load_context_manifest, parse_context_manifest, resolve_trusted_task, trust_context_manifest,
+    validate_context_manifest, ContextActionsConfig, ContextManifest, ContextPluginConfig,
+    ContextRun, ContextTab, DirectoryHistoryEntry, LoadedContextManifest, TrustedContextTab,
+    TrustedProject, BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE,
+    DEFAULT_CONTEXT_SIDEBAR_WIDTH, DIRECTORY_SELECTION_PER_SIGNAL, MANIFEST_PLUGIN_ID,
+    MANIFEST_PLUGIN_ORDER, MAX_CONTEXT_MANIFEST_BYTES, MAX_CONTEXT_PLUGINS,
+    MAX_CONTEXT_PLUGIN_ORDER, MAX_CONTEXT_SIDEBAR_WIDTH, MAX_CONTEXT_TABS, MAX_DIRECTORY_HISTORY,
+    MAX_TRUSTED_PROJECTS, MIN_CONTEXT_SIDEBAR_WIDTH, RECENT_DIRECTORIES_PLUGIN_ID,
+    RECENT_DIRECTORIES_PLUGIN_ORDER, SPDEPLOY_PLUGIN_ID, SPDEPLOY_PLUGIN_ORDER,
+};
 pub use error::{AppError, AppResult};
 pub use launch::{LaunchContext, LaunchState};
 pub use pty::{LaunchOpts, PtyManager, PtySink, SpawnOpts};

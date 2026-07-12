@@ -15,6 +15,7 @@ portable-pty = { workspace = true }
 rusqlite = { workspace = true }
 directories = { workspace = true }
 thiserror = { workspace = true }
+noyalib = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }

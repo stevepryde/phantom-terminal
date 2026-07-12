@@ -605,6 +605,65 @@ mod tests {
     }
 
     #[test]
+    fn context_config_and_trust_roundtrip() {
+        let store = in_memory();
+        let root = std::env::current_dir().unwrap();
+        let source = "version: 1\nname: Test\ntabs:\n  - id: shell\n    title: Shell\n    cwd: .\n";
+        let trusted = crate::trust_context_manifest(&root, source.to_string()).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.context_actions.panel_collapsed = true;
+        cfg.context_actions.sidebar_width = 333;
+        cfg.context_actions
+            .plugin_mut(crate::MANIFEST_PLUGIN_ID)
+            .unwrap()
+            .section_collapsed = true;
+        cfg.context_actions
+            .record_directory_visit(&root, 42)
+            .unwrap();
+        cfg.trusted_projects.push(trusted.clone());
+
+        store.save_config(&cfg).unwrap();
+        let loaded = store.load_config().unwrap();
+
+        assert!(loaded.context_actions.panel_collapsed);
+        assert_eq!(loaded.context_actions.sidebar_width, 333);
+        assert_eq!(loaded.context_actions.directory_history.len(), 1);
+        assert_eq!(loaded.context_actions.directory_history[0].last_visited, 42);
+        assert_eq!(
+            loaded
+                .context_actions
+                .plugin(crate::RECENT_DIRECTORIES_PLUGIN_ID)
+                .unwrap()
+                .order,
+            crate::RECENT_DIRECTORIES_PLUGIN_ORDER
+        );
+        assert_eq!(
+            loaded
+                .context_actions
+                .plugin(crate::MANIFEST_PLUGIN_ID)
+                .unwrap()
+                .order,
+            crate::MANIFEST_PLUGIN_ORDER
+        );
+        assert_eq!(
+            loaded
+                .context_actions
+                .plugin(crate::SPDEPLOY_PLUGIN_ID)
+                .unwrap()
+                .order,
+            crate::SPDEPLOY_PLUGIN_ORDER
+        );
+        assert!(
+            loaded
+                .context_actions
+                .plugin(crate::MANIFEST_PLUGIN_ID)
+                .unwrap()
+                .section_collapsed
+        );
+        assert_eq!(loaded.trusted_projects, [trusted]);
+    }
+
+    #[test]
     fn save_config_rejects_invalid_config() {
         let store = in_memory();
         let cfg = AppConfig {

@@ -220,6 +220,15 @@ pub fn compute_layout_scaled(
     }
 }
 
+/// Reserve an edge-attached right sidebar from terminal content while leaving
+/// titlebar/tab chrome full-width. The sidebar starts below chrome, and callers
+/// retain the original layout for full-window backdrop drawing.
+pub fn reserve_right_sidebar(mut layout: Layout, width: f32) -> Layout {
+    let width = width.max(0.0).min(layout.viewport.w);
+    layout.viewport.w = (layout.viewport.w - width).max(0.0);
+    layout
+}
+
 /// Area behind the terminal viewport. This includes the intentional text inset
 /// so backdrops can fill the pane while terminal glyphs stay padded.
 pub fn terminal_pane(layout: &Layout) -> Rect {
@@ -1678,6 +1687,18 @@ mod tests {
         assert_eq!(pane.y, l.bar.h);
         assert_eq!(pane.w, 800.0);
         assert_eq!(pane.h, 600.0 - l.bar.h);
+    }
+
+    #[test]
+    fn right_sidebar_reserves_only_terminal_content_width() {
+        let base = compute_layout(1000.0, 600.0, 20.0, true, WindowChrome::System);
+        let reserved = reserve_right_sidebar(base, 260.0);
+
+        assert_eq!(reserved.viewport.w, base.viewport.w - 260.0);
+        assert_eq!(reserved.bar, base.bar);
+        assert_eq!(reserved.titlebar, base.titlebar);
+        assert_eq!(reserved.viewport.x, base.viewport.x);
+        assert_eq!(terminal_pane(&base).w, base.bar.w);
     }
 
     #[test]

@@ -5,15 +5,20 @@
 //! surfaces.
 
 use egui::{
-    Area, Button, Color32, ComboBox, Context, Frame, Id, Key as EguiKey, LayerId, Margin, Order,
-    Panel, RichText, Slider, TextEdit, Ui, ViewportId,
+    Align2, Area, Button, Color32, ComboBox, Context, Frame, Id, Key as EguiKey, LayerId, Margin,
+    Order, Panel, RichText, Slider, TextEdit, Ui, ViewportId,
 };
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
-use phantom_core::{AppConfig, Keybinding, Theme};
+use phantom_core::{
+    AppConfig, Keybinding, Theme, MANIFEST_PLUGIN_ID, RECENT_DIRECTORIES_PLUGIN_ID,
+    SPDEPLOY_PLUGIN_ID,
+};
 use phantom_gfx::available_terminal_font_families;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+use crate::context_actions::{ContextRequest, ContextSnapshot};
+use crate::context_ui::ContextUi;
 use crate::gpu::{BlurRegion, FrameOverlay};
 use crate::keybindings::{parse_combo, Combo, ComboKey};
 use crate::palette::{PaletteAction, PaletteState};
@@ -39,15 +44,17 @@ enum SettingsTab {
     Appearance,
     Terminal,
     Session,
+    ContextActions,
     Colours,
     Keybindings,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Appearance,
         Self::Terminal,
         Self::Session,
+        Self::ContextActions,
         Self::Colours,
         Self::Keybindings,
     ];
@@ -57,6 +64,7 @@ impl SettingsTab {
             Self::Appearance => "appearance",
             Self::Terminal => "terminal",
             Self::Session => "session",
+            Self::ContextActions => "context_actions",
             Self::Colours => "colours",
             Self::Keybindings => "keybindings",
         }
@@ -67,6 +75,7 @@ impl SettingsTab {
             Self::Appearance => "Appearance",
             Self::Terminal => "Terminal",
             Self::Session => "Session",
+            Self::ContextActions => "Context Actions",
             Self::Colours => "Colours",
             Self::Keybindings => "Keybindings",
         }
@@ -77,21 +86,31 @@ impl SettingsTab {
 pub struct UiOutcome {
     pub config_changed: bool,
     pub palette_action: Option<PaletteAction>,
+    pub context_request: Option<ContextRequest>,
 }
 
 pub struct UiState {
     active_panel: Option<PanelKind>,
     settings_tab: SettingsTab,
     panel_width_px: f32,
+    context_sidebar_width_px: f32,
     font_families: Vec<String>,
     notice: Option<String>,
     /// An edited-but-invalid settings draft, kept so the user can type through
     /// invalid intermediate states. Only a draft that passes
     /// `AppConfig::validate()` is committed to the live config.
     settings_draft: Option<AppConfig>,
+    context_ui: ContextUi,
     /// Rects (egui points) of panels drawn translucent this frame, whose
     /// backdrop should be frosted. Rebuilt every `draw`.
     blur_regions: Vec<egui::Rect>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UiFrameContext<'a> {
+    pub snapshot: &'a ContextSnapshot,
+    pub top_inset_points: f32,
+    pub global_notice: Option<&'a str>,
 }
 
 impl UiState {
@@ -100,9 +119,11 @@ impl UiState {
             active_panel: None,
             settings_tab: SettingsTab::Appearance,
             panel_width_px: 0.0,
+            context_sidebar_width_px: 0.0,
             font_families: font_families_with_current(&config.font_family),
             notice: None,
             settings_draft: None,
+            context_ui: ContextUi::default(),
             blur_regions: Vec::new(),
         }
     }
@@ -137,16 +158,28 @@ impl UiState {
         self.active_panel == Some(PanelKind::Settings)
     }
 
+    pub fn context_owns_keyboard(&self) -> bool {
+        self.context_ui.owns_keyboard()
+    }
+
+    pub fn terminal_right_inset_px(&self) -> f32 {
+        self.context_sidebar_width_px
+    }
+
     fn draw(
         &mut self,
         ui: &mut Ui,
         config: &mut AppConfig,
         palette: &mut PaletteState,
+        frame: UiFrameContext<'_>,
     ) -> UiOutcome {
         let mut outcome = UiOutcome::default();
+        self.context_ui.begin_frame();
+        self.context_sidebar_width_px = 0.0;
         self.blur_regions.clear();
         let alpha = panel_alpha(config.panel_opacity);
         let transparent = config.panel_opacity < 100;
+        let context_alpha = context_panel_alpha(alpha);
         // Escape is also egui's "release focus" key for text fields: only
         // close the panel when no widget holds keyboard focus, so escaping
         // out of a keybinding edit doesn't take the whole panel with it.
@@ -174,6 +207,22 @@ impl UiState {
         } else {
             self.panel_width_px = 0.0;
         }
+        if self.active_panel.is_none() && !palette.open {
+            let context_overlay = self.context_ui.draw(
+                ui,
+                config,
+                frame.snapshot,
+                frame.top_inset_points,
+                context_alpha,
+            );
+            self.context_sidebar_width_px =
+                context_overlay.reserved_width_points * ui.ctx().pixels_per_point();
+            outcome.config_changed |= context_overlay.config_changed;
+            outcome.context_request = context_overlay.request;
+            if let Some(rect) = context_overlay.rect {
+                self.blur_regions.push(rect);
+            }
+        }
         let toggle_combo = config
             .keybindings
             .iter()
@@ -185,6 +234,9 @@ impl UiState {
             if let Some(rect) = palette.rect {
                 self.blur_regions.push(rect);
             }
+        }
+        if let Some(notice) = frame.global_notice {
+            global_notice_overlay(ui.ctx(), notice);
         }
         outcome
     }
@@ -351,6 +403,50 @@ impl UiState {
                             .checkbox(&mut config.restore_on_launch, "Restore tabs on launch")
                             .changed();
                     }
+                    SettingsTab::ContextActions => {
+                        section(ui, "Availability");
+                        changed |= ui
+                            .checkbox(
+                                &mut config.context_actions.enabled,
+                                "Enable contextual actions",
+                            )
+                            .changed();
+                        ui.label(
+                            RichText::new(
+                                "When enabled, Phantom inspects only the active tab's current \
+                                 directory. Detection never runs project code.",
+                            )
+                            .size(11.0)
+                            .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+                        );
+
+                        section(ui, "Plugins");
+                        ui.add_enabled_ui(config.context_actions.enabled, |ui| {
+                            changed |= context_plugin_toggle(
+                                ui,
+                                config,
+                                RECENT_DIRECTORIES_PLUGIN_ID,
+                                "Recent directories",
+                                "Quick access to recently and frequently used directories.",
+                            );
+                            ui.separator();
+                            changed |= context_plugin_toggle(
+                                ui,
+                                config,
+                                MANIFEST_PLUGIN_ID,
+                                "Phantom manifest",
+                                "Review and open tabs declared by .phantom.yml.",
+                            );
+                            ui.separator();
+                            changed |= context_plugin_toggle(
+                                ui,
+                                config,
+                                SPDEPLOY_PLUGIN_ID,
+                                "spdeploy",
+                                "List operations from deploy.yml and run one in a new tab.",
+                            );
+                        });
+                    }
                     SettingsTab::Colours => {
                         section(ui, "Theme Colours");
                         changed |= theme_colors(ui, &mut config.theme);
@@ -417,6 +513,7 @@ pub struct EguiLayer {
     textures_delta: egui::TexturesDelta,
     screen: ScreenDescriptor,
     blur_regions: Vec<BlurRegion>,
+    blur_suppressed: bool,
     /// egui's requested repaint delay from the last `run` (`MAX` = idle).
     repaint_delay: std::time::Duration,
 }
@@ -445,6 +542,7 @@ impl EguiLayer {
                 pixels_per_point: window.scale_factor() as f32,
             },
             blur_regions: Vec::new(),
+            blur_suppressed: false,
             repaint_delay: std::time::Duration::MAX,
         }
     }
@@ -457,17 +555,18 @@ impl EguiLayer {
         self.state.on_window_event(window, event)
     }
 
-    pub fn run(
+    pub fn run_with_context(
         &mut self,
         window: &Window,
         ui_state: &mut UiState,
         config: &mut AppConfig,
         palette: &mut PaletteState,
+        frame: UiFrameContext<'_>,
     ) -> UiOutcome {
         let raw_input = self.state.take_egui_input(window);
         let mut outcome = UiOutcome::default();
         let full_output = self.ctx.run_ui(raw_input, |ui| {
-            outcome = ui_state.draw(ui, config, palette);
+            outcome = ui_state.draw(ui, config, palette, frame);
         });
         self.state
             .handle_platform_output(window, full_output.platform_output);
@@ -501,6 +600,10 @@ impl EguiLayer {
     /// How soon egui wants to be repainted after the last `run`.
     pub fn repaint_delay(&self) -> std::time::Duration {
         self.repaint_delay
+    }
+
+    pub fn set_blur_suppressed(&mut self, suppressed: bool) {
+        self.blur_suppressed = suppressed;
     }
 
     fn prepare_inner(
@@ -545,12 +648,46 @@ impl FrameOverlay for EguiLayer {
     }
 
     fn blur_regions(&self) -> &[BlurRegion] {
-        &self.blur_regions
+        active_blur_regions(&self.blur_regions, self.blur_suppressed)
     }
 
     fn after_submit(&mut self) {
         self.free_textures();
     }
+}
+
+fn active_blur_regions(regions: &[BlurRegion], suppressed: bool) -> &[BlurRegion] {
+    if suppressed {
+        &[]
+    } else {
+        regions
+    }
+}
+
+fn global_notice_order() -> Order {
+    Order::Tooltip
+}
+
+fn global_notice_overlay(ctx: &Context, notice: &str) {
+    let content = ctx.content_rect();
+    let position = egui::pos2(content.center().x, content.bottom() - 16.0);
+    let max_width = (content.width() - 24.0).clamp(40.0, 720.0);
+    Area::new(Id::new("phantom_global_notice"))
+        .order(global_notice_order())
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(position)
+        .interactable(false)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 245))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(56, 189, 248)))
+                .corner_radius(4)
+                .inner_margin(Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.set_max_width(max_width);
+                    ui.add(egui::Label::new(RichText::new(notice).size(12.0)).wrap());
+                });
+        });
 }
 
 /// Convert an egui rect (points) to a physical-pixel [`BlurRegion`], clamped to
@@ -602,6 +739,12 @@ fn panel_alpha(opacity_percent: u8) -> u8 {
     (percent * 255.0).round() as u8
 }
 
+/// Context actions sit over the full-window terminal backdrop and intentionally
+/// remain translucent even when ordinary panels are configured as opaque.
+fn context_panel_alpha(shared_panel_alpha: u8) -> u8 {
+    shared_panel_alpha.min(220)
+}
+
 fn panel_frame(alpha: u8) -> egui::Frame {
     egui::Frame::side_top_panel(&egui::Style::default())
         .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
@@ -627,6 +770,38 @@ fn section(ui: &mut Ui, title: &str) {
             .color(Color32::from_rgba_unmultiplied(255, 255, 255, 140)),
     );
     ui.separator();
+}
+
+fn context_plugin_toggle(
+    ui: &mut Ui,
+    config: &mut AppConfig,
+    id: &str,
+    name: &str,
+    description: &str,
+) -> bool {
+    let Some(plugin) = config.context_actions.plugin_mut(id) else {
+        return false;
+    };
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(name).size(13.0));
+            ui.label(
+                RichText::new(description)
+                    .size(11.0)
+                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+            );
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            changed |= ui.checkbox(&mut plugin.enabled, "Enabled").changed();
+            ui.label(
+                RichText::new(format!("Order {}", plugin.order))
+                    .size(11.0)
+                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 90)),
+            );
+        });
+    });
+    changed
 }
 
 fn label(text: &str) -> RichText {
@@ -1024,7 +1199,16 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run_ui(raw_input, |ui| {
-            state.draw(ui, config, palette);
+            state.draw(
+                ui,
+                config,
+                palette,
+                UiFrameContext {
+                    snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    top_inset_points: 0.0,
+                    global_notice: None,
+                },
+            );
         });
         output
             .shapes
@@ -1103,5 +1287,30 @@ mod tests {
         let families = font_families_with_current("Custom Mono");
 
         assert_eq!(families.first().map(String::as_str), Some("Custom Mono"));
+    }
+
+    #[test]
+    fn live_resize_suppresses_expensive_backdrop_blur() {
+        let regions = [BlurRegion {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 400,
+        }];
+
+        assert_eq!(active_blur_regions(&regions, false), &regions);
+        assert!(active_blur_regions(&regions, true).is_empty());
+    }
+
+    #[test]
+    fn global_notices_use_the_topmost_egui_layer() {
+        assert_eq!(global_notice_order(), Order::Tooltip);
+    }
+
+    #[test]
+    fn context_sidebar_remains_translucent_when_other_panels_are_opaque() {
+        assert_eq!(panel_alpha(100), 255);
+        assert_eq!(context_panel_alpha(panel_alpha(100)), 220);
+        assert_eq!(context_panel_alpha(panel_alpha(50)), 128);
     }
 }

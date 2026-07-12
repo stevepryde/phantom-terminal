@@ -11,30 +11,36 @@
 //! drains. The winit event loop ([`run`]) is a thin adapter, which also makes
 //! the whole app drivable headlessly in tests.
 
+pub mod cli;
 pub mod event;
 
 mod blur;
 mod chrome;
+mod context_actions;
+mod context_ui;
 mod egui_ui;
 mod gpu;
 mod input;
 mod keybindings;
 mod palette;
+mod skill_install;
 mod tab;
 mod themes;
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use egui_ui::{EguiLayer, UiState};
+use egui_ui::{EguiLayer, UiFrameContext, UiState};
 use event::{AppInput, Mods};
 use gpu::{GpuContext, PresentStatus};
 use keybindings::{Action, Keymap};
 use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
-    default_home_dir, resolve_launch_opts, AppConfig, LaunchContext, PtyManager, PtySink,
+    default_home_dir, load_context_manifest, resolve_launch_opts, resolve_trusted_task,
+    trust_context_manifest, AppConfig, LaunchContext, LaunchOpts, PtyManager, PtySink,
     SessionStore, TabRecord, MAX_TAB_TITLE_LEN,
 };
 use phantom_emu::{
@@ -49,6 +55,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
+
+use context_actions::{discover_context, ContextRequest, ContextSnapshot};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const CWD_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -74,8 +82,17 @@ const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 /// PTY output delivered from a reader thread, tagged with the tab it belongs to.
 #[derive(Debug)]
 pub enum AppEvent {
-    PtyBytes { tab: u64, bytes: Vec<u8> },
-    PtyExit { tab: u64 },
+    PtyBytes {
+        tab: u64,
+        bytes: Vec<u8>,
+    },
+    PtyExit {
+        tab: u64,
+    },
+    ContextDiscovered {
+        generation: u64,
+        snapshot: Box<ContextSnapshot>,
+    },
     PtyWake,
 }
 
@@ -179,7 +196,7 @@ impl PendingPtyEvents {
 fn event_byte_len(event: &AppEvent) -> usize {
     match event {
         AppEvent::PtyBytes { bytes, .. } => bytes.len(),
-        AppEvent::PtyExit { .. } | AppEvent::PtyWake => 0,
+        AppEvent::PtyExit { .. } | AppEvent::ContextDiscovered { .. } | AppEvent::PtyWake => 0,
     }
 }
 
@@ -348,6 +365,40 @@ struct ProxySink {
     tab: u64,
 }
 
+struct ContextDiscoveryRequest {
+    generation: u64,
+    cwd: PathBuf,
+    config: phantom_core::ContextActionsConfig,
+    trusted_projects: Vec<phantom_core::TrustedProject>,
+}
+
+fn spawn_context_discovery_worker(
+    outbox: Arc<dyn PtyOutbox>,
+) -> mpsc::Sender<ContextDiscoveryRequest> {
+    let (tx, rx) = mpsc::channel::<ContextDiscoveryRequest>();
+    let _ = thread::Builder::new()
+        .name("context-discovery".to_string())
+        .spawn(move || {
+            while let Ok(mut request) = rx.recv() {
+                // Coalesce cwd/config changes queued while a previous provider
+                // was running. App-side generation checks discard any result
+                // that became stale during discovery.
+                while let Ok(newer) = rx.try_recv() {
+                    request = newer;
+                }
+                let snapshot =
+                    discover_context(&request.cwd, &request.config, &request.trusted_projects);
+                if !outbox.send(AppEvent::ContextDiscovered {
+                    generation: request.generation,
+                    snapshot: Box::new(snapshot),
+                }) {
+                    break;
+                }
+            }
+        });
+    tx
+}
+
 impl PtySink for ProxySink {
     fn on_bytes(&mut self, bytes: &[u8]) -> bool {
         self.outbox.send(AppEvent::PtyBytes {
@@ -457,6 +508,11 @@ pub struct App {
     palette: PaletteState,
     ui: UiState,
     notice: Option<Notice>,
+    context_snapshot: ContextSnapshot,
+    context_generation: u64,
+    context_discovery_tx: mpsc::Sender<ContextDiscoveryRequest>,
+    directory_visit_pending: bool,
+    last_observed_directory: Option<(u64, PathBuf)>,
 
     // Launch behaviour.
     launch_cwd: Option<String>,
@@ -497,6 +553,7 @@ impl App {
         let now = Instant::now();
         let ui = UiState::new(&config);
         let persistence = Persistence::new(store.clone());
+        let context_discovery_tx = spawn_context_discovery_worker(Arc::clone(&outbox));
         Self {
             outbox,
             pending_pty_events: None,
@@ -539,6 +596,11 @@ impl App {
             palette: PaletteState::default(),
             ui,
             notice: None,
+            context_snapshot: ContextSnapshot::empty(PathBuf::new()),
+            context_generation: 0,
+            context_discovery_tx,
+            directory_visit_pending: false,
+            last_observed_directory: None,
             launch_cwd: launch.cwd,
             remember_tabs: launch.remember_tabs,
             ephemeral,
@@ -623,7 +685,19 @@ impl App {
                     return;
                 }
                 if let Some(index) = self.tabs.iter().position(|t| t.id == tab) {
+                    if self.tabs[index].return_to_shell && self.return_tab_to_shell(index) {
+                        return;
+                    }
                     self.close_tab(index);
+                }
+            }
+            AppEvent::ContextDiscovered {
+                generation,
+                snapshot,
+            } => {
+                if generation == self.context_generation {
+                    self.context_snapshot = *snapshot;
+                    self.request_redraw();
                 }
             }
             AppEvent::PtyWake => self.drain_pending_pty_events(),
@@ -726,6 +800,8 @@ impl App {
                     self.applied_window_chrome(),
                     gpu.scale_factor(),
                 );
+                let layout =
+                    chrome::reserve_right_sidebar(layout, self.ui.terminal_right_inset_px());
                 renderer.grid_size(layout.viewport.w as u32, layout.viewport.h as u32)
             }
             _ => (24, 80),
@@ -822,6 +898,7 @@ impl App {
                     return;
                 }
                 self.active = active.min(self.tabs.len() - 1);
+                self.schedule_context_discovery();
                 return;
             }
         }
@@ -850,6 +927,20 @@ impl App {
                     return false;
                 }
             };
+        self.spawn_resolved_tab(launch, profile_id, None, false, persist)
+    }
+
+    /// Spawn a previously validated structured launch. Contextual tasks use
+    /// this path only after their stored trust record has been revalidated.
+    fn spawn_resolved_tab(
+        &mut self,
+        launch: LaunchOpts,
+        profile_id: Option<String>,
+        title: Option<String>,
+        return_to_shell: bool,
+        persist: bool,
+    ) -> bool {
+        let (rows, cols) = (launch.rows, launch.cols);
         let start_cwd = launch
             .cwd
             .clone()
@@ -878,12 +969,19 @@ impl App {
         );
         self.tabs
             .push(Tab::new(tab_id, core, pty_id, start_cwd, profile_id));
+        if let Some(tab) = self.tabs.last_mut() {
+            tab.return_to_shell = return_to_shell;
+        }
+        if let (Some(tab), Some(title)) = (self.tabs.last_mut(), title) {
+            tab.custom_title = title;
+        }
         self.active = self.tabs.len() - 1;
         self.tab_scroll_into_view = Some(self.active);
         self.arm_cwd_polling(CWD_STARTUP_POLL_WINDOW);
         if persist {
             self.mark_dirty();
         }
+        self.schedule_context_discovery();
         self.request_redraw();
         true
     }
@@ -929,7 +1027,49 @@ impl App {
         self.tab_scroll_into_view = Some(self.active);
         self.rename = None;
         self.mark_dirty();
+        self.schedule_context_discovery();
         self.request_redraw();
+    }
+
+    fn return_tab_to_shell(&mut self, index: usize) -> bool {
+        let Some(tab) = self.tabs.get(index) else {
+            return false;
+        };
+        let (tab_id, old_pty, cwd) = (tab.id, tab.pty_id, tab.cwd.clone());
+        let (rows, cols) = self.viewport_grid();
+        let launch = match resolve_launch_opts(&self.config, None, Some(cwd), rows, cols) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.show_notice(format!(
+                    "Task finished, but the shell could not start: {error}"
+                ));
+                return false;
+            }
+        };
+        let sink = ProxySink {
+            outbox: Arc::clone(&self.outbox),
+            tab: tab_id,
+        };
+        let new_pty = match self.pty.spawn(launch, sink) {
+            Ok(id) => id,
+            Err(error) => {
+                self.show_notice(format!(
+                    "Task finished, but the shell could not start: {error}"
+                ));
+                return false;
+            }
+        };
+        let _ = self.pty.kill(old_pty);
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.pty_id = new_pty;
+            tab.profile_id = None;
+            tab.return_to_shell = false;
+        }
+        self.arm_cwd_polling(CWD_STARTUP_POLL_WINDOW);
+        self.mark_dirty();
+        self.schedule_context_discovery();
+        self.request_redraw();
+        true
     }
 
     fn handle_action(&mut self, action: Action) {
@@ -946,6 +1086,7 @@ impl App {
                     self.active = i;
                     self.tab_scroll_into_view = Some(i);
                     self.mark_dirty();
+                    self.schedule_context_discovery();
                     self.request_redraw();
                 }
             }
@@ -987,6 +1128,393 @@ impl App {
             PaletteAction::OpenSettings => self.ui.open_settings(&self.config),
         }
         self.request_redraw();
+    }
+
+    fn schedule_context_discovery(&mut self) {
+        self.directory_visit_pending = true;
+        self.context_generation = self.context_generation.wrapping_add(1);
+        let generation = self.context_generation;
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .map(|tab| PathBuf::from(&tab.cwd))
+            .unwrap_or_default();
+        if cwd.as_os_str().is_empty() || !self.config.context_actions.enabled {
+            self.context_snapshot = ContextSnapshot::empty(cwd);
+            self.request_redraw();
+            return;
+        }
+        let request = ContextDiscoveryRequest {
+            generation,
+            cwd: cwd.clone(),
+            config: self.config.context_actions.clone(),
+            trusted_projects: self.config.trusted_projects.clone(),
+        };
+        if self.context_discovery_tx.send(request).is_err() {
+            self.context_snapshot = ContextSnapshot::empty(cwd);
+            self.show_notice("Context discovery is unavailable");
+        }
+    }
+
+    fn dispatch_context_request(&mut self, request: ContextRequest) {
+        let provider = match &request {
+            ContextRequest::TrustManifest { .. }
+            | ContextRequest::OpenManifestAll { .. }
+            | ContextRequest::OpenManifestTab { .. } => context_actions::MANIFEST_PROVIDER_ID,
+            ContextRequest::RunSpdeploy { .. } => context_actions::SPDEPLOY_PROVIDER_ID,
+            ContextRequest::OpenDirectory { .. } => phantom_core::RECENT_DIRECTORIES_PLUGIN_ID,
+        };
+        if !self.config.context_actions.enabled
+            || !self
+                .config
+                .context_actions
+                .plugin(provider)
+                .is_some_and(|plugin| plugin.enabled)
+        {
+            self.show_notice("That context plugin is disabled");
+            return;
+        }
+        match request {
+            ContextRequest::TrustManifest {
+                root,
+                manifest_source,
+            } => self.trust_manifest(root, manifest_source),
+            ContextRequest::OpenManifestAll {
+                root,
+                manifest_source,
+            } => self.open_manifest_tasks(root, manifest_source, None),
+            ContextRequest::OpenManifestTab {
+                root,
+                manifest_source,
+                tab_id,
+            } => self.open_manifest_tasks(root, manifest_source, Some(tab_id)),
+            ContextRequest::RunSpdeploy {
+                config_path,
+                operation,
+            } => self.run_spdeploy_context_action(config_path, operation),
+            ContextRequest::OpenDirectory { path, target } => {
+                self.open_context_directory(path, target)
+            }
+        }
+    }
+
+    fn open_context_directory(&mut self, path: PathBuf, target: context_actions::DirectoryTarget) {
+        let canonical = match path.canonicalize() {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => {
+                self.show_notice("That recent directory is no longer a directory");
+                return;
+            }
+            Err(error) => {
+                self.show_notice(format!("Could not open recent directory: {error}"));
+                return;
+            }
+        };
+        let Some(canonical_text) = canonical.to_str() else {
+            self.show_notice("That directory path is not valid UTF-8");
+            return;
+        };
+        if !self
+            .config
+            .context_actions
+            .directory_history
+            .iter()
+            .any(|entry| entry.path == canonical_text)
+        {
+            self.show_notice("That directory is no longer in recent history");
+            self.schedule_context_discovery();
+            return;
+        }
+
+        match target {
+            context_actions::DirectoryTarget::NewTab => {
+                self.spawn_tab(None, Some(canonical_text.to_string()));
+            }
+            context_actions::DirectoryTarget::CurrentTab => {
+                let Some(tab) = self.tabs.get(self.active) else {
+                    self.show_notice("No active terminal session");
+                    return;
+                };
+                if tab.return_to_shell {
+                    self.show_notice(
+                        "This tab is running a task; choose a shell tab or Shift-click",
+                    );
+                    return;
+                }
+                let pty_id = tab.pty_id;
+                let command = posix_cd_command(canonical_text);
+                if let Err(error) = self.pty.write(pty_id, command.as_bytes()) {
+                    self.show_notice(format!("Could not change directory: {error}"));
+                    return;
+                }
+                self.arm_cwd_polling(CWD_POLL_WINDOW);
+            }
+        }
+    }
+
+    fn flush_directory_visit(&mut self) {
+        if !self.directory_visit_pending {
+            return;
+        }
+        self.directory_visit_pending = false;
+        if !self.config.context_actions.enabled
+            || !self
+                .config
+                .context_actions
+                .plugin(phantom_core::RECENT_DIRECTORIES_PLUGIN_ID)
+                .is_some_and(|plugin| plugin.enabled)
+        {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Ok(canonical) = Path::new(&tab.cwd).canonicalize() else {
+            return;
+        };
+        if !canonical.is_dir() {
+            return;
+        }
+        let marker = (tab.id, canonical.clone());
+        if self.last_observed_directory.as_ref() == Some(&marker) {
+            return;
+        }
+        self.last_observed_directory = Some(marker);
+        let visited_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        if let Err(error) = self
+            .config
+            .context_actions
+            .record_directory_visit(&canonical, visited_at)
+        {
+            self.show_notice(format!("Could not remember directory: {error}"));
+            return;
+        }
+        self.mark_config_dirty();
+        self.schedule_context_discovery();
+    }
+
+    fn revalidate_manifest_request(
+        &self,
+        root: &Path,
+        manifest_source: &str,
+    ) -> phantom_core::AppResult<phantom_core::LoadedContextManifest> {
+        let active_cwd = self
+            .tabs
+            .get(self.active)
+            .map(|tab| Path::new(&tab.cwd))
+            .ok_or_else(|| phantom_core::AppError::InvalidConfig("no active tab".to_string()))?;
+        let active_cwd = active_cwd.canonicalize().map_err(|error| {
+            phantom_core::AppError::InvalidConfig(format!(
+                "active working directory is unavailable: {error}"
+            ))
+        })?;
+        let canonical_root = root.canonicalize().map_err(|error| {
+            phantom_core::AppError::InvalidConfig(format!(
+                "project directory is unavailable: {error}"
+            ))
+        })?;
+        if active_cwd != canonical_root {
+            return Err(phantom_core::AppError::InvalidConfig(
+                "the active tab has left this project directory".to_string(),
+            ));
+        }
+        let loaded = load_context_manifest(&canonical_root)?.ok_or_else(|| {
+            phantom_core::AppError::InvalidConfig(".phantom.yml no longer exists".to_string())
+        })?;
+        if loaded.source != manifest_source {
+            return Err(phantom_core::AppError::InvalidConfig(
+                ".phantom.yml changed; review and trust it again".to_string(),
+            ));
+        }
+        Ok(loaded)
+    }
+
+    fn trust_manifest(&mut self, root: PathBuf, manifest_source: String) {
+        let result = self
+            .revalidate_manifest_request(&root, &manifest_source)
+            .and_then(|loaded| trust_context_manifest(&loaded.root, loaded.source));
+        let trusted = match result {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                self.show_notice(format!("Could not trust project tasks: {error}"));
+                self.schedule_context_discovery();
+                return;
+            }
+        };
+
+        let mut candidate = self.config.clone();
+        if let Some(existing) = candidate
+            .trusted_projects
+            .iter_mut()
+            .find(|project| project.root == trusted.root)
+        {
+            *existing = trusted;
+        } else {
+            candidate.trusted_projects.push(trusted);
+        }
+        if let Err(error) = candidate.validate() {
+            self.show_notice(format!("Could not store project trust: {error}"));
+            return;
+        }
+        self.config = candidate;
+        self.mark_config_dirty();
+        self.schedule_context_discovery();
+    }
+
+    fn open_manifest_tasks(
+        &mut self,
+        root: PathBuf,
+        manifest_source: String,
+        only_task: Option<String>,
+    ) {
+        let loaded = match self.revalidate_manifest_request(&root, &manifest_source) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.show_notice(format!("Could not open project tabs: {error}"));
+                self.schedule_context_discovery();
+                return;
+            }
+        };
+        let Some(project) = self
+            .config
+            .trusted_projects
+            .iter()
+            .find(|project| {
+                Path::new(&project.root) == loaded.root && project.manifest_source == loaded.source
+            })
+            .cloned()
+        else {
+            self.show_notice("Project tasks are not trusted");
+            self.schedule_context_discovery();
+            return;
+        };
+
+        let task_ids: Vec<String> = match only_task {
+            Some(id) => vec![id],
+            None => project.tasks.iter().map(|task| task.id.clone()).collect(),
+        };
+        let (rows, cols) = self.viewport_grid();
+        let mut launches = Vec::with_capacity(task_ids.len());
+        for id in &task_ids {
+            let launch = match resolve_context_tab_launch(
+                &self.config,
+                &project,
+                &loaded.root,
+                &loaded.source,
+                id,
+                rows,
+                cols,
+            ) {
+                Ok(launch) => launch,
+                Err(error) => {
+                    self.show_notice(format!("Could not open project tabs: {error}"));
+                    return;
+                }
+            };
+            let title = project
+                .task(id)
+                .map(|task| task.title.clone())
+                .unwrap_or_else(|| id.clone());
+            launches.push((launch, title));
+        }
+
+        let original_len = self.tabs.len();
+        let original_active = self.active;
+        for (launch, title) in launches {
+            let return_to_shell = launch.command.is_some();
+            if !self.spawn_resolved_tab(launch, None, Some(title), return_to_shell, false) {
+                while self.tabs.len() > original_len {
+                    if let Some(tab) = self.tabs.pop() {
+                        let _ = self.pty.kill(tab.pty_id);
+                    }
+                }
+                self.active = original_active.min(self.tabs.len().saturating_sub(1));
+                self.mark_dirty();
+                self.schedule_context_discovery();
+                self.show_notice("Could not open every project tab; no project tabs were kept");
+                return;
+            }
+        }
+        self.mark_dirty();
+        self.schedule_context_discovery();
+    }
+
+    fn run_spdeploy_context_action(&mut self, config_path: PathBuf, operation: String) {
+        let active_cwd = match self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| Path::new(&tab.cwd).canonicalize().ok())
+        {
+            Some(cwd) => cwd,
+            None => {
+                self.show_notice("Could not resolve the active working directory");
+                return;
+            }
+        };
+        let listed_section =
+            self.context_snapshot
+                .sections
+                .iter()
+                .find_map(|section| match &section.content {
+                    context_actions::ContextSectionContent::Spdeploy(spdeploy)
+                        if spdeploy.operations.iter().any(|item| {
+                            item.config_path == config_path && item.name == operation
+                        }) =>
+                    {
+                        Some(spdeploy)
+                    }
+                    _ => None,
+                });
+        if let Some(section) = listed_section {
+            if let Err(error) = context_actions::verify_spdeploy_sources(section) {
+                self.show_notice(format!("spdeploy configuration changed: {error}"));
+                self.schedule_context_discovery();
+                return;
+            }
+        }
+        let canonical_config = config_path.canonicalize().ok();
+        let valid = listed_section.is_some()
+            && self.context_snapshot.cwd == active_cwd
+            && canonical_config
+                .as_ref()
+                .is_some_and(|path| path.starts_with(&active_cwd) && path.is_file())
+            && !operation.is_empty()
+            && operation.len() <= 256
+            && !operation.chars().any(char::is_control);
+        if !valid {
+            self.show_notice("The selected spdeploy action is stale or invalid");
+            self.schedule_context_discovery();
+            return;
+        }
+        let config_path = canonical_config.expect("validated canonical spdeploy config");
+        let (rows, cols) = self.viewport_grid();
+        let launch = LaunchOpts {
+            command: Some("spdeploy".to_string()),
+            args: vec![
+                "--config".to_string(),
+                config_path.to_string_lossy().into_owned(),
+                "--operation".to_string(),
+                operation.clone(),
+                "--no-ui".to_string(),
+            ],
+            env: Default::default(),
+            cwd: config_path
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned()),
+            rows,
+            cols,
+        };
+        self.spawn_resolved_tab(
+            launch,
+            None,
+            Some(format!("spdeploy: {operation}")),
+            true,
+            true,
+        );
     }
 
     fn save_config(&mut self) {
@@ -1286,6 +1814,7 @@ impl App {
         self.tab_scroll_into_view = Some(index);
         self.rename = None;
         self.mark_dirty();
+        self.schedule_context_discovery();
         self.request_redraw();
     }
 
@@ -1305,6 +1834,7 @@ impl App {
         self.tab_scroll_into_view = Some(insert_at);
         self.rename = None;
         self.mark_dirty();
+        self.schedule_context_discovery();
     }
 
     fn tab_drag_indicator(&self) -> Option<chrome::DragIndicator> {
@@ -1324,13 +1854,17 @@ impl App {
         let gpu = self.gpu.as_ref()?;
         let renderer = self.renderer.as_ref()?;
         let (w, h) = gpu.size();
-        Some(chrome::compute_layout_scaled(
+        let layout = chrome::compute_layout_scaled(
             self.content_width(w),
             h as f32,
             renderer.cell_size().1,
             self.horizontal(),
             self.applied_window_chrome(),
             gpu.scale_factor(),
+        );
+        Some(chrome::reserve_right_sidebar(
+            layout,
+            self.ui.terminal_right_inset_px(),
         ))
     }
 
@@ -1893,6 +2427,7 @@ impl App {
             if cwd != current {
                 self.tabs[self.active].cwd = cwd;
                 self.mark_dirty();
+                self.schedule_context_discovery();
                 self.request_redraw();
             }
         }
@@ -1972,12 +2507,34 @@ impl App {
     fn render(&mut self) {
         self.redraw_queued = false;
         self.sync_surface_to_window_size();
+        let context_top_inset_points = match (self.gpu.as_ref(), self.renderer.as_ref()) {
+            (Some(gpu), Some(renderer)) => {
+                let (width, height) = gpu.size();
+                let layout = chrome::compute_layout_scaled(
+                    width.max(1) as f32,
+                    height as f32,
+                    renderer.cell_size().1,
+                    self.config.tab_layout != "vertical",
+                    chrome::WindowChrome::from_config(&self.applied_window_chrome),
+                    gpu.scale_factor(),
+                );
+                chrome::terminal_pane(&layout).y / gpu.scale_factor()
+            }
+            _ => 0.0,
+        };
+        let context_config_before = self.config.context_actions.clone();
+        let global_notice = self.notice.as_ref().map(|notice| notice.text.as_str());
         let ui_outcome = match (self.gpu.as_ref(), self.egui.as_mut()) {
-            (Some(gpu), Some(egui)) => egui.run(
+            (Some(gpu), Some(egui)) => egui.run_with_context(
                 &gpu.window,
                 &mut self.ui,
                 &mut self.config,
                 &mut self.palette,
+                UiFrameContext {
+                    snapshot: &self.context_snapshot,
+                    top_inset_points: context_top_inset_points,
+                    global_notice,
+                },
             ),
             _ => Default::default(),
         };
@@ -1995,9 +2552,25 @@ impl App {
         }
         if ui_outcome.config_changed {
             self.apply_config_change();
+            if context_discovery_config_changed(
+                &context_config_before,
+                &self.config.context_actions,
+            ) {
+                self.schedule_context_discovery();
+            }
         }
         if let Some(action) = ui_outcome.palette_action {
             self.dispatch_palette(action);
+        }
+        if let Some(request) = ui_outcome.context_request {
+            self.dispatch_context_request(request);
+        }
+        if let Some(egui) = self.egui.as_mut() {
+            // Rebuilding full-surface blur textures for every intermediate
+            // maximize/restore size can saturate the GPU and make the native
+            // window appear frozen. Keep translucent fills during live resize,
+            // then restore frosting once the surface dimensions settle.
+            egui.set_blur_suppressed(self.live_resize_until.is_some());
         }
         if self.pending_terminal_grid.is_none() {
             self.sync_terminal_grid(false);
@@ -2009,7 +2582,7 @@ impl App {
             return;
         };
         let (w, h) = gpu.size();
-        let layout = chrome::compute_layout_scaled(
+        let base_layout = chrome::compute_layout_scaled(
             w.max(1) as f32,
             h as f32,
             renderer.cell_size().1,
@@ -2017,6 +2590,7 @@ impl App {
             chrome::WindowChrome::from_config(&self.applied_window_chrome),
             gpu.scale_factor(),
         );
+        let layout = chrome::reserve_right_sidebar(base_layout, self.ui.terminal_right_inset_px());
         let colors = chrome::ChromeColors::from_renderer(
             renderer,
             themes::ui_theme_accent(&self.config.ui_theme),
@@ -2025,8 +2599,8 @@ impl App {
         let chrome_animating = self.chrome_anim.advance(Instant::now(), titles.len());
 
         renderer.begin();
-        chrome::draw_window_backfill(renderer, &layout, &colors, w as f32, h as f32);
-        let terminal_pane = chrome::terminal_pane(&layout);
+        chrome::draw_window_backfill(renderer, &base_layout, &colors, w as f32, h as f32);
+        let terminal_pane = chrome::terminal_pane(&base_layout);
         renderer.draw_terminal_backdrop(
             &self.config.terminal_background,
             self.config.terminal_background_opacity,
@@ -2092,27 +2666,6 @@ impl App {
                 renderer.text(&gpu.queue, px, py, &self.preedit, colors.text);
                 renderer.fill_rect(px, py + ch - 2.0, width, 2.0, colors.accent);
             }
-        }
-        if let Some(notice) = self.notice.as_ref() {
-            renderer.begin_overlay();
-            let pad = 10.0;
-            let cell_h = renderer.cell_size().1;
-            let text_w = renderer.text_width(&notice.text);
-            let available_w = (w as f32 - pad * 2.0).max(40.0);
-            let min_w = available_w.min(120.0);
-            let box_w = (text_w + pad * 2.0).clamp(min_w, available_w);
-            let box_h = cell_h + pad * 2.0;
-            let x = ((w as f32 - box_w) / 2.0).max(pad);
-            let y = (h as f32 - box_h - pad).max(pad);
-            renderer.fill_rect(x, y, box_w, box_h, [12, 16, 22, 235]);
-            renderer.fill_rect(x, y, 3.0, box_h, colors.accent);
-            renderer.text(
-                &gpu.queue,
-                x + pad,
-                y + pad,
-                &truncate_to_fit(&notice.text, renderer, box_w - pad * 2.0),
-                colors.text,
-            );
         }
         renderer.end(&gpu.device, &gpu.queue);
         let present_status = if let Some(egui) = self.egui.as_mut() {
@@ -2240,8 +2793,55 @@ fn translate(event: &WindowEvent, mods: Mods, cursor: (f32, f32)) -> Option<AppI
     })
 }
 
-fn terminal_owns_keyboard(palette_open: bool, renaming: bool, settings_open: bool) -> bool {
-    !palette_open && !renaming && !settings_open
+fn terminal_owns_keyboard(
+    palette_open: bool,
+    renaming: bool,
+    settings_open: bool,
+    context_owns_keyboard: bool,
+) -> bool {
+    !palette_open && !renaming && !settings_open && !context_owns_keyboard
+}
+
+fn context_discovery_config_changed(
+    before: &phantom_core::ContextActionsConfig,
+    after: &phantom_core::ContextActionsConfig,
+) -> bool {
+    before.enabled != after.enabled
+        || before.plugins.len() != after.plugins.len()
+        || before
+            .plugins
+            .iter()
+            .zip(&after.plugins)
+            .any(|(before, after)| {
+                before.id != after.id
+                    || before.enabled != after.enabled
+                    || before.order != after.order
+            })
+}
+
+fn posix_cd_command(path: &str) -> String {
+    format!("cd '{}'\r", path.replace('\'', "'\\''"))
+}
+
+fn resolve_context_tab_launch(
+    config: &AppConfig,
+    project: &phantom_core::TrustedProject,
+    observed_root: &Path,
+    observed_source: &str,
+    task_id: &str,
+    rows: u16,
+    cols: u16,
+) -> phantom_core::AppResult<LaunchOpts> {
+    let trusted =
+        resolve_trusted_task(project, observed_root, observed_source, task_id, rows, cols)?;
+    let task = project.task(task_id).ok_or_else(|| {
+        phantom_core::AppError::InvalidConfig(format!("unknown trusted task '{task_id}'"))
+    })?;
+    if task.run.is_none() {
+        resolve_launch_opts(config, None, trusted.cwd, rows, cols)
+    } else {
+        Ok(trusted)
+    }
 }
 
 fn app_input_bypasses_egui_overlay(input: &AppInput) -> bool {
@@ -2451,6 +3051,7 @@ impl ApplicationHandler<AppEvent> for App {
             self.palette.open,
             self.rename.is_some(),
             self.ui.settings_open(),
+            self.ui.context_owns_keyboard(),
         );
         let egui_response = if terminal_owns_keyboard && is_keyboard_event(&event) {
             None
@@ -2467,8 +3068,9 @@ impl ApplicationHandler<AppEvent> for App {
         let input = translate(&event, self.mods, self.cursor_pos);
 
         if let Some(input) = input {
-            let palette_owns_input = self.palette.open && self.egui.is_some();
-            if app_input_bypasses_egui_overlay(&input) || (!consumed && !palette_owns_input) {
+            let egui_overlay_owns_input =
+                self.egui.is_some() && (self.palette.open || self.ui.context_owns_keyboard());
+            if app_input_bypasses_egui_overlay(&input) || (!consumed && !egui_overlay_owns_input) {
                 self.handle_input(input);
             }
         }
@@ -2485,6 +3087,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
         self.drain_persistence_errors();
         self.pump_cwd_polling(now);
+        self.flush_directory_visit();
         if let Some(deadline) = self.renderer_rebuild_after {
             if now >= deadline {
                 self.renderer_rebuild_after = None;
@@ -2527,6 +3130,9 @@ impl ApplicationHandler<AppEvent> for App {
             }
             if now >= until {
                 self.live_resize_until = None;
+                // Paint one settled frame with the final grid and backdrop
+                // blur after the cheap live-resize path ends.
+                self.request_redraw();
             }
         }
 
@@ -2597,20 +3203,6 @@ fn truncate_to_chars(value: &str, max_bytes: usize) -> String {
     out
 }
 
-fn truncate_to_fit(value: &str, renderer: &Renderer, max_width: f32) -> String {
-    let cell_w = renderer.cell_size().0.max(1.0);
-    let max_chars = (max_width / cell_w).floor().max(1.0) as usize;
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-    let mut out: String = value.chars().take(max_chars - 1).collect();
-    out.push('…');
-    out
-}
-
 /// Run the app under a winit event loop (the production entry point).
 pub fn run() {
     let store = SessionStore::open()
@@ -2662,10 +3254,75 @@ mod tests {
 
     #[test]
     fn keyboard_events_bypass_egui_only_when_terminal_owns_input() {
-        assert!(terminal_owns_keyboard(false, false, false));
-        assert!(!terminal_owns_keyboard(true, false, false));
-        assert!(!terminal_owns_keyboard(false, true, false));
-        assert!(!terminal_owns_keyboard(false, false, true));
+        assert!(terminal_owns_keyboard(false, false, false, false));
+        assert!(!terminal_owns_keyboard(true, false, false, false));
+        assert!(!terminal_owns_keyboard(false, true, false, false));
+        assert!(!terminal_owns_keyboard(false, false, true, false));
+        assert!(!terminal_owns_keyboard(false, false, false, true));
+    }
+
+    #[test]
+    fn presentation_only_context_changes_do_not_restart_discovery() {
+        let before = phantom_core::ContextActionsConfig::default();
+        let mut after = before.clone();
+        after.panel_collapsed = true;
+        after.plugins[0].section_collapsed = true;
+        assert!(!context_discovery_config_changed(&before, &after));
+
+        after.plugins[0].enabled = false;
+        assert!(context_discovery_config_changed(&before, &after));
+    }
+
+    #[test]
+    fn posix_cd_command_quotes_paths_and_submits_with_carriage_return() {
+        assert_eq!(
+            posix_cd_command("/projects/O'Brien/soul fire"),
+            "cd '/projects/O'\\''Brien/soul fire'\r"
+        );
+        assert_eq!(posix_cd_command("/"), "cd '/'\r");
+    }
+
+    #[test]
+    fn directory_history_updates_do_not_implicitly_restart_discovery() {
+        let before = phantom_core::ContextActionsConfig::default();
+        let mut after = before.clone();
+        after
+            .record_directory_visit(Path::new("/projects/soulfire"), 1)
+            .unwrap();
+
+        assert!(!context_discovery_config_changed(&before, &after));
+    }
+
+    #[test]
+    fn runless_context_tab_uses_configured_default_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "phantom-runless-context-{}-{:?}",
+            std::process::id(),
+            Instant::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source =
+            "version: 1\nname: Test\ntabs:\n  - id: deploy\n    title: Deploy\n    cwd: .\n";
+        let project = trust_context_manifest(&root, source.to_string()).unwrap();
+        let config = AppConfig {
+            shell_profiles: vec![phantom_core::ShellProfile {
+                id: "custom".to_string(),
+                name: "Custom".to_string(),
+                command: "/bin/custom-shell".to_string(),
+                args: vec!["--login".to_string()],
+                cwd: None,
+            }],
+            default_shell_profile_id: "custom".to_string(),
+            ..AppConfig::default()
+        };
+
+        let launch =
+            resolve_context_tab_launch(&config, &project, &root, source, "deploy", 24, 80).unwrap();
+
+        assert_eq!(launch.command.as_deref(), Some("/bin/custom-shell"));
+        assert_eq!(launch.args, ["--login"]);
+        assert_eq!(launch.cwd.as_deref(), Some(project.tasks[0].cwd.as_str()));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

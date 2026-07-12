@@ -14,6 +14,9 @@ pub struct Tab {
     pub cwd: String,
     /// Profile this tab was launched with; persisted for faithful restore.
     pub profile_id: Option<String>,
+    /// A one-shot contextual task returns to the default shell when it exits,
+    /// preserving its output and leaving the tab useful.
+    pub return_to_shell: bool,
 }
 
 impl Tab {
@@ -31,6 +34,7 @@ impl Tab {
             custom_title: String::new(),
             cwd,
             profile_id,
+            return_to_shell: false,
         }
     }
 
