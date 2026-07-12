@@ -47,6 +47,7 @@ pub fn resolve_launch_opts(
         },
         args: profile.args.clone(),
         env: BTreeMap::new(),
+        inherit_shell_path: false,
         cwd,
         rows,
         cols,

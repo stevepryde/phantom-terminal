@@ -535,6 +535,7 @@ pub fn resolve_trusted_task(
         command,
         args,
         env,
+        inherit_shell_path: task.run.is_some(),
         cwd: Some(task.cwd.clone()),
         rows,
         cols,
@@ -915,6 +916,7 @@ tabs:
         assert_eq!(launch.command.as_deref(), Some("cargo"));
         assert_eq!(launch.args, ["run"]);
         assert_eq!(launch.env.get("RUST_LOG").map(String::as_str), Some("info"));
+        assert!(launch.inherit_shell_path);
         assert_eq!((launch.rows, launch.cols), (40, 120));
     }
 
@@ -944,6 +946,7 @@ tabs:
         assert_eq!(launch.command, None);
         assert!(launch.args.is_empty());
         assert!(launch.env.is_empty());
+        assert!(!launch.inherit_shell_path);
     }
 
     #[test]

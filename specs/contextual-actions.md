@@ -105,9 +105,10 @@ validated-execution posture.
   topmost layer after every panel, sidebar, palette, and popup. Contextual UI
   must never obscure an error.
 - **CTX-028 (correctness):** Explicit contextual programs are resolved from the
-  normalized GUI-safe PATH before PTY spawn. The fallback includes `~/bin`,
-  `~/.cargo/bin`, and `~/.local/bin`, so Finder-launched builds can run trusted
-  tools without inheriting a login shell's environment.
+  same login-shell-initialized PATH used by ordinary Ctrl+T and titlebar `+`
+  tabs. Resolution is lazy, retains the normalized GUI-safe fallback, and never
+  interpolates project data into a shell command. The fallback includes
+  `~/bin`, `~/.cargo/bin`, and `~/.local/bin`.
 - **CTX-029 (confirmed):** `phantom context validate [directory]` must validate
   the `.phantom.yml` in the supplied directory, defaulting to the current
   directory. It must use the same strict parser, canonical-root binding, and

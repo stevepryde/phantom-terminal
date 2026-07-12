@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -26,6 +26,7 @@ const WRITE_QUEUE_CHUNKS: usize = 256;
 const MAX_LAUNCH_ENV_VARS: usize = 128;
 const MAX_LAUNCH_ENV_KEY_LEN: usize = 128;
 const MAX_LAUNCH_ENV_VALUE_LEN: usize = 16 * 1024;
+const MAX_SHELL_PATH_LEN: usize = 64 * 1024;
 
 /// Consumer of a PTY session's output.
 ///
@@ -63,6 +64,10 @@ pub struct LaunchOpts {
     /// Validated per-task environment additions. Reserved terminal/account
     /// variables are owned by Phantom and cannot be supplied by manifests.
     pub env: BTreeMap<String, String>,
+    /// Resolve and pass PATH as initialized by the user's login shell. This is
+    /// reserved for explicit contextual actions; ordinary profiles retain
+    /// their existing launch behavior.
+    pub inherit_shell_path: bool,
     pub cwd: Option<String>,
     pub rows: u16,
     pub cols: u16,
@@ -85,6 +90,25 @@ struct AccountEnv {
 struct ProcessEnv {
     account: AccountEnv,
     path: String,
+    login_shell_path: OnceLock<String>,
+}
+
+impl ProcessEnv {
+    /// Explicit contextual programs must see the same PATH initialization as a
+    /// normal tab's login shell. Resolve it lazily so ordinary shell tabs do
+    /// not run startup files twice, then retain the GUI-safe fallback entries.
+    fn explicit_program_path(&self) -> &str {
+        self.login_shell_path.get_or_init(|| {
+            login_shell_path(&self.account, &self.path)
+                .map(|path| {
+                    merge_path_parts(
+                        [Some(path), Some(self.path.clone())],
+                        self.account.home.as_deref(),
+                    )
+                })
+                .unwrap_or_else(|| self.path.clone())
+        })
+    }
 }
 
 pub struct PtyManager {
@@ -157,6 +181,11 @@ impl PtyManager {
         let account = &env.account;
         let use_default_shell =
             opts.command.as_ref().is_none_or(|c| c.is_empty()) && opts.args.is_empty();
+        let launch_path = if opts.inherit_shell_path && !use_default_shell {
+            env.explicit_program_path()
+        } else {
+            &env.path
+        };
         let mut cmd = if use_default_shell {
             CommandBuilder::new_default_prog()
         } else {
@@ -164,7 +193,7 @@ impl PtyManager {
                 .command
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| default_shell(account));
-            let command = resolve_named_program(&command, &env.path)?;
+            let command = resolve_named_program(&command, launch_path)?;
             let mut cmd = CommandBuilder::new(command);
             for arg in &opts.args {
                 cmd.arg(arg);
@@ -177,7 +206,7 @@ impl PtyManager {
         // TERM advertises a capable terminal; PATH is normalized because macOS
         // GUI apps launch with a sparse environment compared with login shells.
         apply_terminal_env(&mut cmd);
-        cmd.env("PATH", &env.path);
+        cmd.env("PATH", launch_path);
         apply_account_env(&mut cmd, account);
         apply_launch_env(&mut cmd, &opts.env);
 
@@ -475,8 +504,52 @@ fn process_env() -> &'static ProcessEnv {
     PROCESS_ENV.get_or_init(|| {
         let account = account_env();
         let path = shell_path(&account);
-        ProcessEnv { account, path }
+        ProcessEnv {
+            account,
+            path,
+            login_shell_path: OnceLock::new(),
+        }
     })
+}
+
+#[cfg(unix)]
+fn login_shell_path(account: &AccountEnv, fallback_path: &str) -> Option<String> {
+    let shell = default_shell(account);
+    let mut command = Command::new(shell);
+    command
+        // The leading NUL separates any interactive startup output from the
+        // first environment entry, even when PATH happens to be emitted first.
+        .args(["-ilc", "/usr/bin/printf '\\0'; /usr/bin/env -0"])
+        .env("PATH", fallback_path);
+    if let Some(home) = account.home.as_deref() {
+        command.env("HOME", home);
+    }
+    if let Some(shell) = account.shell.as_deref() {
+        command.env("SHELL", shell);
+    }
+    if let Some(user) = account.user.as_deref() {
+        command.env("USER", user).env("LOGNAME", user);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_env_path(&output.stdout)
+}
+
+#[cfg(not(unix))]
+fn login_shell_path(_account: &AccountEnv, _fallback_path: &str) -> Option<String> {
+    None
+}
+
+fn parse_env_path(output: &[u8]) -> Option<String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(b"PATH="))
+        .filter(|path| !path.is_empty() && path.len() <= MAX_SHELL_PATH_LEN)
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .next_back()
+        .map(str::to_string)
 }
 
 #[cfg(target_os = "macos")]
@@ -719,6 +792,25 @@ mod tests {
         assert_eq!(merged, "/usr/bin:/bin:/opt/homebrew/bin");
     }
 
+    #[test]
+    fn env_path_parser_ignores_shell_noise_and_uses_nul_delimited_path() {
+        let output =
+            b"startup message\nHOME=/home/x\0PATH=/home/x/.bun/bin:/usr/bin\0SHELL=/bin/zsh\0";
+
+        assert_eq!(
+            parse_env_path(output).as_deref(),
+            Some("/home/x/.bun/bin:/usr/bin")
+        );
+    }
+
+    #[test]
+    fn env_path_parser_rejects_empty_invalid_or_oversized_values() {
+        assert_eq!(parse_env_path(b"PATH=\0"), None);
+        assert_eq!(parse_env_path(b"PATH=\xff\0"), None);
+        let oversized = format!("PATH={}\0", "a".repeat(MAX_SHELL_PATH_LEN + 1));
+        assert_eq!(parse_env_path(oversized.as_bytes()), None);
+    }
+
     fn account(home: Option<&str>, shell: Option<&str>, user: Option<&str>) -> AccountEnv {
         AccountEnv {
             home: home.map(str::to_string),
@@ -925,6 +1017,7 @@ mod tests {
                     command: Some("/bin/sh".to_string()),
                     args: vec!["-c".to_string(), "exit 0".to_string()],
                     env: BTreeMap::new(),
+                    inherit_shell_path: false,
                     cwd: None,
                     rows: 24,
                     cols: 80,
