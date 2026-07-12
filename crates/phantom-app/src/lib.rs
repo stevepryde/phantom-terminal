@@ -41,9 +41,9 @@ use gpu::{GpuContext, PresentStatus};
 use keybindings::{Action, Keymap};
 use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
-    default_home_dir, load_context_manifest, resolve_launch_opts, resolve_trusted_task,
-    trust_context_manifest, AppConfig, LaunchContext, LaunchOpts, PtyManager, PtySink,
-    SessionStore, StartupCommand, TabRecord, WindowSize, MAX_TAB_TITLE_LEN,
+    default_home_dir, resolve_launch_opts, resolve_trusted_task, trust_context_manifest, AppConfig,
+    LaunchContext, LaunchOpts, PtyManager, PtySink, SessionStore, StartupCommand, TabRecord,
+    WindowSize, MAX_TAB_TITLE_LEN,
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
@@ -1381,6 +1381,20 @@ impl App {
         root: &Path,
         manifest_source: &str,
     ) -> phantom_core::AppResult<phantom_core::LoadedContextManifest> {
+        let loaded = self.revalidate_manifest_source(root, manifest_source)?;
+        let manifest = phantom_core::parse_context_manifest(&loaded.source)?;
+        Ok(phantom_core::LoadedContextManifest {
+            root: loaded.root,
+            source: loaded.source,
+            manifest,
+        })
+    }
+
+    fn revalidate_manifest_source(
+        &self,
+        root: &Path,
+        manifest_source: &str,
+    ) -> phantom_core::AppResult<phantom_core::ContextManifestSource> {
         let active_cwd = self
             .tabs
             .get(self.active)
@@ -1401,9 +1415,10 @@ impl App {
                 "the active tab has left this project directory".to_string(),
             ));
         }
-        let loaded = load_context_manifest(&canonical_root)?.ok_or_else(|| {
-            phantom_core::AppError::InvalidConfig(".phantom.yml no longer exists".to_string())
-        })?;
+        let loaded =
+            phantom_core::load_context_manifest_source(&canonical_root)?.ok_or_else(|| {
+                phantom_core::AppError::InvalidConfig(".phantom.yml no longer exists".to_string())
+            })?;
         if loaded.source != manifest_source {
             return Err(phantom_core::AppError::InvalidConfig(
                 ".phantom.yml changed; review and trust it again".to_string(),
@@ -1445,7 +1460,7 @@ impl App {
     }
 
     fn edit_manifest(&mut self, root: PathBuf, manifest_source: String) {
-        let loaded = match self.revalidate_manifest_request(&root, &manifest_source) {
+        let loaded = match self.revalidate_manifest_source(&root, &manifest_source) {
             Ok(loaded) => loaded,
             Err(error) => {
                 self.show_notice(format!("Could not edit project tasks: {error}"));

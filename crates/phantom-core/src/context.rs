@@ -307,6 +307,12 @@ pub struct LoadedContextManifest {
     pub manifest: ContextManifest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextManifestSource {
+    pub root: PathBuf,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustedProject {
@@ -398,8 +404,8 @@ impl TrustedContextTab {
     }
 }
 
-/// Read and validate the manifest in `root`. Missing manifests are not errors.
-pub fn load_context_manifest(root: &Path) -> AppResult<Option<LoadedContextManifest>> {
+/// Read the bounded manifest source in `root` without requiring valid YAML.
+pub fn load_context_manifest_source(root: &Path) -> AppResult<Option<ContextManifestSource>> {
     let root = canonical_directory(root, "context project root")?;
     let path = root.join(CONTEXT_MANIFEST_FILE);
     let metadata = match fs::symlink_metadata(&path) {
@@ -421,6 +427,15 @@ pub fn load_context_manifest(root: &Path) -> AppResult<Option<LoadedContextManif
     }
     let source = fs::read_to_string(&path)?;
     validate_source(&source)?;
+    Ok(Some(ContextManifestSource { root, source }))
+}
+
+/// Read and validate the manifest in `root`. Missing manifests are not errors.
+pub fn load_context_manifest(root: &Path) -> AppResult<Option<LoadedContextManifest>> {
+    let Some(loaded) = load_context_manifest_source(root)? else {
+        return Ok(None);
+    };
+    let ContextManifestSource { root, source } = loaded;
     let manifest = parse_context_manifest(&source)?;
     Ok(Some(LoadedContextManifest {
         root,
@@ -956,6 +971,18 @@ tabs:
         let loaded = load_context_manifest(&dir.0).unwrap().unwrap();
         assert_eq!(loaded.source, VALID);
         assert_eq!(loaded.manifest.name, "Soulfire");
+    }
+
+    #[test]
+    fn bounded_manifest_source_remains_available_when_yaml_is_invalid() {
+        let dir = TestDir::new();
+        let source = "version: [unterminated";
+        fs::write(dir.0.join(CONTEXT_MANIFEST_FILE), source).unwrap();
+
+        let loaded = load_context_manifest_source(&dir.0).unwrap().unwrap();
+        assert_eq!(loaded.root, fs::canonicalize(&dir.0).unwrap());
+        assert_eq!(loaded.source, source);
+        assert!(load_context_manifest(&dir.0).is_err());
     }
 
     #[cfg(unix)]

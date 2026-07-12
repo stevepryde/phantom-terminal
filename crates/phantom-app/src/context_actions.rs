@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 
 use noyalib::Value;
 use phantom_core::{
-    load_context_manifest, trust_context_manifest, ContextActionsConfig, ContextRun,
-    TrustedProject, BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE,
-    RECENT_DIRECTORIES_PLUGIN_ID,
+    load_context_manifest_source, parse_context_manifest, trust_context_manifest,
+    ContextActionsConfig, ContextRun, TrustedProject, BUILT_IN_CONTEXT_PLUGIN_IDS,
+    CONTEXT_MANIFEST_FILE, RECENT_DIRECTORIES_PLUGIN_ID,
 };
 
 pub const MANIFEST_PROVIDER_ID: &str = "phantom-manifest";
@@ -59,7 +59,16 @@ pub enum ContextSectionContent {
     Spdeploy(SpdeploySection),
     RecentDirectories(RecentDirectoriesSection),
     FrequentCommands(FrequentCommandsSection),
+    ManifestError(ManifestErrorSection),
     Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestErrorSection {
+    pub root: PathBuf,
+    /// Exact bounded source observed when parsing failed.
+    pub manifest_source: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,14 +245,28 @@ pub fn discover_manifest(
     cwd: &Path,
     trusted_projects: &[TrustedProject],
 ) -> Option<ContextSection> {
-    let loaded = match load_context_manifest(cwd) {
+    let loaded = match load_context_manifest_source(cwd) {
         Ok(Some(loaded)) => loaded,
         Ok(None) => return None,
-        Err(error) => return Some(manifest_error(error.to_string())),
+        Err(error) => return Some(manifest_error(error.to_string(), None)),
+    };
+    let manifest = match parse_context_manifest(&loaded.source) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Some(manifest_error(
+                error.to_string(),
+                Some((loaded.root, loaded.source)),
+            ))
+        }
     };
     let proposal = match trust_context_manifest(&loaded.root, loaded.source.clone()) {
         Ok(project) => project,
-        Err(error) => return Some(manifest_error(error.to_string())),
+        Err(error) => {
+            return Some(manifest_error(
+                error.to_string(),
+                Some((loaded.root, loaded.source)),
+            ))
+        }
     };
     let trusted = trusted_projects.iter().any(|project| {
         Path::new(&project.root) == loaded.root && project.manifest_source == loaded.source
@@ -261,12 +284,12 @@ pub fn discover_manifest(
 
     Some(ContextSection {
         id: MANIFEST_PROVIDER_ID.to_string(),
-        title: loaded.manifest.name.clone(),
+        title: manifest.name.clone(),
         content: ContextSectionContent::Manifest(ManifestSection {
             manifest_path: loaded.root.join(CONTEXT_MANIFEST_FILE),
             root: loaded.root,
             manifest_source: loaded.source,
-            name: loaded.manifest.name,
+            name: manifest.name,
             trust: if trusted {
                 ManifestTrustState::Trusted
             } else {
@@ -285,12 +308,21 @@ fn manifest_task(run: ContextRun) -> ManifestTask {
     }
 }
 
-fn manifest_error(message: String) -> ContextSection {
+fn manifest_error(message: String, source: Option<(PathBuf, String)>) -> ContextSection {
     ContextSection {
         id: MANIFEST_PROVIDER_ID.to_string(),
         title: ".phantom.yml".to_string(),
-        content: ContextSectionContent::Error {
-            message: bounded_text(&message, MAX_ERROR_BYTES),
+        content: match source {
+            Some((root, manifest_source)) => {
+                ContextSectionContent::ManifestError(ManifestErrorSection {
+                    root,
+                    manifest_source,
+                    message: bounded_text(&message, MAX_ERROR_BYTES),
+                })
+            }
+            None => ContextSectionContent::Error {
+                message: bounded_text(&message, MAX_ERROR_BYTES),
+            },
         },
     }
 }
@@ -756,6 +788,21 @@ tabs:
             panic!("expected manifest section");
         };
         assert_eq!(manifest.trust, ManifestTrustState::Trusted);
+    }
+
+    #[test]
+    fn invalid_manifest_keeps_its_source_for_editing() {
+        let temp = TestDir::new();
+        let source = "version: [unterminated";
+        fs::write(temp.path().join(CONTEXT_MANIFEST_FILE), source).unwrap();
+
+        let section = discover_manifest(temp.path(), &[]).unwrap();
+        let ContextSectionContent::ManifestError(error) = section.content else {
+            panic!("expected editable manifest error");
+        };
+        assert_eq!(error.root, temp.path().canonicalize().unwrap());
+        assert_eq!(error.manifest_source, source);
+        assert!(error.message.contains("invalid .phantom.yml"));
     }
 
     #[test]

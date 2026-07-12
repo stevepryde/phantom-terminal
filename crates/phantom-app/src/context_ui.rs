@@ -373,7 +373,11 @@ impl ContextUi {
         let mut outcome = ContextUiOutcome::default();
         let (_, header_rect) =
             ui.allocate_space(egui::vec2(ui.available_width(), SECTION_HEADER_HEIGHT));
-        let edit_rect = matches!(section.content, ContextSectionContent::Manifest(_)).then(|| {
+        let edit_rect = matches!(
+            section.content,
+            ContextSectionContent::Manifest(_) | ContextSectionContent::ManifestError(_)
+        )
+        .then(|| {
             egui::Rect::from_min_max(
                 egui::pos2(
                     header_rect.right() - SECTION_HEADER_HEIGHT,
@@ -471,16 +475,11 @@ impl ContextUi {
             ContextSectionContent::FrequentCommands(frequent) => {
                 outcome.request = draw_frequent_commands(ui, frequent);
             }
+            ContextSectionContent::ManifestError(error) => {
+                draw_error(ui, &error.message);
+            }
             ContextSectionContent::Error { message } => {
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.colored_label(Color32::from_rgb(248, 113, 113), message);
-                    });
-                    ui.add_space(8.0);
-                });
+                draw_error(ui, message);
             }
         }
         outcome
@@ -724,13 +723,27 @@ fn draw_ellipsis_icon(ui: &Ui, rect: egui::Rect, response: &egui::Response) {
 }
 
 fn edit_manifest_request(section: &ContextSection) -> Option<ContextRequest> {
-    let ContextSectionContent::Manifest(manifest) = &section.content else {
-        return None;
+    let (root, manifest_source) = match &section.content {
+        ContextSectionContent::Manifest(manifest) => (&manifest.root, &manifest.manifest_source),
+        ContextSectionContent::ManifestError(error) => (&error.root, &error.manifest_source),
+        _ => return None,
     };
     Some(ContextRequest::EditManifest {
-        root: manifest.root.clone(),
-        manifest_source: manifest.manifest_source.clone(),
+        root: root.clone(),
+        manifest_source: manifest_source.clone(),
     })
+}
+
+fn draw_error(ui: &mut Ui, message: &str) {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.colored_label(Color32::from_rgb(248, 113, 113), message);
+        });
+        ui.add_space(8.0);
+    });
 }
 
 fn thin_separator(ui: &mut Ui) {
@@ -1504,6 +1517,58 @@ mod tests {
             })
         );
         assert_eq!(edit_manifest_request(&snapshot.sections[1]), None);
+    }
+
+    #[test]
+    fn invalid_tasks_manifest_still_provides_an_edit_request() {
+        let section = ContextSection {
+            id: MANIFEST_PLUGIN_ID.to_string(),
+            title: ".phantom.yml".to_string(),
+            content: ContextSectionContent::ManifestError(
+                crate::context_actions::ManifestErrorSection {
+                    root: "/projects/soulfire".into(),
+                    manifest_source: "version: [unterminated".to_string(),
+                    message: "invalid .phantom.yml".to_string(),
+                },
+            ),
+        };
+
+        assert_eq!(
+            edit_manifest_request(&section),
+            Some(ContextRequest::EditManifest {
+                root: "/projects/soulfire".into(),
+                manifest_source: "version: [unterminated".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_tasks_manifest_keeps_the_header_edit_control_visible() {
+        let snapshot = ContextSnapshot {
+            cwd: "/projects/soulfire".into(),
+            sections: vec![ContextSection {
+                id: MANIFEST_PLUGIN_ID.to_string(),
+                title: ".phantom.yml".to_string(),
+                content: ContextSectionContent::ManifestError(
+                    crate::context_actions::ManifestErrorSection {
+                        root: "/projects/soulfire".into(),
+                        manifest_source: "version: [unterminated".to_string(),
+                        message: "invalid .phantom.yml".to_string(),
+                    },
+                ),
+            }],
+        };
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        let mut state = ContextUi::default();
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            state.draw(ui, &mut config, &snapshot, 42.0, 220);
+        });
+
+        assert!(ctx
+            .read_response(Id::new(("context_section_edit", MANIFEST_PLUGIN_ID)))
+            .is_some());
     }
 
     #[test]

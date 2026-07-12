@@ -234,20 +234,11 @@ pub fn reserve_right_sidebar(mut layout: Layout, width: f32) -> Layout {
 /// so backdrops can fill the pane while terminal glyphs stay padded.
 pub fn terminal_pane(layout: &Layout) -> Rect {
     let terminal_margin = px(layout, TERMINAL_MARGIN);
-    if layout.horizontal {
-        Rect {
-            x: layout.bar.x,
-            y: layout.bar.y + layout.bar.h,
-            w: layout.bar.w,
-            h: layout.viewport.h + terminal_margin * 2.0,
-        }
-    } else {
-        Rect {
-            x: layout.bar.x + layout.bar.w,
-            y: layout.bar.y,
-            w: layout.viewport.w + terminal_margin * 2.0,
-            h: layout.bar.h,
-        }
+    Rect {
+        x: layout.viewport.x - terminal_margin,
+        y: layout.viewport.y - terminal_margin,
+        w: layout.viewport.w + terminal_margin * 2.0,
+        h: layout.viewport.h + terminal_margin * 2.0,
     }
 }
 
@@ -1752,12 +1743,25 @@ mod tests {
     fn right_sidebar_reserves_only_terminal_content_width() {
         let base = compute_layout(1000.0, 600.0, 20.0, true, WindowChrome::System);
         let reserved = reserve_right_sidebar(base, 260.0);
+        let base_pane = terminal_pane(&base);
+        let reserved_pane = terminal_pane(&reserved);
 
         assert_eq!(reserved.viewport.w, base.viewport.w - 260.0);
         assert_eq!(reserved.bar, base.bar);
         assert_eq!(reserved.titlebar, base.titlebar);
         assert_eq!(reserved.viewport.x, base.viewport.x);
-        assert_eq!(terminal_pane(&base).w, base.bar.w);
+        assert_eq!(base_pane.w, base.bar.w);
+        assert_eq!(reserved_pane.w, base_pane.w - 260.0);
+        assert_eq!(reserved_pane.x, base_pane.x);
+        assert_eq!(
+            reserved_pane.x + reserved_pane.w,
+            base_pane.x + base_pane.w - 260.0
+        );
+        let scrollbar = terminal_scrollbar_track(&reserved);
+        assert_eq!(
+            scrollbar.x + scrollbar.w,
+            reserved_pane.x + reserved_pane.w - px(&reserved, SCROLLBAR_INSET)
+        );
     }
 
     #[test]

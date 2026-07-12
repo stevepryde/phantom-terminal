@@ -21,12 +21,13 @@ pub mod spawn;
 
 pub use config::{AppConfig, Keybinding, ShellProfile, Theme, WindowSize, UI_THEMES};
 pub use context::{
-    load_context_manifest, parse_context_manifest, resolve_trusted_task, trust_context_manifest,
-    validate_context_manifest, ContextActionsConfig, ContextManifest, ContextPluginConfig,
-    ContextRun, ContextTab, DirectoryHistoryEntry, LoadedContextManifest, TrustedContextTab,
-    TrustedProject, BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE,
-    DEFAULT_CONTEXT_SIDEBAR_WIDTH, DIRECTORY_SELECTION_PER_SIGNAL, FREQUENT_COMMANDS_PLUGIN_ID,
-    MANIFEST_PLUGIN_ID, MANIFEST_PLUGIN_ORDER, MAX_CONTEXT_MANIFEST_BYTES, MAX_CONTEXT_PLUGINS,
+    load_context_manifest, load_context_manifest_source, parse_context_manifest,
+    resolve_trusted_task, trust_context_manifest, validate_context_manifest, ContextActionsConfig,
+    ContextManifest, ContextManifestSource, ContextPluginConfig, ContextRun, ContextTab,
+    DirectoryHistoryEntry, LoadedContextManifest, TrustedContextTab, TrustedProject,
+    BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE, DEFAULT_CONTEXT_SIDEBAR_WIDTH,
+    DIRECTORY_SELECTION_PER_SIGNAL, FREQUENT_COMMANDS_PLUGIN_ID, MANIFEST_PLUGIN_ID,
+    MANIFEST_PLUGIN_ORDER, MAX_CONTEXT_MANIFEST_BYTES, MAX_CONTEXT_PLUGINS,
     MAX_CONTEXT_PLUGIN_ORDER, MAX_CONTEXT_SIDEBAR_WIDTH, MAX_CONTEXT_TABS, MAX_DIRECTORY_HISTORY,
     MAX_TRUSTED_PROJECTS, MIN_CONTEXT_SIDEBAR_WIDTH, RECENT_DIRECTORIES_PLUGIN_ID,
     RECENT_DIRECTORIES_PLUGIN_ORDER, SPDEPLOY_PLUGIN_ID, SPDEPLOY_PLUGIN_ORDER,
