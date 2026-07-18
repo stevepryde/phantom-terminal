@@ -22,14 +22,50 @@ use crate::context_actions::{
 };
 
 const ACTION_ROW_HEIGHT: f32 = 28.0;
+const ACTION_TEXT_SIZE: f32 = 12.0;
 const DIRECTORY_ROW_HEIGHT: f32 = 24.0;
 const DIRECTORY_TEXT_SIZE: f32 = 12.0;
 const SECTION_HEADER_HEIGHT: f32 = 28.0;
-const SIDEBAR_TOOLBAR_HEIGHT: f32 = 30.0;
+const SECTION_LABEL_TEXT_SIZE: f32 = 11.0;
+/// Horizontal center of the leading chevron inside a section header.
+const CHEVRON_CENTER_INSET: f32 = 13.0;
+/// Left edge of the section label, clear of the chevron.
+const SECTION_LABEL_INSET: f32 = 25.0;
+/// Left text inset shared by all full-width action and directory rows.
+const ROW_TEXT_INSET: f32 = 10.0;
+/// Horizontal margin around inset section content (controls, review details).
+const SECTION_BODY_MARGIN: i8 = 8;
+const SIDEBAR_TOOLBAR_HEIGHT: f32 = 36.0;
+const TOOLBAR_ICON_SIZE: f32 = 28.0;
 const FLOATING_ICON_INSET: f32 = 8.0;
 const MAX_VIEWPORT_FRACTION: f32 = 0.50;
 const RESIZE_GRAB_WIDTH: f32 = 6.0;
 const START_ALL_TASKS_LABEL: &str = "Start all (new tabs)";
+const RUN_SPDEPLOY_LABEL: &str = "Run in new tab";
+
+/// Warning text while a manifest awaits an explicit trust decision.
+const WARNING_TEXT_COLOR: Color32 = Color32::from_rgb(250, 204, 21);
+/// Error text for section-level failures (design token: danger).
+const ERROR_TEXT_COLOR: Color32 = Color32::from_rgb(248, 113, 113);
+
+fn white_alpha(alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
+}
+
+/// 1px outline shared by the sidebar surface and the floating launcher.
+fn surface_border_color() -> Color32 {
+    white_alpha(35)
+}
+
+/// Hairline between accordion sections (design token: divider).
+fn separator_color() -> Color32 {
+    white_alpha(26)
+}
+
+/// Muted text: empty states, dropdown group headings, detail labels.
+fn muted_text_color() -> Color32 {
+    white_alpha(110)
+}
 
 #[derive(Default)]
 pub(crate) struct ContextUi {
@@ -153,14 +189,8 @@ impl ContextUi {
             .pivot(Align2::RIGHT_TOP)
             .fixed_pos(position)
             .show(root_ui.ctx(), |ui| {
-                Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 35),
-                    ))
+                sidebar_frame(alpha, 4)
                     .corner_radius(4)
-                    .inner_margin(Margin::same(4))
                     .show(ui, |ui| {
                         if context_icon_button(ui, true).clicked() {
                             config.context_actions.panel_collapsed = false;
@@ -252,6 +282,7 @@ impl ContextUi {
                 egui::vec2(ui.available_width(), SIDEBAR_TOOLBAR_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
+                    ui.add_space(4.0);
                     if context_icon_button(ui, false).clicked() {
                         config.context_actions.panel_collapsed = true;
                         outcome.config_changed = true;
@@ -319,7 +350,7 @@ impl ContextUi {
         } else if resize.hovered() {
             root_ui.visuals().widgets.hovered.fg_stroke.color
         } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 35)
+            surface_border_color()
         };
         root_ui.painter().vline(
             panel_rect.left(),
@@ -362,58 +393,7 @@ impl ContextUi {
             .plugin(&section.id)
             .is_some_and(|plugin| plugin.section_collapsed);
         let mut outcome = ContextUiOutcome::default();
-        let (_, header_rect) =
-            ui.allocate_space(egui::vec2(ui.available_width(), SECTION_HEADER_HEIGHT));
-        let edit_rect = matches!(
-            section.content,
-            ContextSectionContent::Manifest(_) | ContextSectionContent::ManifestError(_)
-        )
-        .then(|| {
-            egui::Rect::from_min_max(
-                egui::pos2(
-                    header_rect.right() - SECTION_HEADER_HEIGHT,
-                    header_rect.top(),
-                ),
-                header_rect.right_bottom(),
-            )
-        });
-        let toggle_rect = edit_rect.map_or(header_rect, |rect| {
-            egui::Rect::from_min_max(
-                header_rect.min,
-                egui::pos2(rect.left(), header_rect.bottom()),
-            )
-        });
-        let header = ui
-            .interact(
-                toggle_rect,
-                Id::new(("context_section_toggle", section.id.as_str())),
-                Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let header_visuals = ui.style().interact(&header);
-        if header.hovered() || header.has_focus() {
-            ui.painter()
-                .rect_filled(toggle_rect, 0.0, header_visuals.weak_bg_fill);
-        }
-        draw_section_chevron(ui, header_rect, !collapsed, header_visuals.fg_stroke.color);
-        ui.painter().text(
-            egui::pos2(header_rect.left() + 25.0, header_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            section_label(section),
-            FontId::proportional(11.0),
-            header_visuals.fg_stroke.color,
-        );
-        let edit = edit_rect.map(|rect| {
-            let response = ui
-                .interact(
-                    rect,
-                    Id::new(("context_section_edit", section.id.as_str())),
-                    Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            draw_ellipsis_icon(ui, rect, &response);
-            response.on_hover_text("Edit .phantom.yml")
-        });
+        let (header, edit) = draw_section_header(ui, section, collapsed);
         let edit_clicked = edit.as_ref().is_some_and(egui::Response::clicked);
         if edit_clicked {
             outcome.request = edit_manifest_request(section);
@@ -428,50 +408,26 @@ impl ContextUi {
             return outcome;
         }
 
-        match &section.content {
-            ContextSectionContent::Manifest(manifest) => {
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.set_width((ui.available_width() - 8.0).max(0.0));
-                            let request = self.draw_manifest(ui, manifest);
-                            if outcome.request.is_none() {
-                                outcome.request = request;
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                });
-            }
+        let request = match &section.content {
+            ContextSectionContent::Manifest(manifest) => draw_manifest(ui, manifest),
             ContextSectionContent::Spdeploy(spdeploy) => {
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.set_width((ui.available_width() - 8.0).max(0.0));
-                            outcome.request = self.draw_spdeploy(ui, &section.id, spdeploy);
-                        });
-                    });
-                    ui.add_space(6.0);
-                });
+                self.draw_spdeploy(ui, &section.id, spdeploy)
             }
-            ContextSectionContent::RecentDirectories(recent) => {
-                outcome.request = draw_recent_directories(ui, recent);
-            }
+            ContextSectionContent::RecentDirectories(recent) => draw_recent_directories(ui, recent),
             ContextSectionContent::FrequentCommands(frequent) => {
-                outcome.request = draw_frequent_commands(ui, frequent);
+                draw_frequent_commands(ui, frequent)
             }
             ContextSectionContent::ManifestError(error) => {
                 draw_error(ui, &error.message);
+                None
             }
             ContextSectionContent::Error { message } => {
                 draw_error(ui, message);
+                None
             }
+        };
+        if outcome.request.is_none() {
+            outcome.request = request;
         }
         outcome
     }
@@ -483,11 +439,13 @@ impl ContextUi {
         spdeploy: &SpdeploySection,
     ) -> Option<ContextRequest> {
         if spdeploy.operations.is_empty() {
-            ui.label(
-                RichText::new("No runnable operations")
-                    .size(12.0)
-                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 100)),
-            );
+            section_body(ui, |ui| {
+                ui.label(
+                    RichText::new("No runnable operations")
+                        .size(ACTION_TEXT_SIZE)
+                        .color(muted_text_color()),
+                );
+            });
             return None;
         }
 
@@ -503,34 +461,124 @@ impl ContextUi {
             *selected = SpdeploySelection::new(&spdeploy.operations[0]);
         }
         let entries = spdeploy_dropdown_entries(spdeploy);
-        spdeploy_dropdown(ui, ("spdeploy_operation", section_id), selected, &entries);
-        if let Some(operation) = spdeploy
+        section_body(ui, |ui| {
+            spdeploy_dropdown(ui, ("spdeploy_operation", section_id), selected, &entries);
+        });
+        let operation = spdeploy
             .operations
             .iter()
-            .find(|operation| selected.matches(operation))
-        {
-            if ui.button("Run in new tab").clicked() {
-                return Some(ContextRequest::RunSpdeploy {
-                    config_path: operation.config_path.clone(),
-                    operation: operation.name.clone(),
-                });
-            }
-        }
-        None
+            .find(|operation| selected.matches(operation))?;
+        action_row(ui, RUN_SPDEPLOY_LABEL)
+            .clicked()
+            .then(|| ContextRequest::RunSpdeploy {
+                config_path: operation.config_path.clone(),
+                operation: operation.name.clone(),
+            })
+    }
+}
+
+fn draw_manifest(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
+    if manifest.trust == ManifestTrustState::Trusted {
+        return draw_trusted_manifest(ui, manifest);
     }
 
-    fn draw_manifest(&mut self, ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
-        if manifest.trust == ManifestTrustState::Trusted {
-            return draw_trusted_manifest(ui, manifest);
-        }
+    section_body(ui, |ui| draw_manifest_review(ui, manifest))
+}
 
-        detail_value(
-            ui,
-            "Manifest",
-            &manifest.manifest_path.display().to_string(),
+/// Fixed 28px header row: leading chevron, plugin label, and at most one
+/// right-aligned icon-only management action that never toggles the accordion.
+fn draw_section_header(
+    ui: &mut Ui,
+    section: &ContextSection,
+    collapsed: bool,
+) -> (egui::Response, Option<egui::Response>) {
+    let (_, header_rect) =
+        ui.allocate_space(egui::vec2(ui.available_width(), SECTION_HEADER_HEIGHT));
+    let edit_rect = matches!(
+        section.content,
+        ContextSectionContent::Manifest(_) | ContextSectionContent::ManifestError(_)
+    )
+    .then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                header_rect.right() - SECTION_HEADER_HEIGHT,
+                header_rect.top(),
+            ),
+            header_rect.right_bottom(),
+        )
+    });
+    let toggle_rect = edit_rect.map_or(header_rect, |rect| {
+        egui::Rect::from_min_max(
+            header_rect.min,
+            egui::pos2(rect.left(), header_rect.bottom()),
+        )
+    });
+    let header = ui
+        .interact(
+            toggle_rect,
+            Id::new(("context_section_toggle", section.id.as_str())),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let header_visuals = ui.style().interact(&header);
+    if header.hovered() || header.has_focus() {
+        ui.painter()
+            .rect_filled(toggle_rect, 0.0, header_visuals.weak_bg_fill);
+    }
+    draw_section_chevron(ui, header_rect, !collapsed, header_visuals.fg_stroke.color);
+    ui.painter().text(
+        egui::pos2(
+            header_rect.left() + SECTION_LABEL_INSET,
+            header_rect.center().y,
+        ),
+        egui::Align2::LEFT_CENTER,
+        section_label(section),
+        FontId::proportional(SECTION_LABEL_TEXT_SIZE),
+        header_visuals.fg_stroke.color,
+    );
+    let edit = edit_rect.map(|rect| {
+        let response = ui
+            .interact(
+                rect,
+                Id::new(("context_section_edit", section.id.as_str())),
+                Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        draw_ellipsis_icon(ui, rect, &response);
+        response.on_hover_text("Edit .phantom.yml")
+    });
+    (header, edit)
+}
+
+/// Inset wrapper for section content that is not a full-width action row:
+/// controls, empty states, errors, and trust-review details.
+fn section_body<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .inner_margin(Margin {
+            left: SECTION_BODY_MARGIN,
+            right: SECTION_BODY_MARGIN,
+            top: 4,
+            bottom: 6,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 4.0;
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// Full-width fixed-height action row with the shared text inset and hover fill.
+fn action_row(ui: &mut Ui, label: &str) -> egui::Response {
+    full_width_row(ui, Sense::click(), |ui, rect, color| {
+        ui.painter().text(
+            egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(ACTION_TEXT_SIZE),
+            color,
         );
-        draw_manifest_review(ui, manifest)
-    }
+    })
 }
 
 /// Keep the resize gesture on the sidebar side of the divider. The terminal
@@ -600,14 +648,19 @@ fn draw_recent_directories(
     let home = default_home_dir();
     for directory in &recent.directories {
         let path = display_directory_path(&directory.path, home.as_deref().map(Path::new));
-        let response = full_width_row_with_height(
+        let text = elide_path_start(
+            ui,
+            &path,
+            (ui.available_width() - 2.0 * ROW_TEXT_INSET).max(0.0),
+        );
+        let elided = text != path;
+        let mut response = full_width_row_with_height(
             ui,
             DIRECTORY_ROW_HEIGHT,
             Sense::click(),
             |ui, rect, color| {
-                let text = elide_path_start(ui, &path, (rect.width() - 20.0).max(0.0));
                 ui.painter().text(
-                    egui::pos2(rect.left() + 10.0, rect.center().y),
+                    egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     text,
                     FontId::monospace(DIRECTORY_TEXT_SIZE),
@@ -615,6 +668,9 @@ fn draw_recent_directories(
                 );
             },
         );
+        if elided {
+            response = response.on_hover_text(&path);
+        }
         if response.clicked() && request.is_none() {
             let target = directory_target(ui.input(|input| input.modifiers.shift));
             request = Some(ContextRequest::OpenDirectory {
@@ -630,25 +686,33 @@ fn draw_frequent_commands(
     ui: &mut Ui,
     frequent: &FrequentCommandsSection,
 ) -> Option<ContextRequest> {
+    let mut request = None;
     for command in &frequent.commands {
-        let response = full_width_row(ui, Sense::click(), |ui, rect, color| {
-            let text = elide_text_end(ui, command, (rect.width() - 20.0).max(0.0));
+        let text = elide_text_end(
+            ui,
+            command,
+            (ui.available_width() - 2.0 * ROW_TEXT_INSET).max(0.0),
+        );
+        let elided = text != *command;
+        let mut response = full_width_row(ui, Sense::click(), |ui, rect, color| {
             ui.painter().text(
-                egui::pos2(rect.left() + 10.0, rect.center().y),
+                egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 text,
                 FontId::monospace(DIRECTORY_TEXT_SIZE),
                 color,
             );
-        })
-        .on_hover_text(command);
-        if response.clicked() {
-            return Some(ContextRequest::RunFrequentCommand {
+        });
+        if elided {
+            response = response.on_hover_text(command);
+        }
+        if response.clicked() && request.is_none() {
+            request = Some(ContextRequest::RunFrequentCommand {
                 command: command.clone(),
             });
         }
     }
-    None
+    request
 }
 
 fn directory_target(shift: bool) -> DirectoryTarget {
@@ -693,7 +757,7 @@ fn section_label(section: &ContextSection) -> &str {
 }
 
 fn draw_section_chevron(ui: &Ui, rect: egui::Rect, expanded: bool, color: Color32) {
-    let center = egui::pos2(rect.left() + 13.0, rect.center().y);
+    let center = egui::pos2(rect.left() + CHEVRON_CENTER_INSET, rect.center().y);
     let points = if expanded {
         [
             egui::pos2(center.x - 3.5, center.y - 2.0),
@@ -739,14 +803,8 @@ fn edit_manifest_request(section: &ContextSection) -> Option<ContextRequest> {
 }
 
 fn draw_error(ui: &mut Ui, message: &str) {
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.y = 4.0;
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.colored_label(Color32::from_rgb(248, 113, 113), message);
-        });
-        ui.add_space(8.0);
+    section_body(ui, |ui| {
+        ui.colored_label(ERROR_TEXT_COLOR, message);
     });
 }
 
@@ -755,7 +813,7 @@ fn thin_separator(ui: &mut Ui) {
     ui.painter().hline(
         rect.x_range(),
         rect.center().y,
-        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 26)),
+        egui::Stroke::new(1.0, separator_color()),
     );
 }
 
@@ -773,91 +831,64 @@ fn display_directory_path(path: &Path, home: Option<&Path>) -> String {
     }
 }
 
-fn elide_path_start(ui: &Ui, path: &str, max_width: f32) -> String {
-    let font = FontId::monospace(DIRECTORY_TEXT_SIZE);
-    let color = ui.visuals().text_color();
-    if ui
-        .painter()
-        .layout_no_wrap(path.to_string(), font.clone(), color)
+fn text_fits(ui: &Ui, text: &str, font: &FontId, max_width: f32) -> bool {
+    ui.painter()
+        .layout_no_wrap(text.to_string(), font.clone(), Color32::PLACEHOLDER)
         .size()
         .x
         <= max_width
-    {
-        return path.to_string();
-    }
-
-    let characters: Vec<char> = path.chars().collect();
-    let mut low = 0;
-    let mut high = characters.len();
-    while low < high {
-        let keep = (low + high).div_ceil(2);
-        let candidate = format!(
-            "…{}",
-            characters[characters.len() - keep..]
-                .iter()
-                .collect::<String>()
-        );
-        let fits = ui
-            .painter()
-            .layout_no_wrap(candidate, font.clone(), color)
-            .size()
-            .x
-            <= max_width;
-        if fits {
-            low = keep;
-        } else {
-            high = keep - 1;
-        }
-    }
-    format!(
-        "…{}",
-        characters[characters.len() - low..]
-            .iter()
-            .collect::<String>()
-    )
 }
 
-fn elide_text_end(ui: &Ui, text: &str, max_width: f32) -> String {
+#[derive(Clone, Copy)]
+enum Elide {
+    /// Drop the start of the text, keeping its ending visible.
+    Start,
+    /// Drop the end of the text, keeping its beginning visible.
+    End,
+}
+
+/// Binary-search the longest prefix/suffix that fits within `max_width`.
+fn elide_to_width(ui: &Ui, text: &str, max_width: f32, elide: Elide) -> String {
     let font = FontId::monospace(DIRECTORY_TEXT_SIZE);
-    let color = ui.visuals().text_color();
-    if ui
-        .painter()
-        .layout_no_wrap(text.to_string(), font.clone(), color)
-        .size()
-        .x
-        <= max_width
-    {
+    if text_fits(ui, text, &font, max_width) {
         return text.to_string();
     }
 
     let characters: Vec<char> = text.chars().collect();
+    let rendered = |keep: usize| match elide {
+        Elide::Start => format!(
+            "…{}",
+            characters[characters.len() - keep..]
+                .iter()
+                .collect::<String>()
+        ),
+        Elide::End => format!("{}…", characters[..keep].iter().collect::<String>()),
+    };
     let mut low = 0;
     let mut high = characters.len();
     while low < high {
         let keep = (low + high).div_ceil(2);
-        let candidate = format!("{}…", characters[..keep].iter().collect::<String>());
-        let fits = ui
-            .painter()
-            .layout_no_wrap(candidate, font.clone(), color)
-            .size()
-            .x
-            <= max_width;
-        if fits {
+        if text_fits(ui, &rendered(keep), &font, max_width) {
             low = keep;
         } else {
             high = keep - 1;
         }
     }
-    format!("{}…", characters[..low].iter().collect::<String>())
+    rendered(low)
+}
+
+fn elide_path_start(ui: &Ui, path: &str, max_width: f32) -> String {
+    elide_to_width(ui, path, max_width, Elide::Start)
+}
+
+fn elide_text_end(ui: &Ui, text: &str, max_width: f32) -> String {
+    elide_to_width(ui, text, max_width, Elide::End)
 }
 
 fn sidebar_frame(alpha: u8, margin: i8) -> Frame {
     Frame::new()
         .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
-        .stroke(egui::Stroke::new(
-            1.0,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 35),
-        ))
+        .stroke(egui::Stroke::new(1.0, surface_border_color()))
         .inner_margin(Margin::same(margin))
 }
 
@@ -869,7 +900,10 @@ fn section_is_enabled(config: &AppConfig, section: &ContextSection) -> bool {
 }
 
 fn context_icon_button(ui: &mut Ui, open: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(TOOLBAR_ICON_SIZE, TOOLBAR_ICON_SIZE),
+        Sense::click(),
+    );
     let visuals = ui.style().interact(&response);
     ui.painter().rect_filled(rect, 4.0, visuals.weak_bg_fill);
     ui.painter()
@@ -904,15 +938,12 @@ fn context_icon_button(ui: &mut Ui, open: bool) -> egui::Response {
 }
 
 fn draw_manifest_review(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
-    ui.colored_label(
-        Color32::from_rgb(250, 204, 21),
-        "Verify these exact tasks before trusting.",
-    );
-    ui.add_space(2.0);
+    ui.spacing_mut().item_spacing.y = 2.0;
+    ui.colored_label(WARNING_TEXT_COLOR, "Review before trusting:");
     for tab in &manifest.tabs {
-        draw_manifest_tab_review(ui, tab);
-        ui.add_space(4.0);
+        draw_manifest_tab_summary(ui, tab, &manifest.root);
     }
+    ui.add_space(2.0);
     ui.button("Trust project tasks")
         .clicked()
         .then(|| ContextRequest::TrustManifest {
@@ -921,81 +952,75 @@ fn draw_manifest_review(ui: &mut Ui, manifest: &ManifestSection) -> Option<Conte
         })
 }
 
-fn draw_manifest_tab_review(ui: &mut Ui, tab: &ManifestTab) {
-    Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 8))
-        .stroke(egui::Stroke::new(
-            1.0,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-        ))
-        .corner_radius(4)
-        .inner_margin(Margin::same(8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(&tab.title).size(12.0).strong());
-            detail_value(ui, "cwd", &tab.cwd.display().to_string());
-            match &tab.task {
-                Some(task) => {
-                    detail_value(ui, "program", &task.program);
-                    if task.args.is_empty() {
-                        detail_value(ui, "args", "[]");
-                    } else {
-                        for (index, arg) in task.args.iter().enumerate() {
-                            detail_value(ui, &format!("arg[{index}]"), &format!("{arg:?}"));
-                        }
-                    }
-                    if task.env.is_empty() {
-                        detail_value(ui, "env", "{}");
-                    } else {
-                        for (key, value) in &task.env {
-                            detail_value(ui, &format!("env[{key}]"), &format!("{value:?}"));
-                        }
-                    }
-                }
-                None => detail_value(ui, "task", "shell only"),
-            }
-        });
+/// One compact line per task: title, the exact command (env prefix, quoted
+/// program and args), and the working directory only when it is not the
+/// project root. Everything executable stays visible for the trust decision.
+fn draw_manifest_tab_summary(ui: &mut Ui, tab: &ManifestTab, root: &Path) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new(&tab.title).size(11.0).strong());
+        match manifest_task_command(tab) {
+            Some(command) => ui.label(RichText::new(command).monospace().size(11.0)),
+            None => ui.label(
+                RichText::new("shell only")
+                    .size(11.0)
+                    .color(muted_text_color()),
+            ),
+        };
+        if let Some(location) = manifest_task_location(tab, root) {
+            ui.label(RichText::new(location).size(11.0).color(muted_text_color()));
+        }
+    });
 }
 
-fn detail_value(ui: &mut Ui, name: &str, value: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(format!("{name}:"))
-                .size(11.0)
-                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 115)),
-        );
-        ui.label(RichText::new(value).monospace().size(11.0));
-    });
+/// Shell-style single-line rendering of the task: `KEY=val program args…`.
+/// Returns `None` for shell-only tabs.
+fn manifest_task_command(tab: &ManifestTab) -> Option<String> {
+    let task = tab.task.as_ref()?;
+    let mut tokens: Vec<String> = task
+        .env
+        .iter()
+        .map(|(key, value)| format!("{key}={}", quote_token(value)))
+        .collect();
+    tokens.push(quote_token(&task.program));
+    tokens.extend(task.args.iter().map(|arg| quote_token(arg)));
+    Some(tokens.join(" "))
+}
+
+/// Quote a command token exactly (Rust debug escapes) unless it is plain
+/// enough to be unambiguous on a space-separated line.
+fn quote_token(token: &str) -> String {
+    let plain = !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/:=@%+,".contains(c));
+    if plain {
+        token.to_string()
+    } else {
+        format!("{token:?}")
+    }
+}
+
+/// Where the task runs, shown only when it differs from the project root. A
+/// cwd outside the root keeps its full path so it cannot hide from review.
+fn manifest_task_location(tab: &ManifestTab, root: &Path) -> Option<String> {
+    let relative = tab.cwd.strip_prefix(root).unwrap_or(&tab.cwd);
+    if relative.as_os_str().is_empty() || relative == Path::new(".") {
+        return None;
+    }
+    Some(format!("in {}", relative.display()))
 }
 
 fn draw_trusted_manifest(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
-    ui.spacing_mut().item_spacing.y = 0.0;
-    let mut request = full_width_row(ui, Sense::click(), |ui, rect, color| {
-        ui.painter().text(
-            egui::pos2(rect.left() + 8.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            START_ALL_TASKS_LABEL,
-            FontId::proportional(12.0),
-            color,
-        );
-    })
-    .clicked()
-    .then(|| ContextRequest::OpenManifestAll {
-        root: manifest.root.clone(),
-        manifest_source: manifest.manifest_source.clone(),
-    });
+    let mut request =
+        action_row(ui, START_ALL_TASKS_LABEL)
+            .clicked()
+            .then(|| ContextRequest::OpenManifestAll {
+                root: manifest.root.clone(),
+                manifest_source: manifest.manifest_source.clone(),
+            });
     for tab in &manifest.tabs {
-        if full_width_row(ui, Sense::click(), |ui, rect, color| {
-            ui.painter().text(
-                egui::pos2(rect.left() + 8.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                task_start_label(&tab.title),
-                FontId::proportional(12.0),
-                color,
-            );
-        })
-        .clicked()
-        {
+        if action_row(ui, &task_start_label(&tab.title)).clicked() && request.is_none() {
             request = Some(ContextRequest::OpenManifestTab {
                 root: manifest.root.clone(),
                 manifest_source: manifest.manifest_source.clone(),
@@ -1015,7 +1040,7 @@ fn spdeploy_dropdown(
     id_salt: impl egui::AsIdSalt,
     value: &mut SpdeploySelection,
     entries: &[SpdeployDropdownEntry],
-) -> bool {
+) {
     let selected_text = entries
         .iter()
         .find_map(|entry| match entry {
@@ -1024,12 +1049,21 @@ fn spdeploy_dropdown(
             }
             _ => None,
         })
-        .unwrap_or(value.operation.as_str());
-    let mut changed = false;
-    ComboBox::from_id_salt(id_salt)
-        .selected_text(selected_text)
-        .width(ui.available_width())
+        .unwrap_or(value.operation.as_str())
+        .to_string();
+    let width = ui.available_width();
+    let button_font = egui::TextStyle::Button.resolve(ui.style());
+    // Reserve room for the combo's chevron icon when deciding if a tooltip is
+    // needed for the truncated selection.
+    let selected_fits = text_fits(ui, &selected_text, &button_font, width - 24.0);
+    // Truncate instead of wrapping so the closed control keeps one fixed
+    // height regardless of the selected operation or sidebar width.
+    let combo = ComboBox::from_id_salt(id_salt)
+        .selected_text(selected_text.as_str())
+        .width(width)
+        .truncate()
         .show_ui(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
             for entry in entries {
                 match entry {
                     SpdeployDropdownEntry::Heading(heading) => {
@@ -1038,18 +1072,23 @@ fn spdeploy_dropdown(
                             RichText::new(heading)
                                 .size(10.0)
                                 .strong()
-                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 105)),
+                                .color(muted_text_color()),
                         );
                     }
                     SpdeployDropdownEntry::Operation { selection, text } => {
-                        changed |= ui
-                            .selectable_value(value, selection.clone(), text)
-                            .changed();
+                        let fits = text_fits(ui, text, &button_font, ui.available_width());
+                        let mut response = ui.selectable_value(value, selection.clone(), text);
+                        if !fits {
+                            response = response.on_hover_text(text);
+                        }
+                        let _ = response;
                     }
                 }
             }
         });
-    changed
+    if !selected_fits {
+        combo.response.on_hover_text(selected_text);
+    }
 }
 
 #[cfg(test)]
@@ -1486,6 +1525,71 @@ mod tests {
     }
 
     #[test]
+    fn long_commands_elide_from_the_end() {
+        let ctx = Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(320.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let mut text = None;
+        let _ = ctx.run_ui(input, |ui| {
+            text = Some(elide_text_end(
+                ui,
+                "cargo run --release --features full-stack-orchestration",
+                100.0,
+            ));
+        });
+
+        let text = text.unwrap();
+        assert!(text.starts_with("cargo"));
+        assert!(text.ends_with('…'));
+    }
+
+    fn closed_dropdown_height(ctx: &Context, text: &str) -> f32 {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(300.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut height = 0.0;
+        let _ = ctx.run_ui(input, |ui| {
+            ui.allocate_ui(egui::vec2(220.0, 600.0), |ui| {
+                let mut value = SpdeploySelection {
+                    config_path: "/projects/soulfire/deploy.yml".into(),
+                    operation: "deploy".to_string(),
+                };
+                let entries = vec![SpdeployDropdownEntry::Operation {
+                    selection: value.clone(),
+                    text: text.to_string(),
+                }];
+                spdeploy_dropdown(ui, "dropdown_height_probe", &mut value, &entries);
+                height = ui.min_rect().height();
+            });
+        });
+        height
+    }
+
+    #[test]
+    fn closed_dropdown_keeps_one_fixed_height_for_long_operation_text() {
+        let ctx = Context::default();
+
+        let short = closed_dropdown_height(&ctx, "deploy");
+        let long = closed_dropdown_height(
+            &ctx,
+            "deploy: a very long operation description that would otherwise wrap \
+             onto several lines inside a narrow sidebar and change the row height",
+        );
+
+        assert!(short > 0.0);
+        assert_eq!(short, long);
+    }
+
+    #[test]
     fn directory_paths_use_a_home_relative_label_only_for_the_exact_home_prefix() {
         let home = Path::new("/Users/steve");
 
@@ -1654,6 +1758,61 @@ mod tests {
                 .plugin(MANIFEST_PLUGIN_ID)
                 .unwrap()
                 .section_collapsed
+        );
+    }
+
+    #[test]
+    fn trust_review_renders_tasks_as_single_exact_command_lines() {
+        let tab = ManifestTab {
+            id: "api".to_string(),
+            title: "API".to_string(),
+            cwd: "/projects/soulfire".into(),
+            task: Some(ManifestTask {
+                program: "cargo".to_string(),
+                args: vec!["run".to_string(), "--flag with space".to_string()],
+                env: vec![("RUST_LOG".to_string(), "info,soulfire=debug".to_string())],
+            }),
+        };
+
+        assert_eq!(
+            manifest_task_command(&tab),
+            Some("RUST_LOG=info,soulfire=debug cargo run \"--flag with space\"".to_string())
+        );
+    }
+
+    #[test]
+    fn trust_review_omits_the_command_for_shell_only_tabs() {
+        let tab = ManifestTab {
+            id: "shell".to_string(),
+            title: "Shell".to_string(),
+            cwd: "/projects/soulfire".into(),
+            task: None,
+        };
+
+        assert_eq!(manifest_task_command(&tab), None);
+    }
+
+    #[test]
+    fn trust_review_shows_cwd_only_when_it_differs_from_the_project_root() {
+        let root = Path::new("/projects/soulfire");
+        let tab = |cwd: &str| ManifestTab {
+            id: "api".to_string(),
+            title: "API".to_string(),
+            cwd: cwd.into(),
+            task: None,
+        };
+
+        assert_eq!(
+            manifest_task_location(&tab("/projects/soulfire"), root),
+            None
+        );
+        assert_eq!(
+            manifest_task_location(&tab("/projects/soulfire/soulfire-api"), root),
+            Some("in soulfire-api".to_string())
+        );
+        assert_eq!(
+            manifest_task_location(&tab("/elsewhere/tasks"), root),
+            Some("in /elsewhere/tasks".to_string())
         );
     }
 
