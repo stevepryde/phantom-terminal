@@ -1090,6 +1090,18 @@ impl App {
         self.spawn_new_tab(NewTabRequest::shell(profile_id, cwd, true));
     }
 
+    /// The active tab's cwd, for tabs opened via Ctrl+T to inherit. `None` when
+    /// the directory no longer exists (falling back to the profile cwd or home)
+    /// so the spawn cannot fail on a stale path.
+    fn inherited_cwd(&self) -> Option<String> {
+        let cwd = &self.tabs.get(self.active)?.cwd;
+        if !cwd.is_empty() && Path::new(cwd).is_dir() {
+            Some(cwd.clone())
+        } else {
+            None
+        }
+    }
+
     /// Spawn a tab; returns whether a tab was actually added.
     fn spawn_tab_with_persistence(
         &mut self,
@@ -1261,7 +1273,10 @@ impl App {
 
     fn handle_action(&mut self, action: Action) {
         match action {
-            Action::NewTab => self.spawn_tab(None, None),
+            Action::NewTab => {
+                let cwd = self.inherited_cwd();
+                self.spawn_tab(None, cwd);
+            }
             Action::CloseTab => self.close_tab(self.active),
             Action::SwitchTab(n) => {
                 let i = (n as usize).saturating_sub(1);
@@ -3651,6 +3666,28 @@ mod tests {
                 remember_tabs: true,
             },
         )
+    }
+
+    #[test]
+    fn inherited_cwd_uses_active_tab_only_while_directory_exists() {
+        let mut app = test_app();
+        assert_eq!(app.inherited_cwd(), None);
+
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            dir.clone(),
+            None,
+        ));
+        assert_eq!(app.inherited_cwd(), Some(dir));
+
+        app.tabs[0].cwd = "/phantom-test-dir-that-does-not-exist".to_string();
+        assert_eq!(app.inherited_cwd(), None);
+
+        app.tabs[0].cwd = String::new();
+        assert_eq!(app.inherited_cwd(), None);
     }
 
     #[test]
