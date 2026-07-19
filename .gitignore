@@ -36,3 +36,6 @@ logs
 # SBOM / audit artifacts
 *.sbom.json
 sbom-*.json
+
+# Leftover generated files from the removed Tauri frontend
+/src-tauri/
