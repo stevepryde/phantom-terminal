@@ -80,7 +80,7 @@ pub enum Key {
 
 /// Encode `key` (with `mods`) into the bytes to write to the PTY.
 /// `app_cursor_keys` is the terminal's DECCKM state, which changes the prefix
-/// for the arrow and Home/End keys.
+/// for cursor keys and keeps Home/End available to full-screen applications.
 pub fn encode_key(key: Key, mods: Modifiers, app_cursor_keys: bool) -> Vec<u8> {
     match key {
         Key::Char(c) => {
@@ -107,8 +107,8 @@ pub fn encode_key(key: Key, mods: Modifiers, app_cursor_keys: bool) -> Vec<u8> {
         Key::Down => cursor_key(b'B', mods, app_cursor_keys),
         Key::Right => cursor_key(b'C', mods, app_cursor_keys),
         Key::Left => cursor_key(b'D', mods, app_cursor_keys),
-        Key::Home => cursor_key(b'H', mods, app_cursor_keys),
-        Key::End => cursor_key(b'F', mods, app_cursor_keys),
+        Key::Home => line_key(0x01, b'H', mods, app_cursor_keys),
+        Key::End => line_key(0x05, b'F', mods, app_cursor_keys),
         Key::Insert => tilde_key(2, mods),
         Key::Delete => tilde_key(3, mods),
         Key::PageUp => tilde_key(5, mods),
@@ -159,6 +159,18 @@ fn cursor_key(final_byte: u8, mods: Modifiers, app_cursor_keys: bool) -> Vec<u8>
         vec![0x1b, b'O', final_byte]
     } else {
         vec![0x1b, b'[', final_byte]
+    }
+}
+
+/// Home / End. At a normal shell prompt, send the canonical line-editing
+/// controls so the keys work without shell-specific escape-sequence bindings.
+/// Applications that enable DECCKM still receive their advertised cursor-key
+/// sequences, and modified keys retain the xterm CSI form.
+fn line_key(line_control: u8, final_byte: u8, mods: Modifiers, app_cursor_keys: bool) -> Vec<u8> {
+    if mods.any() || app_cursor_keys {
+        cursor_key(final_byte, mods, app_cursor_keys)
+    } else {
+        vec![line_control]
     }
 }
 
@@ -276,6 +288,18 @@ mod tests {
         assert_eq!(encode_key(Key::Up, Modifiers::NONE, false), b"\x1b[A");
         assert_eq!(encode_key(Key::Up, Modifiers::NONE, true), b"\x1bOA");
         assert_eq!(encode_key(Key::Left, Modifiers::NONE, false), b"\x1b[D");
+    }
+
+    #[test]
+    fn home_and_end_edit_the_shell_line() {
+        assert_eq!(encode_key(Key::Home, Modifiers::NONE, false), b"\x01");
+        assert_eq!(encode_key(Key::End, Modifiers::NONE, false), b"\x05");
+    }
+
+    #[test]
+    fn home_and_end_respect_application_cursor_keys() {
+        assert_eq!(encode_key(Key::Home, Modifiers::NONE, true), b"\x1bOH");
+        assert_eq!(encode_key(Key::End, Modifiers::NONE, true), b"\x1bOF");
     }
 
     #[test]
