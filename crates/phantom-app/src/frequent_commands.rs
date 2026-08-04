@@ -17,6 +17,8 @@ pub(crate) struct FrequentCommands {
     capture_decided: bool,
     capture_allowed: bool,
     usages: Vec<CommandUsage>,
+    /// Cached ranking, rebuilt on mutation so per-frame reads don't re-sort.
+    top: Vec<String>,
     sequence: u64,
 }
 
@@ -28,6 +30,7 @@ impl Default for FrequentCommands {
             capture_decided: false,
             capture_allowed: false,
             usages: Vec::new(),
+            top: Vec::new(),
             sequence: 0,
         }
     }
@@ -108,6 +111,7 @@ impl FrequentCommands {
         {
             usage.count = usage.count.saturating_add(1);
             usage.last_used = self.sequence;
+            self.rebuild_top();
             return;
         }
         if self.usages.len() == MAX_TRACKED_COMMANDS {
@@ -130,9 +134,10 @@ impl FrequentCommands {
             count: 1,
             last_used: self.sequence,
         });
+        self.rebuild_top();
     }
 
-    pub fn top(&self) -> Vec<String> {
+    fn rebuild_top(&mut self) {
         let mut usages: Vec<_> = self.usages.iter().collect();
         usages.sort_by(|left, right| {
             right
@@ -141,15 +146,19 @@ impl FrequentCommands {
                 .then(right.last_used.cmp(&left.last_used))
                 .then(left.command.cmp(&right.command))
         });
-        usages
+        self.top = usages
             .into_iter()
             .take(FREQUENT_COMMAND_LIMIT)
             .map(|usage| usage.command.clone())
-            .collect()
+            .collect();
+    }
+
+    pub fn top(&self) -> &[String] {
+        &self.top
     }
 
     pub fn contains_top(&self, command: &str) -> bool {
-        self.top().iter().any(|candidate| candidate == command)
+        self.top.iter().any(|candidate| candidate == command)
     }
 
     pub fn reset_input_line(&mut self) {

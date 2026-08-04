@@ -98,9 +98,11 @@ pub struct UiState {
     context_sidebar_width_px: f32,
     font_families: Vec<String>,
     notice: Option<String>,
-    /// An edited-but-invalid settings draft, kept so the user can type through
-    /// invalid intermediate states. Only a draft that passes
-    /// `AppConfig::validate()` is committed to the live config.
+    /// The settings draft, cloned from the live config when the panel opens
+    /// and kept for the panel's lifetime so each frame doesn't re-clone the
+    /// whole config. It may hold invalid intermediate states the user is
+    /// typing through; only a draft that passes `AppConfig::validate()` is
+    /// committed to the live config.
     settings_draft: Option<AppConfig>,
     context_ui: ContextUi,
     find: FindState,
@@ -143,7 +145,7 @@ impl UiState {
         self.active_panel = Some(PanelKind::Settings);
         self.font_families = font_families_with_current(&config.font_family);
         self.notice = None;
-        self.settings_draft = None;
+        self.settings_draft = Some(config.clone());
     }
 
     pub fn toggle_settings(&mut self, config: &AppConfig) {
@@ -165,11 +167,19 @@ impl UiState {
         self.active_panel == Some(PanelKind::Settings)
     }
 
-    /// Keep runtime-owned window geometry current in an invalid settings draft
+    /// Keep runtime-owned window geometry current in an open settings draft
     /// so a later valid widget edit cannot restore stale geometry.
     pub fn sync_window_size(&mut self, size: WindowSize) {
         if let Some(draft) = self.settings_draft.as_mut() {
             draft.window_size = Some(size);
+        }
+    }
+
+    /// Keep a palette-driven theme change current in an open settings draft so
+    /// a later settings apply cannot revert it.
+    pub fn sync_ui_theme(&mut self, theme: &str) {
+        if let Some(draft) = self.settings_draft.as_mut() {
+            draft.ui_theme = theme.to_string();
         }
     }
 
@@ -296,8 +306,9 @@ impl UiState {
         let mut changed = false;
         // Widgets edit a draft, not the live config: a value is only applied
         // (and persisted) once the whole draft round-trips through
-        // `AppConfig::validate()`. An invalid draft is kept across frames so
-        // the user can type through invalid intermediate states.
+        // `AppConfig::validate()`. The draft persists while the panel is open
+        // (so untouched frames don't clone or validate the whole config) and
+        // may hold invalid intermediate states the user is typing through.
         let mut draft = self.settings_draft.take().unwrap_or_else(|| config.clone());
 
         ui.horizontal(|ui| {
@@ -332,6 +343,20 @@ impl UiState {
             );
         });
 
+        // Nothing was edited this frame: keep the draft as-is and skip the
+        // full-config validation pass.
+        if !changed {
+            self.settings_draft = Some(draft);
+            return false;
+        }
+
+        // Runtime-owned state the settings widgets never edit can move while
+        // the panel is open (directory visits, window resizes); refresh it
+        // from the live config so applying the draft cannot roll it back.
+        draft.window_size = config.window_size;
+        draft.context_actions.directory_history = config.context_actions.directory_history.clone();
+        draft.trusted_projects = config.trusted_projects.clone();
+
         // Core bounds validation plus the app-level rule that every binding
         // parses to a usable combo (core can't know the combo grammar).
         let validation = draft.validate().map_err(|e| e.to_string()).and_then(|()| {
@@ -351,17 +376,16 @@ impl UiState {
         match validation {
             Ok(()) => {
                 self.notice = None;
-                if changed {
-                    *config = draft;
-                    return true;
-                }
+                *config = draft.clone();
+                self.settings_draft = Some(draft);
+                true
             }
             Err(error) => {
                 self.notice = Some(error);
                 self.settings_draft = Some(draft);
+                false
             }
         }
-        false
     }
 
     fn settings_nav(&mut self, ui: &mut Ui) {
