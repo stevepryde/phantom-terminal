@@ -137,6 +137,9 @@ pub enum AppEvent {
         generation: u64,
         snapshot: Box<ContextSnapshot>,
     },
+    EditorOpenFailed {
+        error: String,
+    },
     PtyWake,
 }
 
@@ -240,7 +243,10 @@ impl PendingPtyEvents {
 fn event_byte_len(event: &AppEvent) -> usize {
     match event {
         AppEvent::PtyBytes { bytes, .. } => bytes.len(),
-        AppEvent::PtyExit { .. } | AppEvent::ContextDiscovered { .. } | AppEvent::PtyWake => 0,
+        AppEvent::PtyExit { .. }
+        | AppEvent::ContextDiscovered { .. }
+        | AppEvent::EditorOpenFailed { .. }
+        | AppEvent::PtyWake => 0,
     }
 }
 
@@ -759,6 +765,9 @@ impl App {
                     self.context_snapshot = *snapshot;
                     self.request_redraw();
                 }
+            }
+            AppEvent::EditorOpenFailed { error } => {
+                self.show_notice(format!("Could not open .phantom.yml: {error}"));
             }
             AppEvent::PtyWake => self.drain_pending_pty_events(),
         }
@@ -1616,9 +1625,7 @@ impl App {
             }
         };
         let path = loaded.root.join(phantom_core::CONTEXT_MANIFEST_FILE);
-        if let Err(error) = external_editor::open(&path) {
-            self.show_notice(format!("Could not open .phantom.yml: {error}"));
-        }
+        external_editor::open(path, Arc::clone(&self.outbox));
     }
 
     fn open_manifest_tasks(
