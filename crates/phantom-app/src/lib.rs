@@ -547,6 +547,9 @@ pub struct App {
     egui_repaint_after: Option<Instant>,
     /// Mirrors `WindowEvent::Occluded`: while hidden, skip timed redraws.
     window_occluded: bool,
+    /// Mirrors `WindowEvent::Focused`: while unfocused, the cursor stays solid
+    /// instead of waking the event loop every blink interval.
+    window_focused: bool,
     /// Whether the cursor was over the scrollbar track on the last mouse move.
     scrollbar_hovered: bool,
     /// Tab strip scroll offset (physical px); clamped by the chrome each frame.
@@ -655,6 +658,7 @@ impl App {
             fatal_presents: 0,
             egui_repaint_after: None,
             window_occluded: false,
+            window_focused: true,
             scrollbar_hovered: false,
             tab_scroll: 0.0,
             tab_scroll_into_view: None,
@@ -1360,6 +1364,9 @@ impl App {
             }
             PaletteAction::NewTabWithProfile(id) => self.spawn_tab(Some(id), None),
             PaletteAction::SetUiTheme(name) => {
+                // Keep an open settings draft in step so a later settings
+                // apply cannot revert the palette-chosen theme.
+                self.ui.sync_ui_theme(&name);
                 self.config.ui_theme = name;
                 self.mark_config_dirty();
             }
@@ -2965,12 +2972,13 @@ impl App {
                 }
                 _ => (0.0, 0.0, 0.0),
             };
-        let context_config_before = self.config.context_actions.clone();
+        let context_fingerprint_before =
+            context_discovery_fingerprint(&self.config.context_actions);
         let frequent_commands = self
             .tabs
             .get(self.active)
             .map(|tab| tab.frequent_commands.top())
-            .unwrap_or_default();
+            .unwrap_or(&[]);
         let global_notice = self.notice.as_ref().map(|notice| notice.text.as_str());
         let ui_outcome = match (self.gpu.as_ref(), self.egui.as_mut()) {
             (Some(gpu), Some(egui)) => egui.run_with_context(
@@ -2980,7 +2988,7 @@ impl App {
                 &mut self.palette,
                 UiFrameContext {
                     snapshot: &self.context_snapshot,
-                    frequent_commands: &frequent_commands,
+                    frequent_commands,
                     top_inset_points: context_top_inset_points,
                     terminal_left_points,
                     terminal_right_points,
@@ -3003,10 +3011,9 @@ impl App {
         }
         if ui_outcome.config_changed {
             self.apply_config_change();
-            if context_discovery_config_changed(
-                &context_config_before,
-                &self.config.context_actions,
-            ) {
+            if context_discovery_fingerprint(&self.config.context_actions)
+                != context_fingerprint_before
+            {
                 self.schedule_context_discovery();
             }
         }
@@ -3175,7 +3182,7 @@ impl App {
     }
 
     fn pump_blink(&mut self) -> bool {
-        if !self.blink_enabled {
+        if !self.blink_enabled || !self.window_focused {
             return false;
         }
         let now = Instant::now();
@@ -3284,21 +3291,29 @@ fn app_input_is_find_shortcut(input: &AppInput) -> bool {
     )
 }
 
+/// Allocation-free digest of the context-actions settings that affect
+/// discovery (enabled flag plus per-plugin id/enabled/order), so the render
+/// path can detect a relevant change without cloning the whole config —
+/// notably its bounded-but-large directory history.
+fn context_discovery_fingerprint(config: &phantom_core::ContextActionsConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.enabled.hash(&mut hasher);
+    config.plugins.len().hash(&mut hasher);
+    for plugin in &config.plugins {
+        plugin.id.hash(&mut hasher);
+        plugin.enabled.hash(&mut hasher);
+        plugin.order.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[cfg(test)]
 fn context_discovery_config_changed(
     before: &phantom_core::ContextActionsConfig,
     after: &phantom_core::ContextActionsConfig,
 ) -> bool {
-    before.enabled != after.enabled
-        || before.plugins.len() != after.plugins.len()
-        || before
-            .plugins
-            .iter()
-            .zip(&after.plugins)
-            .any(|(before, after)| {
-                before.id != after.id
-                    || before.enabled != after.enabled
-                    || before.order != after.order
-            })
+    context_discovery_fingerprint(before) != context_discovery_fingerprint(after)
 }
 
 fn posix_cd_command(path: &str) -> String {
@@ -3559,6 +3574,17 @@ impl ApplicationHandler<AppEvent> for App {
                 self.request_redraw();
             }
         }
+        if let WindowEvent::Focused(focused) = event {
+            self.window_focused = focused;
+            if focused {
+                // Restart the cycle so the cursor is solid as focus returns.
+                self.reset_blink();
+            } else if !self.cursor_on {
+                // Blink pauses while unfocused; leave a solid cursor behind.
+                self.cursor_on = true;
+                self.request_redraw();
+            }
+        }
 
         let terminal_owns_keyboard = terminal_owns_keyboard(
             self.palette.open,
@@ -3675,8 +3701,9 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         let mut next = None;
-        // No blink wake-ups while hidden; Occluded(false) restarts rendering.
-        if self.blink_enabled && !self.window_occluded {
+        // No blink wake-ups while hidden or unfocused; Occluded(false)
+        // restarts rendering and Focused(true) restarts the blink cycle.
+        if self.blink_enabled && !self.window_occluded && self.window_focused {
             min_deadline(&mut next, self.next_toggle);
         }
         if let Some(deadline) = self.cwd_deadline {

@@ -349,7 +349,20 @@ fn save_config_conn(conn: &Connection, config: &AppConfig) -> AppResult<()> {
     Ok(())
 }
 
+/// Cap on retained `app.invalid.*` backup rows: repeated corrupt-config loads
+/// must not grow the table forever.
+const MAX_INVALID_CONFIG_BACKUPS: usize = 5;
+
 fn backup_invalid_config(conn: &Connection, json: &str, reason: &str) -> AppResult<()> {
+    // Keep only the newest backups (by insertion order), counting the row
+    // about to be inserted.
+    conn.execute(
+        "DELETE FROM config WHERE key LIKE 'app.invalid.%' AND rowid NOT IN (
+             SELECT rowid FROM config WHERE key LIKE 'app.invalid.%'
+             ORDER BY rowid DESC LIMIT ?1
+         )",
+        rusqlite::params![(MAX_INVALID_CONFIG_BACKUPS - 1) as i64],
+    )?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -699,5 +712,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(backup_count, 1);
+    }
+
+    #[test]
+    fn invalid_config_backups_are_pruned_to_the_newest_few() {
+        let store = in_memory();
+        let conn = store.lock();
+        conn.execute("INSERT INTO config (key, value) VALUES ('app', 'live')", [])
+            .unwrap();
+        for i in 0..MAX_INVALID_CONFIG_BACKUPS + 3 {
+            conn.execute(
+                "INSERT INTO config (key, value) VALUES (?1, 'x')",
+                rusqlite::params![format!("app.invalid.seed{i}")],
+            )
+            .unwrap();
+        }
+
+        backup_invalid_config(&conn, "{bad json", "parse error").unwrap();
+
+        let keys: Vec<String> = conn
+            .prepare("SELECT key FROM config WHERE key LIKE 'app.invalid.%' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(keys.len(), MAX_INVALID_CONFIG_BACKUPS);
+        // The oldest seeds are gone; the newest survive alongside the fresh
+        // backup, and the live 'app' row is untouched.
+        assert!(!keys.iter().any(|key| key == "app.invalid.seed0"));
+        assert_eq!(keys[0], "app.invalid.seed4");
+        assert_eq!(keys[keys.len() - 2], "app.invalid.seed7");
+        let live: String = conn
+            .query_row("SELECT value FROM config WHERE key = 'app'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(live, "live");
     }
 }
