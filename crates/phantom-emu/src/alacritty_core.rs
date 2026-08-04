@@ -24,8 +24,8 @@ use alacritty_terminal::vte::ansi::{
 
 use crate::{
     BufferPoint, CellAttrs, CellColor, CursorShape, CursorState, MouseMode, MouseProtocol,
-    NamedColor, ScrollState, SearchError, SearchMatch, SearchOptions, SearchRange, SelSide,
-    SelectionKind, SnapCell, Snapshot, VtCore,
+    NamedColor, ScrollState, SearchError, SearchMatch, SearchOptions, SearchOutcome, SearchRange,
+    SelSide, SelectionKind, SnapCell, Snapshot, VtCore, MAX_SEARCH_MATCHES,
 };
 
 const PHANTOM_SEMANTIC_ESCAPE_CHARS: &str = "\t !\"#$%&'()*+,./:;<=>?@[\\]^`{|}~│";
@@ -89,16 +89,7 @@ impl AlacrittyCore {
         let size = TermDimensions::new(cols as usize, rows as usize);
         let responses = Rc::new(RefCell::new(Vec::new()));
 
-        let config = Config {
-            scrolling_history: scrollback_lines as usize,
-            semantic_escape_chars: PHANTOM_SEMANTIC_ESCAPE_CHARS.to_string(),
-            default_cursor_style: AnsiCursorStyle {
-                shape: to_ansi_cursor_shape(default_cursor),
-                blinking: false,
-            },
-            ..Config::default()
-        };
-
+        let config = term_config(scrollback_lines, default_cursor);
         let term = Term::new(config, &size, ResponseSink(Rc::clone(&responses)));
         Self {
             term,
@@ -107,6 +98,31 @@ impl AlacrittyCore {
             size,
             active_search_match: None,
         }
+    }
+
+    /// Push updated config-derived options into a live terminal: the default
+    /// cursor shape (used until an application overrides it via DECSCUSR) and
+    /// the scrollback depth (`Term::set_options` resizes history in place).
+    pub fn set_terminal_options(&mut self, scrollback_lines: u32, default_cursor: CursorShape) {
+        // Shrinking history rotates absolute grid coordinates; the app will
+        // recompute live search results against the new layout.
+        self.active_search_match = None;
+        self.term
+            .set_options(term_config(scrollback_lines, default_cursor));
+    }
+}
+
+/// The `Term` config derived from app settings; `new` and
+/// [`AlacrittyCore::set_terminal_options`] must stay in sync.
+fn term_config(scrollback_lines: u32, default_cursor: CursorShape) -> Config {
+    Config {
+        scrolling_history: scrollback_lines as usize,
+        semantic_escape_chars: PHANTOM_SEMANTIC_ESCAPE_CHARS.to_string(),
+        default_cursor_style: AnsiCursorStyle {
+            shape: to_ansi_cursor_shape(default_cursor),
+            blinking: false,
+        },
+        ..Config::default()
     }
 }
 
@@ -194,6 +210,30 @@ impl VtCore for AlacrittyCore {
         }
     }
 
+    fn cursor_row_prefix(&self) -> Option<String> {
+        // `renderable_content()` is cheap to build (its grid iterator is lazy
+        // and never consumed here); it supplies the same cursor point and
+        // hidden state that `snapshot()` uses.
+        let cursor = self.term.renderable_content().cursor;
+        if matches!(cursor.shape, AnsiCursorShape::Hidden) {
+            return None;
+        }
+
+        let grid = self.term.grid();
+        let mut prefix = String::with_capacity(cursor.point.column.0);
+        for col in 0..cursor.point.column.0 {
+            let cell = &grid[Point::new(cursor.point.line, Column(col))];
+            // The trailing half of a wide character carries no glyph of its
+            // own; `snapshot()` leaves it as a blank default cell.
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                prefix.push(' ');
+            } else {
+                prefix.push(cell.c);
+            }
+        }
+        Some(prefix)
+    }
+
     fn scroll_state(&self) -> ScrollState {
         let grid = self.term.grid();
         ScrollState {
@@ -259,9 +299,9 @@ impl VtCore for AlacrittyCore {
         query: &str,
         options: SearchOptions,
         range: Option<SearchRange>,
-    ) -> Result<Vec<SearchMatch>, SearchError> {
+    ) -> Result<SearchOutcome, SearchError> {
         if query.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchOutcome::default());
         }
 
         let pattern = search_pattern(query, options);
@@ -271,10 +311,11 @@ impl VtCore for AlacrittyCore {
         let start = to_point(range.start);
         let end = to_point(range.end);
         if start > end {
-            return Ok(Vec::new());
+            return Ok(SearchOutcome::default());
         }
 
         let mut matches = Vec::new();
+        let mut capped = false;
         let mut origin = start;
         while origin <= end {
             let Some(found) = self.term.regex_search_right(&mut regex, origin, end) else {
@@ -287,6 +328,12 @@ impl VtCore for AlacrittyCore {
             }
             let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
             if !options.whole_word || self.is_whole_word_match(found_range) {
+                // Only report the cap once a further real match exists, so
+                // `capped` never lies about a buffer with exactly the cap.
+                if matches.len() >= MAX_SEARCH_MATCHES {
+                    capped = true;
+                    break;
+                }
                 matches.push(SearchMatch { range: found_range });
             }
 
@@ -296,7 +343,7 @@ impl VtCore for AlacrittyCore {
             origin = next;
         }
 
-        Ok(matches)
+        Ok(SearchOutcome { matches, capped })
     }
 
     fn set_active_search_match(&mut self, search_match: Option<SearchMatch>) {
@@ -717,10 +764,92 @@ mod tests {
         assert_eq!(snap.cell(0, 1).unwrap().c, ' ');
     }
 
+    /// The prefix the full snapshot would produce for the cursor row: every
+    /// cell strictly left of the cursor, spacers included as blanks.
+    fn snapshot_prefix(term: &AlacrittyCore) -> String {
+        let snap = term.snapshot();
+        (0..snap.cursor.col)
+            .filter_map(|col| snap.cell(snap.cursor.row, col))
+            .map(|cell| cell.c)
+            .collect()
+    }
+
+    #[test]
+    fn cursor_row_prefix_matches_snapshot_prefix() {
+        let mut term = core(6, 40, 100);
+        term.advance(b"steve@host ~/project % ");
+        assert_eq!(
+            term.cursor_row_prefix().as_deref(),
+            Some("steve@host ~/project % ")
+        );
+        assert_eq!(term.cursor_row_prefix().unwrap(), snapshot_prefix(&term));
+
+        term.advance(b"ls\r\n$ ");
+        assert_eq!(term.cursor_row_prefix().as_deref(), Some("$ "));
+        assert_eq!(term.cursor_row_prefix().unwrap(), snapshot_prefix(&term));
+    }
+
+    #[test]
+    fn cursor_row_prefix_matches_snapshot_for_wide_chars() {
+        let mut term = core(4, 20, 100);
+        term.advance("dir 世界 % ".as_bytes());
+        let prefix = term.cursor_row_prefix().unwrap();
+        assert_eq!(prefix, snapshot_prefix(&term));
+        // Wide glyphs span two columns; the spacer column reads as a blank.
+        assert_eq!(prefix, "dir 世 界  % ");
+    }
+
+    #[test]
+    fn cursor_row_prefix_tracks_cursor_visibility() {
+        let mut term = core(4, 20, 100);
+        term.advance(b"$ ");
+        term.advance(b"\x1b[?25l"); // DECTCEM hide
+        assert!(term.cursor_row_prefix().is_none());
+        term.advance(b"\x1b[?25h"); // DECTCEM show
+        assert_eq!(term.cursor_row_prefix().as_deref(), Some("$ "));
+    }
+
+    #[test]
+    fn cursor_row_prefix_ignores_scrollback_offset() {
+        let mut term = core(2, 10, 100);
+        for i in 0..20 {
+            term.advance(format!("line{i:02}\r\n").as_bytes());
+        }
+        term.advance(b"% ");
+        let at_bottom = term.cursor_row_prefix();
+        assert_eq!(at_bottom.as_deref(), Some("% "));
+
+        term.scroll(5);
+        assert_eq!(term.cursor_row_prefix(), at_bottom);
+    }
+
     #[test]
     fn honors_configured_default_cursor_shape() {
         let term = AlacrittyCore::new(24, 80, 100, CursorShape::Beam);
         assert_eq!(term.snapshot().cursor.shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn set_terminal_options_updates_default_cursor_shape_on_a_live_terminal() {
+        let mut term = AlacrittyCore::new(24, 80, 100, CursorShape::Block);
+        term.advance(b"hello");
+
+        term.set_terminal_options(100, CursorShape::Beam);
+
+        assert_eq!(term.snapshot().cursor.shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn set_terminal_options_resizes_scrollback_on_a_live_terminal() {
+        let mut term = core(2, 10, 100);
+        for i in 0..20 {
+            term.advance(format!("line{i:02}\r\n").as_bytes());
+        }
+        assert!(term.scroll_state().history > 5);
+
+        term.set_terminal_options(5, CursorShape::Block);
+
+        assert_eq!(term.scroll_state().history, 5);
     }
 
     #[test]
@@ -835,12 +964,14 @@ mod tests {
 
         let matches = term
             .search_scrollback("ALPHA", SearchOptions::default(), None)
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(matches.len(), 3);
 
         let literal = term
             .search_scrollback("a.*b", SearchOptions::default(), None)
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(literal.len(), 1);
         assert_eq!(literal[0].range.start.column, 18);
         assert_eq!(literal[0].range.end.column, 21);
@@ -858,6 +989,7 @@ mod tests {
         assert_eq!(
             term.search_scrollback("café", whole_word, None)
                 .unwrap()
+                .matches
                 .len(),
             2
         );
@@ -867,7 +999,10 @@ mod tests {
             ..whole_word
         };
         assert_eq!(
-            term.search_scrollback("café", exact, None).unwrap().len(),
+            term.search_scrollback("café", exact, None)
+                .unwrap()
+                .matches
+                .len(),
             1
         );
     }
@@ -884,6 +1019,7 @@ mod tests {
         assert_eq!(
             term.search_scrollback(r"item-\d+", regex, None)
                 .unwrap()
+                .matches
                 .len(),
             2
         );
@@ -900,13 +1036,15 @@ mod tests {
 
         let wrapped = term
             .search_scrollback("c世界", SearchOptions::default(), None)
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(wrapped.len(), 1);
         assert!(wrapped[0].range.start.line < wrapped[0].range.end.line);
 
         let history = term
             .search_scrollback("abc", SearchOptions::default(), None)
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(history.len(), 1);
         assert!(history[0].range.start.line < 0);
     }
@@ -921,7 +1059,8 @@ mod tests {
 
         let matches = term
             .search_scrollback("find", SearchOptions::default(), Some(captured))
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(matches.len(), 1);
 
         assert_eq!(term.selection_range(), Some(captured));
@@ -942,6 +1081,7 @@ mod tests {
         assert_eq!(
             term.search_scrollback("target", SearchOptions::default(), Some(rotated))
                 .unwrap()
+                .matches
                 .len(),
             1
         );
@@ -956,7 +1096,8 @@ mod tests {
         term.advance(b"selected\r\nline1\r\nline2\r\nline3\r\ntarget");
         let target = term
             .search_scrollback("selected", SearchOptions::default(), None)
-            .unwrap()[0];
+            .unwrap()
+            .matches[0];
         term.set_active_search_match(Some(target));
         term.selection_start(0, 0, SelSide::Left);
         term.selection_update(0, 7, SelSide::Right);
@@ -974,5 +1115,31 @@ mod tests {
         term.set_active_search_match(Some(target));
         term.advance(b"x");
         assert!(!term.snapshot().cells.iter().any(|cell| cell.search_match));
+    }
+
+    #[test]
+    fn search_stops_collecting_at_the_match_cap() {
+        // 80 single-char matches per row; enough rows to exceed the cap.
+        let cols = 80usize;
+        let rows = MAX_SEARCH_MATCHES / cols + 2;
+        let mut term = core(4, cols as u16, rows as u32);
+        let line = "a".repeat(cols);
+        for _ in 0..rows {
+            term.advance(line.as_bytes());
+            term.advance(b"\r\n");
+        }
+
+        let capped = term
+            .search_scrollback("a", SearchOptions::default(), None)
+            .unwrap();
+        assert_eq!(capped.matches.len(), MAX_SEARCH_MATCHES);
+        assert!(capped.capped);
+
+        // A full-row query matches once per row and stays under the cap.
+        let uncapped = term
+            .search_scrollback(&line, SearchOptions::default(), None)
+            .unwrap();
+        assert_eq!(uncapped.matches.len(), rows);
+        assert!(!uncapped.capped);
     }
 }

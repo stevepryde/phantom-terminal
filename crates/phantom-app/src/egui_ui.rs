@@ -167,6 +167,10 @@ impl UiState {
         self.active_panel == Some(PanelKind::Settings)
     }
 
+    pub fn panel_open(&self) -> bool {
+        self.active_panel.is_some()
+    }
+
     /// Keep runtime-owned window geometry current in an open settings draft
     /// so a later valid widget edit cannot restore stale geometry.
     pub fn sync_window_size(&mut self, size: WindowSize) {
