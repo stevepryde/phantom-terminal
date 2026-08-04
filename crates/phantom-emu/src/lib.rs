@@ -75,13 +75,14 @@ pub trait VtCore {
     /// This is intended for capturing a stable selection-only search scope.
     fn selection_range(&self) -> Option<SearchRange>;
 
-    /// Search the finite in-memory buffer in stable buffer order.
+    /// Search the finite in-memory buffer in stable buffer order, collecting
+    /// at most [`MAX_SEARCH_MATCHES`] matches.
     fn search_scrollback(
         &self,
         query: &str,
         options: SearchOptions,
         range: Option<SearchRange>,
-    ) -> Result<Vec<SearchMatch>, SearchError>;
+    ) -> Result<SearchOutcome, SearchError>;
 
     /// Set the temporary active find match and scroll it into view.
     ///
@@ -214,6 +215,20 @@ pub struct SearchOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchMatch {
     pub range: SearchRange,
+}
+
+/// Upper bound on matches collected by a single search. A broad query (e.g.
+/// `.` as a regex) over a deep scrollback would otherwise allocate millions of
+/// matches on the UI thread.
+pub const MAX_SEARCH_MATCHES: usize = 10_000;
+
+/// The collected matches of one search, plus whether collection hit the cap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchOutcome {
+    pub matches: Vec<SearchMatch>,
+    /// True when at least one further match exists beyond
+    /// [`MAX_SEARCH_MATCHES`]; the real total is "`matches.len()` or more".
+    pub capped: bool,
 }
 
 /// A search query which could not be compiled.

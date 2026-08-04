@@ -49,7 +49,8 @@ use phantom_core::{
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
-    MouseProtocol, ScrollState, SearchMatch, SearchOptions, SelSide, SelectionKind, VtCore,
+    MouseProtocol, ScrollState, SearchMatch, SearchOptions, SearchOutcome, SelSide, SelectionKind,
+    VtCore,
 };
 use phantom_gfx::Renderer;
 use tab::Tab;
@@ -69,6 +70,7 @@ const CWD_POLL_WINDOW: Duration = Duration::from_secs(6);
 const CWD_STARTUP_POLL_WINDOW: Duration = Duration::from_secs(3);
 const LIVE_RESIZE_REDRAW_GRACE: Duration = Duration::from_millis(120);
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
+const FIND_REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
 const WINDOW_SIZE_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -553,6 +555,11 @@ pub struct App {
     ui: UiState,
     find_matches: Vec<SearchMatch>,
     find_active: usize,
+    /// True when the last search stopped at the emulator's match cap.
+    find_capped: bool,
+    /// Coalesces PTY-driven find refreshes: a full-history search per PTY
+    /// chunk would stall the UI thread during streaming output.
+    find_refresh_deadline: Option<Instant>,
     notice: Option<Notice>,
     context_snapshot: ContextSnapshot,
     context_generation: u64,
@@ -645,6 +652,8 @@ impl App {
             ui,
             find_matches: Vec::new(),
             find_active: 0,
+            find_capped: false,
+            find_refresh_deadline: None,
             notice: None,
             context_snapshot: ContextSnapshot::empty(PathBuf::new()),
             context_generation: 0,
@@ -720,11 +729,10 @@ impl App {
         match event {
             AppEvent::PtyBytes { tab, bytes } => {
                 let mut response = None;
-                let refresh_find = self.ui.find_open()
-                    && self
-                        .tabs
-                        .get(self.active)
-                        .is_some_and(|active| active.id == tab);
+                let active_tab = self
+                    .tabs
+                    .get(self.active)
+                    .is_some_and(|active| active.id == tab);
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.advance_pty(&bytes);
                     let out = t.core.take_pty_output();
@@ -735,10 +743,16 @@ impl App {
                 if let Some((pty_id, out)) = response {
                     let _ = self.pty.write(pty_id, &out);
                 }
-                if refresh_find {
-                    self.refresh_find();
+                if active_tab {
+                    // Debounced rather than refreshed inline: a full-history
+                    // search per drained PTY chunk stalls the event loop.
+                    if self.find_bar_visible() && self.find_refresh_deadline.is_none() {
+                        self.find_refresh_deadline = Some(Instant::now() + FIND_REFRESH_DEBOUNCE);
+                    }
+                    // Background-tab output changes no pixels — render() only
+                    // snapshots the active tab — so it earns no redraw.
+                    self.request_redraw();
                 }
-                self.request_redraw();
             }
             AppEvent::PtyExit { tab } => {
                 if self.exit_requested {
@@ -864,10 +878,19 @@ impl App {
         self.ui.close_find();
         self.find_matches.clear();
         self.find_active = 0;
+        self.find_capped = false;
         self.request_redraw();
     }
 
+    /// Whether the find bar is actually on screen: egui skips drawing it while
+    /// a side panel or the command palette is up even though find stays open.
+    fn find_bar_visible(&self) -> bool {
+        self.ui.find_open() && !self.palette.open && !self.ui.panel_open()
+    }
+
     fn refresh_find(&mut self) {
+        // A completed refresh supersedes any scheduled debounced one.
+        self.find_refresh_deadline = None;
         if !self.ui.find_open() {
             return;
         }
@@ -884,10 +907,10 @@ impl App {
         });
         let scope = scope.flatten();
         let result = if options.selection_only && scope.is_none() {
-            Ok(Vec::new())
+            Ok(SearchOutcome::default())
         } else {
             self.tabs.get(self.active).map_or_else(
-                || Ok(Vec::new()),
+                || Ok(SearchOutcome::default()),
                 |tab| {
                     tab.core.search_scrollback(
                         &query,
@@ -903,8 +926,9 @@ impl App {
         };
 
         let error = match result {
-            Ok(matches) => {
-                self.find_matches = matches;
+            Ok(outcome) => {
+                self.find_matches = outcome.matches;
+                self.find_capped = outcome.capped;
                 self.find_active = self
                     .find_active
                     .min(self.find_matches.len().saturating_sub(1));
@@ -913,6 +937,7 @@ impl App {
             Err(error) => {
                 self.find_matches.clear();
                 self.find_active = 0;
+                self.find_capped = false;
                 Some(FindUiError::InvalidRegex(error.to_string()))
             }
         };
@@ -923,6 +948,7 @@ impl App {
         }
         self.ui.set_find_results(FindResultSummary {
             match_count: self.find_matches.len(),
+            capped: self.find_capped,
             active_match,
             error,
         });
@@ -945,6 +971,7 @@ impl App {
         }
         self.ui.set_find_results(FindResultSummary {
             match_count: self.find_matches.len(),
+            capped: self.find_capped,
             active_match: Some(self.find_active),
             error: None,
         });
@@ -3508,6 +3535,17 @@ impl ApplicationHandler<AppEvent> for App {
                 self.flush_pending_terminal_resize();
             }
         }
+        if let Some(deadline) = self.find_refresh_deadline {
+            if now >= deadline {
+                self.find_refresh_deadline = None;
+                // The palette or a panel may have covered the bar since this
+                // was scheduled; drop the refresh rather than search unseen.
+                if self.find_bar_visible() {
+                    self.refresh_find();
+                    self.request_redraw();
+                }
+            }
+        }
         if self
             .window_size_save_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -3564,6 +3602,9 @@ impl ApplicationHandler<AppEvent> for App {
             min_deadline(&mut next, deadline);
         }
         if let Some(deadline) = self.terminal_resize_deadline {
+            min_deadline(&mut next, deadline);
+        }
+        if let Some(deadline) = self.find_refresh_deadline {
             min_deadline(&mut next, deadline);
         }
         if let Some(deadline) = self.window_size_save_deadline {
@@ -3752,6 +3793,79 @@ mod tests {
         assert!(app.find_open());
         app.switch_tab(1);
         assert!(!app.find_open());
+    }
+
+    #[test]
+    fn background_tab_output_does_not_queue_a_redraw() {
+        let mut app = test_app();
+        for id in 0..2 {
+            app.tabs.push(Tab::new(
+                id,
+                AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+                u32::MAX,
+                String::new(),
+                None,
+            ));
+        }
+
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 1,
+            bytes: b"background build output".to_vec(),
+        });
+        assert!(!app.redraw_queued);
+
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 0,
+            bytes: b"active output".to_vec(),
+        });
+        assert!(app.redraw_queued);
+    }
+
+    #[test]
+    fn pty_output_debounces_find_refresh_and_skips_a_hidden_bar() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.handle_input(AppInput::Key {
+            key: Key::Char('f'),
+            text: Some("f".to_string()),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+        });
+        assert!(app.find_open());
+        assert!(app.find_refresh_deadline.is_none());
+
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 0,
+            bytes: b"one".to_vec(),
+        });
+        let scheduled = app.find_refresh_deadline;
+        assert!(scheduled.is_some());
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 0,
+            bytes: b"two".to_vec(),
+        });
+        assert_eq!(app.find_refresh_deadline, scheduled);
+
+        // Running the search cancels the pending debounce.
+        app.refresh_find();
+        assert!(app.find_refresh_deadline.is_none());
+
+        // The palette covers the find bar, so output must not schedule a
+        // full-history search the user cannot see.
+        app.palette.open(&app.config);
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 0,
+            bytes: b"three".to_vec(),
+        });
+        assert!(app.find_refresh_deadline.is_none());
     }
 
     #[test]

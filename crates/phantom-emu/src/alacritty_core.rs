@@ -24,8 +24,8 @@ use alacritty_terminal::vte::ansi::{
 
 use crate::{
     BufferPoint, CellAttrs, CellColor, CursorShape, CursorState, MouseMode, MouseProtocol,
-    NamedColor, ScrollState, SearchError, SearchMatch, SearchOptions, SearchRange, SelSide,
-    SelectionKind, SnapCell, Snapshot, VtCore,
+    NamedColor, ScrollState, SearchError, SearchMatch, SearchOptions, SearchOutcome, SearchRange,
+    SelSide, SelectionKind, SnapCell, Snapshot, VtCore, MAX_SEARCH_MATCHES,
 };
 
 const PHANTOM_SEMANTIC_ESCAPE_CHARS: &str = "\t !\"#$%&'()*+,./:;<=>?@[\\]^`{|}~│";
@@ -259,9 +259,9 @@ impl VtCore for AlacrittyCore {
         query: &str,
         options: SearchOptions,
         range: Option<SearchRange>,
-    ) -> Result<Vec<SearchMatch>, SearchError> {
+    ) -> Result<SearchOutcome, SearchError> {
         if query.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchOutcome::default());
         }
 
         let pattern = search_pattern(query, options);
@@ -271,10 +271,11 @@ impl VtCore for AlacrittyCore {
         let start = to_point(range.start);
         let end = to_point(range.end);
         if start > end {
-            return Ok(Vec::new());
+            return Ok(SearchOutcome::default());
         }
 
         let mut matches = Vec::new();
+        let mut capped = false;
         let mut origin = start;
         while origin <= end {
             let Some(found) = self.term.regex_search_right(&mut regex, origin, end) else {
@@ -287,6 +288,12 @@ impl VtCore for AlacrittyCore {
             }
             let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
             if !options.whole_word || self.is_whole_word_match(found_range) {
+                // Only report the cap once a further real match exists, so
+                // `capped` never lies about a buffer with exactly the cap.
+                if matches.len() >= MAX_SEARCH_MATCHES {
+                    capped = true;
+                    break;
+                }
                 matches.push(SearchMatch { range: found_range });
             }
 
@@ -296,7 +303,7 @@ impl VtCore for AlacrittyCore {
             origin = next;
         }
 
-        Ok(matches)
+        Ok(SearchOutcome { matches, capped })
     }
 
     fn set_active_search_match(&mut self, search_match: Option<SearchMatch>) {
@@ -835,12 +842,14 @@ mod tests {
 
         let matches = term
             .search_scrollback("ALPHA", SearchOptions::default(), None)
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(matches.len(), 3);
 
         let literal = term
             .search_scrollback("a.*b", SearchOptions::default(), None)
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(literal.len(), 1);
         assert_eq!(literal[0].range.start.column, 18);
         assert_eq!(literal[0].range.end.column, 21);
@@ -858,6 +867,7 @@ mod tests {
         assert_eq!(
             term.search_scrollback("café", whole_word, None)
                 .unwrap()
+                .matches
                 .len(),
             2
         );
@@ -867,7 +877,10 @@ mod tests {
             ..whole_word
         };
         assert_eq!(
-            term.search_scrollback("café", exact, None).unwrap().len(),
+            term.search_scrollback("café", exact, None)
+                .unwrap()
+                .matches
+                .len(),
             1
         );
     }
@@ -884,6 +897,7 @@ mod tests {
         assert_eq!(
             term.search_scrollback(r"item-\d+", regex, None)
                 .unwrap()
+                .matches
                 .len(),
             2
         );
@@ -900,13 +914,15 @@ mod tests {
 
         let wrapped = term
             .search_scrollback("c世界", SearchOptions::default(), None)
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(wrapped.len(), 1);
         assert!(wrapped[0].range.start.line < wrapped[0].range.end.line);
 
         let history = term
             .search_scrollback("abc", SearchOptions::default(), None)
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(history.len(), 1);
         assert!(history[0].range.start.line < 0);
     }
@@ -921,7 +937,8 @@ mod tests {
 
         let matches = term
             .search_scrollback("find", SearchOptions::default(), Some(captured))
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(matches.len(), 1);
 
         assert_eq!(term.selection_range(), Some(captured));
@@ -942,6 +959,7 @@ mod tests {
         assert_eq!(
             term.search_scrollback("target", SearchOptions::default(), Some(rotated))
                 .unwrap()
+                .matches
                 .len(),
             1
         );
@@ -956,7 +974,8 @@ mod tests {
         term.advance(b"selected\r\nline1\r\nline2\r\nline3\r\ntarget");
         let target = term
             .search_scrollback("selected", SearchOptions::default(), None)
-            .unwrap()[0];
+            .unwrap()
+            .matches[0];
         term.set_active_search_match(Some(target));
         term.selection_start(0, 0, SelSide::Left);
         term.selection_update(0, 7, SelSide::Right);
@@ -974,5 +993,31 @@ mod tests {
         term.set_active_search_match(Some(target));
         term.advance(b"x");
         assert!(!term.snapshot().cells.iter().any(|cell| cell.search_match));
+    }
+
+    #[test]
+    fn search_stops_collecting_at_the_match_cap() {
+        // 80 single-char matches per row; enough rows to exceed the cap.
+        let cols = 80usize;
+        let rows = MAX_SEARCH_MATCHES / cols + 2;
+        let mut term = core(4, cols as u16, rows as u32);
+        let line = "a".repeat(cols);
+        for _ in 0..rows {
+            term.advance(line.as_bytes());
+            term.advance(b"\r\n");
+        }
+
+        let capped = term
+            .search_scrollback("a", SearchOptions::default(), None)
+            .unwrap();
+        assert_eq!(capped.matches.len(), MAX_SEARCH_MATCHES);
+        assert!(capped.capped);
+
+        // A full-row query matches once per row and stays under the cap.
+        let uncapped = term
+            .search_scrollback(&line, SearchOptions::default(), None)
+            .unwrap();
+        assert_eq!(uncapped.matches.len(), rows);
+        assert!(!uncapped.capped);
     }
 }
