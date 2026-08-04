@@ -2,9 +2,13 @@
 
 use std::{
     io,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
+    thread,
 };
+
+use crate::{AppEvent, PtyOutbox};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorCommand {
@@ -54,7 +58,23 @@ const EDITOR_COMMANDS: &[EditorCommand] = &[EditorCommand {
     args: &[],
 }];
 
-pub(crate) fn open(path: &Path) -> io::Result<()> {
+/// Launches the editor chain off the UI thread. `status()` can block for a long
+/// time (xdg-open may exec the handler directly and never return), so waiting
+/// for each candidate and falling back happens on a short-lived worker thread;
+/// failure is reported back through the event outbox.
+pub(crate) fn open(path: PathBuf, outbox: Arc<dyn PtyOutbox>) {
+    let _ = thread::Builder::new()
+        .name("external-editor".to_string())
+        .spawn(move || {
+            if let Err(error) = open_blocking(&path) {
+                outbox.send(AppEvent::EditorOpenFailed {
+                    error: error.to_string(),
+                });
+            }
+        });
+}
+
+fn open_blocking(path: &Path) -> io::Result<()> {
     try_commands(path, EDITOR_COMMANDS, |candidate, path| {
         Command::new(candidate.program)
             .args(candidate.args)
