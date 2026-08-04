@@ -32,6 +32,12 @@ pub trait VtCore {
     /// Snapshot the visible viewport for rendering.
     fn snapshot(&self) -> Snapshot;
 
+    /// The text on the cursor's row strictly left of the cursor, or `None`
+    /// when the cursor is hidden. Reads the cursor's actual grid row (not a
+    /// scrolled-back viewport) without building a full [`Snapshot`], so it is
+    /// cheap enough to call per keystroke.
+    fn cursor_row_prefix(&self) -> Option<String>;
+
     /// Current scrollback position. `offset = 0` means the viewport is at the
     /// live prompt; larger offsets move back into history.
     fn scroll_state(&self) -> ScrollState;

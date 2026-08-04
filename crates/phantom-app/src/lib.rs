@@ -2607,14 +2607,11 @@ impl App {
         let Some(tab) = self.tabs.get(self.active) else {
             return false;
         };
-        let snapshot = tab.core.snapshot();
-        if !snapshot.cursor.visible {
+        // Runs on every printable keypress/paste, so read just the cursor row
+        // instead of snapshotting the whole grid.
+        let Some(prefix) = tab.core.cursor_row_prefix() else {
             return false;
-        }
-        let prefix: String = (0..snapshot.cursor.col)
-            .filter_map(|col| snapshot.cell(snapshot.cursor.row, col))
-            .map(|cell| cell.c)
-            .collect();
+        };
         looks_like_shell_prompt(&prefix)
     }
 
