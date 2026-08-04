@@ -194,6 +194,30 @@ impl VtCore for AlacrittyCore {
         }
     }
 
+    fn cursor_row_prefix(&self) -> Option<String> {
+        // `renderable_content()` is cheap to build (its grid iterator is lazy
+        // and never consumed here); it supplies the same cursor point and
+        // hidden state that `snapshot()` uses.
+        let cursor = self.term.renderable_content().cursor;
+        if matches!(cursor.shape, AnsiCursorShape::Hidden) {
+            return None;
+        }
+
+        let grid = self.term.grid();
+        let mut prefix = String::with_capacity(cursor.point.column.0);
+        for col in 0..cursor.point.column.0 {
+            let cell = &grid[Point::new(cursor.point.line, Column(col))];
+            // The trailing half of a wide character carries no glyph of its
+            // own; `snapshot()` leaves it as a blank default cell.
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                prefix.push(' ');
+            } else {
+                prefix.push(cell.c);
+            }
+        }
+        Some(prefix)
+    }
+
     fn scroll_state(&self) -> ScrollState {
         let grid = self.term.grid();
         ScrollState {
@@ -715,6 +739,65 @@ mod tests {
         assert_eq!(snap.cell(0, 0).unwrap().width, 2);
         // The spacer column stays a blank default cell.
         assert_eq!(snap.cell(0, 1).unwrap().c, ' ');
+    }
+
+    /// The prefix the full snapshot would produce for the cursor row: every
+    /// cell strictly left of the cursor, spacers included as blanks.
+    fn snapshot_prefix(term: &AlacrittyCore) -> String {
+        let snap = term.snapshot();
+        (0..snap.cursor.col)
+            .filter_map(|col| snap.cell(snap.cursor.row, col))
+            .map(|cell| cell.c)
+            .collect()
+    }
+
+    #[test]
+    fn cursor_row_prefix_matches_snapshot_prefix() {
+        let mut term = core(6, 40, 100);
+        term.advance(b"steve@host ~/project % ");
+        assert_eq!(
+            term.cursor_row_prefix().as_deref(),
+            Some("steve@host ~/project % ")
+        );
+        assert_eq!(term.cursor_row_prefix().unwrap(), snapshot_prefix(&term));
+
+        term.advance(b"ls\r\n$ ");
+        assert_eq!(term.cursor_row_prefix().as_deref(), Some("$ "));
+        assert_eq!(term.cursor_row_prefix().unwrap(), snapshot_prefix(&term));
+    }
+
+    #[test]
+    fn cursor_row_prefix_matches_snapshot_for_wide_chars() {
+        let mut term = core(4, 20, 100);
+        term.advance("dir 世界 % ".as_bytes());
+        let prefix = term.cursor_row_prefix().unwrap();
+        assert_eq!(prefix, snapshot_prefix(&term));
+        // Wide glyphs span two columns; the spacer column reads as a blank.
+        assert_eq!(prefix, "dir 世 界  % ");
+    }
+
+    #[test]
+    fn cursor_row_prefix_tracks_cursor_visibility() {
+        let mut term = core(4, 20, 100);
+        term.advance(b"$ ");
+        term.advance(b"\x1b[?25l"); // DECTCEM hide
+        assert!(term.cursor_row_prefix().is_none());
+        term.advance(b"\x1b[?25h"); // DECTCEM show
+        assert_eq!(term.cursor_row_prefix().as_deref(), Some("$ "));
+    }
+
+    #[test]
+    fn cursor_row_prefix_ignores_scrollback_offset() {
+        let mut term = core(2, 10, 100);
+        for i in 0..20 {
+            term.advance(format!("line{i:02}\r\n").as_bytes());
+        }
+        term.advance(b"% ");
+        let at_bottom = term.cursor_row_prefix();
+        assert_eq!(at_bottom.as_deref(), Some("% "));
+
+        term.scroll(5);
+        assert_eq!(term.cursor_row_prefix(), at_bottom);
     }
 
     #[test]
