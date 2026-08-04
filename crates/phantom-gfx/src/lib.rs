@@ -310,6 +310,9 @@ impl Renderer {
     /// Start a frame: clear both layers and target the base layer.
     pub fn begin(&mut self) {
         self.backdrop.clear();
+        // An atlas eviction deferred from an overflow last frame lands here,
+        // before any glyph instance is emitted — instances must never outlive
+        // the packing their UVs reference.
         self.atlas.begin_frame();
         for layer in 0..2 {
             self.solids[layer].clear();

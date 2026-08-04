@@ -37,6 +37,9 @@ impl FindError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FindResultSummary {
     pub match_count: usize,
+    /// True when the search stopped at the emulator's match cap; the real
+    /// total is "`match_count` or more" (a counter would show "10000+").
+    pub capped: bool,
     pub active_match: Option<usize>,
     pub error: Option<FindError>,
 }
@@ -487,6 +490,7 @@ mod tests {
         state.options.regex = true;
         state.set_results(FindResultSummary {
             match_count: 3,
+            capped: false,
             active_match: Some(1),
             error: None,
         });
@@ -504,6 +508,7 @@ mod tests {
     fn navigation_requires_a_nonempty_valid_query_with_matches() {
         let ready = FindResultSummary {
             match_count: 1,
+            capped: false,
             active_match: Some(0),
             error: None,
         };

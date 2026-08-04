@@ -125,7 +125,10 @@ impl Default for PtyManager {
 /// thread can't be spawned, the dangling sender makes every `try_send` fail and
 /// `kill` falls back to inline kill+reap.
 fn spawn_reaper() -> SyncSender<PtySession> {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<PtySession>(64);
+    // Bound comfortably above MAX_LIVE_PTY_SESSIONS so a burst of kills never
+    // hits the inline (UI-thread-stalling) fallback just because the queue is
+    // momentarily full.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<PtySession>(1024);
     let _ = std::thread::Builder::new()
         .name("pty-reaper".to_string())
         .spawn(move || {
@@ -207,7 +210,7 @@ impl PtyManager {
         cmd.env("PATH", &env.path);
         apply_account_env(&mut cmd, account);
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| AppError::Pty(format!("spawn failed: {e}")))?;
@@ -229,7 +232,7 @@ impl PtyManager {
         // session (and with it `write_tx`) is dropped, or when a write fails
         // (EIO after the child dies).
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_CHUNKS);
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-writer-{id}"))
             .spawn(move || {
                 while let Ok(data) = write_rx.recv() {
@@ -242,7 +245,13 @@ impl PtyManager {
                     }
                 }
             })
-            .map_err(|e| AppError::Pty(format!("writer thread failed: {e}")))?;
+        {
+            // Dropping a Child never wait()s, so reap the already-spawned
+            // shell before surfacing the error (mirrors the reader path).
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::Pty(format!("writer thread failed: {e}")));
+        }
 
         self.lock().insert(
             id,
@@ -282,7 +291,18 @@ impl PtyManager {
                     .remove(&id);
                 if let Some(mut s) = session {
                     live_sessions.fetch_sub(1, Ordering::AcqRel);
-                    let _ = s.child.wait();
+                    // The loop also ends when the sink detaches (on_bytes ->
+                    // false) with the child still alive, and wait() on a live
+                    // child would block this thread forever. Reap directly when
+                    // the child has already exited (kill() would sleep through
+                    // its SIGHUP grace period), otherwise kill first.
+                    match s.child.try_wait() {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => {
+                            let _ = s.child.kill();
+                            let _ = s.child.wait();
+                        }
+                    }
                 }
             })
             .map_err(|e| {
@@ -1026,6 +1046,61 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert!(reaped, "child {pid} was not reaped after natural exit");
+    }
+
+    #[cfg(unix)]
+    struct DetachingSink(Arc<AtomicUsize>);
+
+    #[cfg(unix)]
+    impl PtySink for DetachingSink {
+        fn on_bytes(&mut self, _bytes: &[u8]) -> bool {
+            false
+        }
+        fn on_eof(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// A sink that detaches (`on_bytes` returning false) while the shell is
+    /// still running must not leave the reader blocked in `wait()` on a live
+    /// child: the session is removed and the child is killed and reaped.
+    #[test]
+    #[cfg(unix)]
+    fn sink_detach_kills_and_reaps_live_child() {
+        let manager = PtyManager::new();
+        let eof = Arc::new(AtomicUsize::new(0));
+        let id = manager
+            .spawn(
+                LaunchOpts {
+                    command: Some("/bin/sh".to_string()),
+                    args: vec!["-c".to_string(), "echo ready; sleep 30".to_string()],
+                    startup: None,
+                    cwd: None,
+                    rows: 24,
+                    cols: 80,
+                },
+                DetachingSink(Arc::clone(&eof)),
+            )
+            .expect("spawn shell");
+        let pid = {
+            let sessions = manager.lock();
+            sessions.get(&id).and_then(|s| s.pid).expect("child pid")
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reaped = loop {
+            let eof_seen = eof.load(Ordering::Acquire) > 0;
+            let gone = unsafe { libc::kill(pid as libc::c_int, 0) } == -1;
+            let removed = !manager.lock().contains_key(&id);
+            if eof_seen && gone && removed {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(reaped, "child {pid} was not reaped after sink detach");
     }
 
     #[test]
