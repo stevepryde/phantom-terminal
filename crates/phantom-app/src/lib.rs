@@ -2798,14 +2798,17 @@ impl App {
     }
 
     fn request_exit(&mut self) {
-        if let Some(pending) = self.pending_pty_events.as_ref() {
-            pending.close();
-        }
         self.flush_pending_window_size();
         self.save_tabs();
         self.flush_persistence();
+        // Kill PTYs before closing the event queue: a reader that sees the
+        // closed queue detaches and removes its own session, which would make
+        // the kill() below a silent no-op.
         for tab in &self.tabs {
             let _ = self.pty.kill(tab.pty_id);
+        }
+        if let Some(pending) = self.pending_pty_events.as_ref() {
+            pending.close();
         }
         self.exit_requested = true;
     }
