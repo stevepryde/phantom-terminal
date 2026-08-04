@@ -124,6 +124,8 @@ fn resolve_new_tab_launch(
 }
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
+/// Pixel-delta scroll divisor used only before the renderer exists.
+const FALLBACK_SCROLL_CELL_HEIGHT_PX: f32 = 24.0;
 
 /// PTY output delivered from a reader thread, tagged with the tab it belongs to.
 #[derive(Debug)]
@@ -597,6 +599,10 @@ pub struct App {
     blink_enabled: bool,
     cursor_on: bool,
     next_toggle: Instant,
+
+    // (scrollback_lines, cursor style) last pushed into the live terminal
+    // cores, so settings edits only touch every tab when they change.
+    applied_term_options: (u32, CursorShape),
 }
 
 impl App {
@@ -608,6 +614,7 @@ impl App {
     ) -> Self {
         let keymap = Keymap::from_config(&config.keybindings);
         let blink_enabled = config.cursor_blink;
+        let applied_term_options = (config.scrollback_lines, cursor_shape(&config.cursor_style));
         let applied_window_chrome = config.window_chrome.clone();
         let renderer_signature = renderer_signature(&config);
         let ephemeral = !launch.remember_tabs;
@@ -683,6 +690,7 @@ impl App {
             blink_enabled,
             cursor_on: true,
             next_toggle: now + BLINK_INTERVAL,
+            applied_term_options,
         }
     }
 
@@ -1374,6 +1382,13 @@ impl App {
             self.request_redraw();
             return;
         }
+        // Another directory's actions must not stay rendered while the worker
+        // rediscovers (they can be slow on network filesystems); show the
+        // empty state until the reply for this generation lands.
+        if self.context_snapshot.cwd != cwd {
+            self.context_snapshot = ContextSnapshot::empty(cwd.clone());
+            self.request_redraw();
+        }
         let request = ContextDiscoveryRequest {
             generation,
             cwd: cwd.clone(),
@@ -1444,6 +1459,12 @@ impl App {
             self.show_notice("That command is no longer frequent in this tab");
             return;
         }
+        // Never inject into a foreground program (vim, an SSH password
+        // prompt, ...): the text would be submitted to it, not the shell.
+        if !self.active_tab_at_shell_prompt() {
+            self.show_notice("Cannot run the command: the tab is running a program");
+            return;
+        }
         let pty_id = tab.pty_id;
         // Clear any partially typed shell line first so the clicked action
         // executes exactly the displayed command instead of concatenating it.
@@ -1501,6 +1522,12 @@ impl App {
                     self.show_notice(
                         "This tab is running a task; choose a shell tab or Shift-click",
                     );
+                    return;
+                }
+                // Never inject `cd` into a foreground program; it would be
+                // submitted as input to that program, not the shell.
+                if !self.active_tab_at_shell_prompt() {
+                    self.show_notice("Cannot change directory: the tab is running a program");
                     return;
                 }
                 let pty_id = tab.pty_id;
@@ -1831,7 +1858,25 @@ impl App {
         self.apply_window_chrome();
         self.keymap = Keymap::from_config(&self.config.keybindings);
         self.mark_config_dirty();
-        self.blink_enabled = self.config.cursor_blink;
+        if self.blink_enabled != self.config.cursor_blink {
+            self.blink_enabled = self.config.cursor_blink;
+            // Toggling blink during the off phase must not strand the cursor
+            // invisible: pump_blink stops toggling once blink is disabled.
+            self.reset_blink();
+        }
+        // Cursor style and scrollback depth are baked into each core at spawn;
+        // push changes to live tabs so they aren't limited to future tabs.
+        let term_options = (
+            self.config.scrollback_lines,
+            cursor_shape(&self.config.cursor_style),
+        );
+        if self.applied_term_options != term_options {
+            self.applied_term_options = term_options;
+            for tab in &mut self.tabs {
+                tab.core
+                    .set_terminal_options(term_options.0, term_options.1);
+            }
+        }
         let next_signature = renderer_signature(&self.config);
         if self.renderer_signature != next_signature {
             self.mark_renderer_dirty();
@@ -2108,16 +2153,22 @@ impl App {
         }
     }
 
+    /// Cleanup shared by every path that changes which tab is active: find
+    /// matches and an in-progress scrollbar drag belong to the outgoing tab.
+    /// Must run while `self.active` still points at the outgoing tab.
+    fn leave_active_tab(&mut self) {
+        if self.ui.find_open() {
+            self.close_find();
+        }
+        self.scroll_drag = None;
+    }
+
     fn switch_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
         if index != self.active {
-            if self.ui.find_open() {
-                self.close_find();
-            }
-            // A scrollbar drag in progress belongs to the previous tab.
-            self.scroll_drag = None;
+            self.leave_active_tab();
         }
         self.active = index;
         self.tab_scroll_into_view = Some(index);
@@ -2131,10 +2182,22 @@ impl App {
         if from >= self.tabs.len() {
             return;
         }
+        // Dropping a dragged tab activates it; run the same cleanup as
+        // switch_tab so find state computed against the previously active
+        // tab's scrollback doesn't survive the activation change.
+        if from != self.active {
+            self.leave_active_tab();
+        }
         let target = target.min(self.tabs.len());
         let insert_at = if target > from { target - 1 } else { target };
         if insert_at == from {
-            self.active = from;
+            // Dropped in place: no reorder, but the drop still activates the
+            // dragged tab, so keep sidebar/persistence in step with it.
+            if self.active != from {
+                self.active = from;
+                self.mark_dirty();
+                self.schedule_context_discovery();
+            }
             return;
         }
         let tab = self.tabs.remove(from);
@@ -2142,6 +2205,9 @@ impl App {
         self.active = insert_at;
         self.tab_scroll_into_view = Some(insert_at);
         self.rename = None;
+        // Tab rects moved: drop last frame's hit map (as close_tab does) so a
+        // racing click can't act on stale positions.
+        self.last_hits = None;
         self.mark_dirty();
         self.schedule_context_discovery();
     }
@@ -3128,9 +3194,16 @@ impl App {
 }
 
 /// Translate a winit window event into an engine-independent [`AppInput`], using
-/// the current modifier state for key events. Returns `None` for events we
-/// ignore (and for `RedrawRequested`, which the caller handles directly).
-fn translate(event: &WindowEvent, mods: Mods, cursor: (f32, f32)) -> Option<AppInput> {
+/// the current modifier state for key events and the renderer's physical cell
+/// height to convert trackpad pixel scrolling into lines. Returns `None` for
+/// events we ignore (and for `RedrawRequested`, which the caller handles
+/// directly).
+fn translate(
+    event: &WindowEvent,
+    mods: Mods,
+    cursor: (f32, f32),
+    cell_height_px: f32,
+) -> Option<AppInput> {
     Some(match event {
         WindowEvent::CloseRequested => AppInput::CloseRequested,
         WindowEvent::ModifiersChanged(m) => {
@@ -3167,7 +3240,9 @@ fn translate(event: &WindowEvent, mods: Mods, cursor: (f32, f32)) -> Option<AppI
         WindowEvent::MouseWheel { delta, .. } => {
             let lines = match delta {
                 MouseScrollDelta::LineDelta(_, y) => *y,
-                MouseScrollDelta::PixelDelta(p) => p.y as f32 / 24.0,
+                // Pixel deltas are physical px; dividing by the real cell
+                // height keeps trackpad speed DPI-independent.
+                MouseScrollDelta::PixelDelta(p) => p.y as f32 / cell_height_px,
             };
             if lines.abs() < f32::EPSILON {
                 return None;
@@ -3503,7 +3578,12 @@ impl ApplicationHandler<AppEvent> for App {
             self.request_redraw();
         }
         let consumed = egui_response.is_some_and(|response| response.consumed);
-        let input = translate(&event, self.mods, self.cursor_pos);
+        let cell_height_px = self
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.cell_size().1)
+            .unwrap_or(FALLBACK_SCROLL_CELL_HEIGHT_PX);
+        let input = translate(&event, self.mods, self.cursor_pos, cell_height_px);
 
         if let Some(input) = input {
             let egui_overlay_owns_input =
@@ -3873,6 +3953,150 @@ mod tests {
             bytes: b"three".to_vec(),
         });
         assert!(app.find_refresh_deadline.is_none());
+    }
+
+    #[test]
+    fn reordering_a_tab_runs_the_same_cleanup_as_switching() {
+        let mut app = test_app();
+        for id in 0..2 {
+            app.tabs.push(Tab::new(
+                id,
+                AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+                u32::MAX,
+                String::new(),
+                None,
+            ));
+        }
+        app.tabs[0].advance_pty(b"find me");
+        app.open_find();
+        assert!(app.find_open());
+        app.scroll_drag = Some(ScrollDrag {
+            start_y: 10.0,
+            start_offset: 3,
+        });
+        let zero = chrome::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
+        app.last_hits = Some(chrome::TabBarHits {
+            tabs: Vec::new(),
+            new_tab: zero,
+            settings: zero,
+            titlebar: None,
+            window_controls: Vec::new(),
+            tab_strip: zero,
+            tab_scroll: 0.0,
+            max_tab_scroll: 0.0,
+        });
+
+        // Drag tab 1 to the front: it becomes the active tab, so the find
+        // state and scrollbar drag of the outgoing tab must not survive.
+        app.reorder_tab(1, 0);
+
+        assert_eq!(app.active, 0);
+        assert_eq!(app.tabs[0].id, 1);
+        assert!(!app.find_open());
+        assert!(app.find_matches.is_empty());
+        assert!(app.scroll_drag.is_none());
+        assert!(app.last_hits.is_none());
+    }
+
+    #[test]
+    fn disabling_cursor_blink_during_the_off_phase_restores_the_cursor() {
+        let mut app = test_app();
+        app.cursor_on = false;
+
+        app.config.cursor_blink = false;
+        app.apply_config_change();
+
+        assert!(!app.blink_enabled);
+        assert!(app.cursor_on);
+    }
+
+    #[test]
+    fn cursor_style_and_scrollback_changes_apply_to_live_tabs() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+
+        app.config.cursor_style = "bar".to_string();
+        app.apply_config_change();
+
+        assert_eq!(app.tabs[0].core.snapshot().cursor.shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn scheduling_discovery_for_a_new_directory_clears_the_stale_snapshot() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            dir.clone(),
+            None,
+        ));
+        app.context_snapshot = ContextSnapshot {
+            cwd: PathBuf::from("/somewhere/else"),
+            sections: vec![context_actions::ContextSection {
+                id: "stale".to_string(),
+                title: "Stale".to_string(),
+                content: context_actions::ContextSectionContent::Error {
+                    message: "stale".to_string(),
+                },
+            }],
+        };
+
+        app.schedule_context_discovery();
+
+        assert_eq!(app.context_snapshot.cwd, PathBuf::from(&dir));
+        assert!(app.context_snapshot.sections.is_empty());
+    }
+
+    #[test]
+    fn sidebar_injections_are_blocked_while_a_program_is_in_the_foreground() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            dir.clone(),
+            None,
+        ));
+        // An empty grid has no shell-prompt-looking line before the cursor,
+        // which models a full-screen program or password prompt owning it.
+        app.tabs[0].frequent_commands.record_executed("cargo test");
+
+        app.run_frequent_command("cargo test");
+        assert_eq!(
+            app.notice_text(),
+            Some("Cannot run the command: the tab is running a program")
+        );
+
+        app.config
+            .context_actions
+            .record_directory_visit(Path::new(&dir), 1)
+            .unwrap();
+        app.open_context_directory(
+            PathBuf::from(&dir),
+            context_actions::DirectoryTarget::CurrentTab,
+        );
+        assert_eq!(
+            app.notice_text(),
+            Some("Cannot change directory: the tab is running a program")
+        );
     }
 
     #[test]
