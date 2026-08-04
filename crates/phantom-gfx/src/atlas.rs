@@ -92,15 +92,94 @@ impl GlyphEntry {
     }
 }
 
-pub struct GlyphAtlas {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
+/// CPU-side atlas state: packing, cache, and the deferred-eviction flag. Kept
+/// separate from the GPU texture so placement policy is unit-testable.
+struct AtlasIndex {
     size: u32,
     packer: ShelfPacker,
     cache: HashMap<GlyphKey, GlyphEntry>,
-    /// Whether a full atlas may still evict-and-repack this frame. One reset
-    /// per frame bounds the work when the visible glyph set exceeds capacity.
-    reset_allowed: bool,
+    /// Set when an allocation failed because the atlas is full. The
+    /// evict-and-repack is deferred to the next `begin_frame`: glyph instances
+    /// already emitted this frame hold UVs into the current packing, so
+    /// repacking mid-frame would have them sample the wrong texels.
+    pending_reset: bool,
+}
+
+impl AtlasIndex {
+    fn new(size: u32) -> Self {
+        Self {
+            size,
+            packer: ShelfPacker::new(size, size),
+            cache: HashMap::new(),
+            pending_reset: false,
+        }
+    }
+
+    /// Apply a deferred evict-and-repack. Must run before any glyph is placed
+    /// this frame so no emitted instance ever references the old packing.
+    fn begin_frame(&mut self) {
+        if self.pending_reset {
+            self.pending_reset = false;
+            self.packer = ShelfPacker::new(self.size, self.size);
+            self.cache.clear();
+        }
+    }
+
+    /// Decide placement for a glyph. Returns the entry to hand back and, when
+    /// `Some`, the atlas origin the caller must upload the bitmap to.
+    fn place(&mut self, key: GlyphKey, glyph: &RasterGlyph) -> (GlyphEntry, Option<(u32, u32)>) {
+        if let Some(entry) = self.cache.get(&key) {
+            return (*entry, None);
+        }
+        if glyph.width == 0 || glyph.height == 0 {
+            // Whitespace / blank glyph: cache it, contributes no quad.
+            let entry = GlyphEntry::empty(glyph.left, glyph.top, glyph.is_color);
+            self.cache.insert(key, entry);
+            return (entry, None);
+        }
+        if let Some((x, y)) = self.packer.alloc(glyph.width, glyph.height) {
+            let s = self.size as f32;
+            let entry = GlyphEntry {
+                uv_min: [x as f32 / s, y as f32 / s],
+                uv_max: [(x + glyph.width) as f32 / s, (y + glyph.height) as f32 / s],
+                left: glyph.left,
+                top: glyph.top,
+                width: glyph.width,
+                height: glyph.height,
+                is_color: glyph.is_color,
+                empty: false,
+            };
+            self.cache.insert(key, entry);
+            return (entry, Some((x, y)));
+        }
+        if glyph.width > self.size || glyph.height > self.size {
+            // Can never fit any packing: cache the blank so the glyph isn't
+            // re-rasterized (and the atlas isn't repacked) every frame.
+            let entry = GlyphEntry::empty(glyph.left, glyph.top, glyph.is_color);
+            self.cache.insert(key, entry);
+            return (entry, None);
+        }
+        // Atlas full: schedule the evict-and-repack for the next frame
+        // boundary, and do NOT cache the failure — the glyph renders blank
+        // for this one frame and is retried once the repack frees space.
+        if !self.pending_reset {
+            self.pending_reset = true;
+            eprintln!(
+                "glyph atlas full ({0}x{0}); evicting all cached glyphs next frame",
+                self.size
+            );
+        }
+        (
+            GlyphEntry::empty(glyph.left, glyph.top, glyph.is_color),
+            None,
+        )
+    }
+}
+
+pub struct GlyphAtlas {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    index: AtlasIndex,
 }
 
 impl GlyphAtlas {
@@ -125,10 +204,7 @@ impl GlyphAtlas {
         Self {
             texture,
             view,
-            size,
-            packer: ShelfPacker::new(size, size),
-            cache: HashMap::new(),
-            reset_allowed: true,
+            index: AtlasIndex::new(size),
         }
     }
 
@@ -137,12 +213,13 @@ impl GlyphAtlas {
     }
 
     pub fn get(&self, key: GlyphKey) -> Option<GlyphEntry> {
-        self.cache.get(&key).copied()
+        self.index.cache.get(&key).copied()
     }
 
-    /// Re-arm the once-per-frame eviction. Call at the start of each frame.
+    /// Apply any eviction deferred from an overflow last frame. Call at the
+    /// start of each frame, before any glyph is emitted.
     pub fn begin_frame(&mut self) {
-        self.reset_allowed = true;
+        self.index.begin_frame();
     }
 
     /// Cache a rasterization failure as an empty entry so it isn't retried —
@@ -150,13 +227,14 @@ impl GlyphAtlas {
     /// visible occurrence of the glyph.
     pub fn insert_failed(&mut self, key: GlyphKey) -> GlyphEntry {
         let entry = GlyphEntry::empty(0, 0, false);
-        self.cache.insert(key, entry);
+        self.index.cache.insert(key, entry);
         entry
     }
 
     /// Upload a rasterized glyph and cache its placement. Idempotent per key.
-    /// When the atlas is full, all cached glyphs are evicted (at most once per
-    /// frame) so live glyphs re-pack on demand instead of newly seen
+    /// When the atlas is full, the glyph renders blank for one frame (the
+    /// failure is not cached) and every cached glyph is evicted at the next
+    /// frame boundary, so live glyphs re-pack on demand instead of newly seen
     /// characters rendering as permanently invisible cells.
     pub fn insert(
         &mut self,
@@ -164,28 +242,8 @@ impl GlyphAtlas {
         key: GlyphKey,
         glyph: &RasterGlyph,
     ) -> GlyphEntry {
-        if let Some(entry) = self.cache.get(&key) {
-            return *entry;
-        }
-
-        let slot = if glyph.width == 0 || glyph.height == 0 {
-            None
-        } else {
-            let mut slot = self.packer.alloc(glyph.width, glyph.height);
-            if slot.is_none() && self.reset_allowed {
-                self.reset_allowed = false;
-                self.packer = ShelfPacker::new(self.size, self.size);
-                self.cache.clear();
-                eprintln!(
-                    "glyph atlas full ({0}x{0}); evicting all cached glyphs",
-                    self.size
-                );
-                slot = self.packer.alloc(glyph.width, glyph.height);
-            }
-            slot
-        };
-
-        let entry = if let Some((x, y)) = slot {
+        let (entry, upload) = self.index.place(key, glyph);
+        if let Some((x, y)) = upload {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.texture,
@@ -205,22 +263,7 @@ impl GlyphAtlas {
                     depth_or_array_layers: 1,
                 },
             );
-            let s = self.size as f32;
-            GlyphEntry {
-                uv_min: [x as f32 / s, y as f32 / s],
-                uv_max: [(x + glyph.width) as f32 / s, (y + glyph.height) as f32 / s],
-                left: glyph.left,
-                top: glyph.top,
-                width: glyph.width,
-                height: glyph.height,
-                is_color: glyph.is_color,
-                empty: false,
-            }
-        } else {
-            GlyphEntry::empty(glyph.left, glyph.top, glyph.is_color)
-        };
-
-        self.cache.insert(key, entry);
+        }
         entry
     }
 }
@@ -266,5 +309,53 @@ mod tests {
         // the open shelf must not be abandoned.
         assert!(p.alloc(15, 20).is_none());
         assert_eq!(p.alloc(8, 20), Some((11, 0)));
+    }
+
+    fn raster(w: u32, h: u32) -> RasterGlyph {
+        RasterGlyph {
+            width: w,
+            height: h,
+            left: 0,
+            top: 0,
+            is_color: false,
+            data: Vec::new(),
+        }
+    }
+
+    fn key(glyph_id: u16) -> GlyphKey {
+        GlyphKey { face: 0, glyph_id }
+    }
+
+    #[test]
+    fn full_atlas_failure_is_transient_and_succeeds_after_repack() {
+        let mut idx = AtlasIndex::new(32);
+        let (entry, upload) = idx.place(key(1), &raster(32, 32));
+        assert!(!entry.empty && upload.is_some());
+        // No space left: blank entry, no upload, and crucially not cached —
+        // a cached blank would never be retried.
+        let (entry, upload) = idx.place(key(2), &raster(8, 8));
+        assert!(entry.empty && upload.is_none());
+        assert!(!idx.cache.contains_key(&key(2)));
+        // The repack is deferred: the current packing (and its cached UVs)
+        // stays valid for the rest of this frame.
+        assert!(idx.pending_reset);
+        assert!(idx.cache.contains_key(&key(1)));
+        // Next frame the repack frees space and the same glyph places.
+        idx.begin_frame();
+        assert!(!idx.pending_reset);
+        assert!(idx.cache.is_empty());
+        let (entry, upload) = idx.place(key(2), &raster(8, 8));
+        assert!(!entry.empty && upload.is_some());
+    }
+
+    #[test]
+    fn oversized_glyph_is_cached_blank_without_scheduling_eviction() {
+        let mut idx = AtlasIndex::new(32);
+        // Wider than the whole atlas: no packing can ever hold it, so the
+        // blank is cached and no futile repack is scheduled.
+        let (entry, upload) = idx.place(key(1), &raster(64, 4));
+        assert!(entry.empty && upload.is_none());
+        assert!(idx.cache.contains_key(&key(1)));
+        assert!(!idx.pending_reset);
     }
 }
