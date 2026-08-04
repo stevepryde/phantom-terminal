@@ -89,16 +89,7 @@ impl AlacrittyCore {
         let size = TermDimensions::new(cols as usize, rows as usize);
         let responses = Rc::new(RefCell::new(Vec::new()));
 
-        let config = Config {
-            scrolling_history: scrollback_lines as usize,
-            semantic_escape_chars: PHANTOM_SEMANTIC_ESCAPE_CHARS.to_string(),
-            default_cursor_style: AnsiCursorStyle {
-                shape: to_ansi_cursor_shape(default_cursor),
-                blinking: false,
-            },
-            ..Config::default()
-        };
-
+        let config = term_config(scrollback_lines, default_cursor);
         let term = Term::new(config, &size, ResponseSink(Rc::clone(&responses)));
         Self {
             term,
@@ -107,6 +98,31 @@ impl AlacrittyCore {
             size,
             active_search_match: None,
         }
+    }
+
+    /// Push updated config-derived options into a live terminal: the default
+    /// cursor shape (used until an application overrides it via DECSCUSR) and
+    /// the scrollback depth (`Term::set_options` resizes history in place).
+    pub fn set_terminal_options(&mut self, scrollback_lines: u32, default_cursor: CursorShape) {
+        // Shrinking history rotates absolute grid coordinates; the app will
+        // recompute live search results against the new layout.
+        self.active_search_match = None;
+        self.term
+            .set_options(term_config(scrollback_lines, default_cursor));
+    }
+}
+
+/// The `Term` config derived from app settings; `new` and
+/// [`AlacrittyCore::set_terminal_options`] must stay in sync.
+fn term_config(scrollback_lines: u32, default_cursor: CursorShape) -> Config {
+    Config {
+        scrolling_history: scrollback_lines as usize,
+        semantic_escape_chars: PHANTOM_SEMANTIC_ESCAPE_CHARS.to_string(),
+        default_cursor_style: AnsiCursorStyle {
+            shape: to_ansi_cursor_shape(default_cursor),
+            blinking: false,
+        },
+        ..Config::default()
     }
 }
 
@@ -721,6 +737,29 @@ mod tests {
     fn honors_configured_default_cursor_shape() {
         let term = AlacrittyCore::new(24, 80, 100, CursorShape::Beam);
         assert_eq!(term.snapshot().cursor.shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn set_terminal_options_updates_default_cursor_shape_on_a_live_terminal() {
+        let mut term = AlacrittyCore::new(24, 80, 100, CursorShape::Block);
+        term.advance(b"hello");
+
+        term.set_terminal_options(100, CursorShape::Beam);
+
+        assert_eq!(term.snapshot().cursor.shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn set_terminal_options_resizes_scrollback_on_a_live_terminal() {
+        let mut term = core(2, 10, 100);
+        for i in 0..20 {
+            term.advance(format!("line{i:02}\r\n").as_bytes());
+        }
+        assert!(term.scroll_state().history > 5);
+
+        term.set_terminal_options(5, CursorShape::Block);
+
+        assert_eq!(term.scroll_state().history, 5);
     }
 
     #[test]
