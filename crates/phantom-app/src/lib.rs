@@ -2310,9 +2310,8 @@ impl App {
             self.request_redraw();
             return;
         }
+        self.snap_active_terminal_to_prompt();
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.core.scroll(-1_000_000);
-            tab.core.selection_clear();
             tab.frequent_commands.prepare_line(at_shell_prompt);
             tab.frequent_commands.observe_text(text);
         }
@@ -2408,10 +2407,8 @@ impl App {
             if !self.write_terminal_input(pty_id, &bytes, "Could not send key") {
                 return;
             }
+            self.snap_active_terminal_to_prompt();
             if let Some(t) = self.tabs.get_mut(self.active) {
-                // Typing snaps to the bottom and clears any selection.
-                t.core.scroll(-1_000_000);
-                t.core.selection_clear();
                 t.frequent_commands.observe_key(key, self.mods.ctrl);
                 if matches!(key, Key::Char(_))
                     && !self.mods.ctrl
@@ -3172,12 +3169,29 @@ impl App {
         if !self.write_terminal_input(pty_id, &bytes, "Could not paste") {
             return;
         }
+        self.snap_active_terminal_to_prompt();
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.frequent_commands.prepare_line(at_shell_prompt);
             tab.frequent_commands.observe_text(&text);
         }
         if text.contains('\n') || text.contains('\r') {
             self.arm_cwd_polling(CWD_POLL_WINDOW);
+        }
+        self.request_redraw();
+    }
+
+    /// Move successful terminal input back to the live prompt and discard a
+    /// selection that would otherwise keep copy/find actions pointed at stale
+    /// scrollback.
+    fn snap_active_terminal_to_prompt(&mut self) {
+        let tracked_find_selection = self.find_selection_scope_tracks_live_selection();
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.scroll(-1_000_000);
+            tab.core.selection_clear();
+        }
+        if self.ui.find_open() && tracked_find_selection {
+            self.sync_find_selection_scope_after_terminal_change(true);
+            self.refresh_find();
         }
     }
 
@@ -4651,6 +4665,46 @@ mod tests {
         app.paste_clipboard();
 
         assert_eq!(app.notice_text(), Some("Clipboard is empty"));
+    }
+
+    #[test]
+    fn terminal_input_cleanup_snaps_to_prompt_and_expires_live_find_selection() {
+        let mut app = test_app();
+        let mut tab = Tab::new(
+            0,
+            AlacrittyCore::new(3, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        );
+        let history = b"target\r\none\r\ntwo\r\nthree\r\nfour\r\nfive";
+        tab.advance_pty(history);
+        tab.core.scroll(3);
+        assert!(tab.core.scroll_state().offset > 0);
+        tab.core.selection_start(0, 0, SelSide::Left);
+        tab.core.selection_update(0, 3, SelSide::Right);
+        assert!(tab.core.selection_range().is_some());
+        app.tabs.push(tab);
+        assert!(app.find_worker.create(0, 3, 40, 100, CursorShape::Block));
+        assert!(app.find_worker.advance(0, history.to_vec(), false));
+
+        app.open_find();
+        app.ui.configure_find_for_tests("target", true);
+        app.refresh_find();
+        assert!(app.find_request_generation.is_some());
+        assert!(app.find_pending);
+
+        // Paste, IME commits, and ordinary keys all call this only after their
+        // PTY write succeeds.
+        app.snap_active_terminal_to_prompt();
+
+        assert_eq!(app.tabs[0].core.scroll_state().offset, 0);
+        assert!(app.tabs[0].core.selection_range().is_none());
+        assert!(app.find_selection_scope.is_none());
+        assert!(!app.ui.find_state().selection_available());
+        assert!(app.find_request_generation.is_none());
+        assert!(!app.find_pending);
+        assert!(app.find_matches.is_empty());
     }
 
     #[test]
