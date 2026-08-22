@@ -52,7 +52,7 @@ use event::{AppInput, AppMouseButton, Mods};
 use find::{FindError as FindUiError, FindNavigation, FindResultSummary};
 use find_worker::{FindResponse, FindWorker};
 use gpu::{GpuContext, PresentStatus};
-use keybindings::{Action, Keymap};
+use keybindings::{Action, BuiltinShortcut, Keymap};
 use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
     default_home_dir, resolve_launch_opts, resolve_program, resolve_trusted_task,
@@ -606,12 +606,6 @@ enum WheelRoute {
     TabStrip,
     MouseReport,
     Terminal,
-}
-
-#[derive(Clone, Copy)]
-enum ClipAction {
-    Copy,
-    Paste,
 }
 
 trait ClipboardAccess {
@@ -1758,6 +1752,8 @@ impl App {
                 }
                 self.ui.open_settings(&self.config);
             }
+            PaletteAction::FindInScrollback => self.open_find(),
+            PaletteAction::ToggleFullscreen => self.toggle_fullscreen(),
         }
         self.request_redraw();
     }
@@ -2423,7 +2419,7 @@ impl App {
 
     /// Route a key press (after the winit adapter has normalized it).
     fn handle_key_input(&mut self, key: Key, text: Option<&str>) {
-        if find_shortcut(key, self.mods) {
+        if BuiltinShortcut::FindInScrollback.matches(key, self.mods) {
             self.open_find();
             return;
         }
@@ -2451,33 +2447,34 @@ impl App {
             return;
         }
         // Clipboard shortcuts.
-        if let Some(action) = self.clipboard_action(key, self.mods) {
-            match action {
-                ClipAction::Copy => self.copy_selection(),
-                ClipAction::Paste => self.paste_clipboard(),
-            }
+        if BuiltinShortcut::Copy.matches(key, self.mods) {
+            self.copy_selection();
+            return;
+        }
+        if BuiltinShortcut::Paste.matches(key, self.mods) {
+            self.paste_clipboard();
             return;
         }
         // Fullscreen toggle.
-        if key == Key::F(11) {
+        if BuiltinShortcut::ToggleFullscreen.matches(key, self.mods) {
             self.toggle_fullscreen();
             return;
         }
         // Shift+PageUp/Down scroll the viewport by a page.
-        if self.mods.shift {
-            let dir = match key {
-                Key::PageUp => Some(1),
-                Key::PageDown => Some(-1),
-                _ => None,
-            };
-            if let Some(dir) = dir {
-                let page = (self.active_terminal_grid().0 as i32).max(1);
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.core.scroll(dir * page);
-                }
-                self.request_redraw();
-                return;
+        let page_direction = if BuiltinShortcut::ScrollPageUp.matches(key, self.mods) {
+            Some(1)
+        } else if BuiltinShortcut::ScrollPageDown.matches(key, self.mods) {
+            Some(-1)
+        } else {
+            None
+        };
+        if let Some(direction) = page_direction {
+            let page = (self.active_terminal_grid().0 as i32).max(1);
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.core.scroll(direction * page);
             }
+            self.request_redraw();
+            return;
         }
         // Keybindings.
         if let Some(action) = self.keymap.lookup(key, self.mods) {
@@ -3405,25 +3402,6 @@ impl App {
         }
     }
 
-    /// Detect a copy/paste shortcut: Cmd+C/V on macOS, Ctrl+Shift+C/V elsewhere
-    /// (so a bare Ctrl+C still reaches the shell as SIGINT).
-    fn clipboard_action(&self, key: Key, mods: Mods) -> Option<ClipAction> {
-        let mac = cfg!(target_os = "macos");
-        let primary = if mac { mods.sup } else { mods.ctrl };
-        if !primary || (!mac && !mods.shift) {
-            return None;
-        }
-        let c = match key {
-            Key::Char(c) => c.to_ascii_lowercase(),
-            _ => return None,
-        };
-        match c {
-            'c' => Some(ClipAction::Copy),
-            'v' => Some(ClipAction::Paste),
-            _ => None,
-        }
-    }
-
     fn on_resize(&mut self, width: u32, height: u32) {
         self.schedule_window_size_save(width, height);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -4025,14 +4003,11 @@ fn overlay_owns_terminal_ime(
     palette_open || renaming || settings_open || context_owns_keyboard || egui_wants_keyboard_input
 }
 
-fn find_shortcut(key: Key, mods: Mods) -> bool {
-    matches!(key, Key::Char('f' | 'F')) && !mods.alt && !mods.shift && (mods.ctrl || mods.sup)
-}
-
 fn app_input_is_find_shortcut(input: &AppInput) -> bool {
     matches!(
         input,
-        AppInput::Key { key, mods, .. } if find_shortcut(*key, *mods)
+        AppInput::Key { key, mods, .. }
+            if BuiltinShortcut::FindInScrollback.matches(*key, *mods)
     )
 }
 
@@ -5216,22 +5191,22 @@ mod tests {
 
     #[test]
     fn ctrl_f_and_cmd_f_are_reserved_for_scrollback_find() {
-        assert!(find_shortcut(
+        assert!(BuiltinShortcut::FindInScrollback.matches(
             Key::Char('f'),
             Mods {
                 ctrl: true,
                 ..Mods::default()
             }
         ));
-        assert!(find_shortcut(
+        assert!(BuiltinShortcut::FindInScrollback.matches(
             Key::Char('f'),
             Mods {
                 sup: true,
                 ..Mods::default()
             }
         ));
-        assert!(!find_shortcut(Key::Char('f'), Mods::default()));
-        assert!(!find_shortcut(
+        assert!(!BuiltinShortcut::FindInScrollback.matches(Key::Char('f'), Mods::default()));
+        assert!(!BuiltinShortcut::FindInScrollback.matches(
             Key::Char('f'),
             Mods {
                 ctrl: true,
@@ -5461,6 +5436,27 @@ mod tests {
         app.dispatch_palette(PaletteAction::OpenSettings);
         assert!(app.ui.settings_open());
         assert!(!app.find_open());
+    }
+
+    #[test]
+    fn palette_dispatches_find_and_fullscreen_through_app_actions() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+
+        app.dispatch_palette(PaletteAction::FindInScrollback);
+        assert!(app.find_open());
+
+        assert!(!app.fullscreen);
+        app.dispatch_palette(PaletteAction::ToggleFullscreen);
+        assert!(app.fullscreen);
+        app.dispatch_palette(PaletteAction::ToggleFullscreen);
+        assert!(!app.fullscreen);
     }
 
     #[test]

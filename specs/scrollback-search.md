@@ -11,9 +11,11 @@ terminal/egui ownership boundary, and general visual rules remain owned by
 
 ## Requirements
 
-- **FIND-001 (confirmed):** `Ctrl+F` must open a find overlay for the active tab
-  and focus its text input. Pressing `Ctrl+F` while it is already open must
-  focus and select the current query so it can be replaced immediately.
+- **FIND-001 (confirmed):** `Cmd+F` on macOS and `Ctrl+F` on Linux must open a
+  find overlay for the active tab and focus its text input. The command palette
+  must expose the same action as `Find in Scrollback`. Pressing the shortcut
+  while Find is already open must focus and select the current query so it can
+  be replaced immediately.
 - **FIND-002 (confirmed):** The default mode must perform case-insensitive
   literal substring matching across the active tab's in-memory scrollback and
   visible screen. Search data must never be persisted or sent over the network.
@@ -71,8 +73,9 @@ terminal/egui ownership boundary, and general visual rules remain owned by
 
 ## Acceptance criteria
 
-- **AC-FIND-A:** Populate more output than one viewport, press `Ctrl+F`, enter a
-  mixed-case fragment, and observe case-insensitive matches in both visible and
+- **AC-FIND-A:** Populate more output than one viewport, open Find with the
+  platform shortcut and again through the command palette, enter a mixed-case
+  fragment, and observe case-insensitive matches in both visible and
   scrolled-off output. Visible non-active matches use a dimmer fill while the
   active match retains its stronger fill and underline. Next/Previous wrap and
   scroll each active match into view; `Enter` and `Shift+Enter` perform the same
