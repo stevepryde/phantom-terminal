@@ -862,7 +862,6 @@ impl App {
                 let tracks_live_selection = active_tab
                     && !bytes.is_empty()
                     && self.find_selection_scope_tracks_live_selection();
-                self.find_worker.advance(tab, &bytes, active_tab);
                 if active_tab && !bytes.is_empty() {
                     self.find_request_generation = None;
                     self.find_pending = false;
@@ -882,6 +881,7 @@ impl App {
                         self.show_notice(format!("Could not reply to terminal query: {error}"));
                     }
                 }
+                self.find_worker.advance(tab, bytes, active_tab);
                 if active_tab {
                     // Debounced rather than refreshed inline: a full-history
                     // search per drained PTY chunk stalls the event loop.
@@ -1132,9 +1132,16 @@ impl App {
             return;
         };
         let tab_id = tab.id;
-        let generation = self
+        let Some(generation) = self
             .find_worker
-            .submit(tab_id, query, search_options, scope);
+            .submit(tab_id, query, search_options, scope)
+        else {
+            self.find_request_generation = None;
+            self.find_pending = false;
+            self.apply_find_result(Ok(SearchOutcome::default()));
+            self.show_notice("Scrollback find worker is unavailable");
+            return;
+        };
         self.find_request_generation = Some(generation);
         self.find_pending = true;
     }
@@ -4786,7 +4793,8 @@ mod tests {
             .matches;
         app.tabs.push(tab);
         app.find_worker.create(0, 4, 40, 100, CursorShape::Block);
-        app.find_worker.advance(0, b"target gap target", false);
+        app.find_worker
+            .advance(0, b"target gap target".to_vec(), false);
 
         app.open_find();
         app.ui.configure_find_for_tests("target", true);
@@ -4840,7 +4848,7 @@ mod tests {
         let captured = tab.core.selection_range().unwrap();
         app.tabs.push(tab);
         app.find_worker.create(0, 2, 20, 2, CursorShape::Block);
-        app.find_worker.advance(0, b"target", false);
+        app.find_worker.advance(0, b"target".to_vec(), false);
         app.open_find();
         app.ui.configure_find_for_tests("target", true);
 

@@ -30,6 +30,7 @@ use crate::{
 };
 
 const PHANTOM_SEMANTIC_ESCAPE_CHARS: &str = "\t !\"#$%&'()*+,./:;<=>?@[\\]^`{|}~│";
+const SEARCH_CHUNK_LINES: i32 = 256;
 
 /// Buffers bytes the terminal wants written back to the PTY. `send_event` takes
 /// `&self`, so interior mutability is required; `Rc<RefCell<…>>` is fine because
@@ -80,6 +81,17 @@ fn search_term<T: EventListener>(
     compiled: &mut CompiledSearch,
     cancelled: &AtomicBool,
 ) -> Option<SearchOutcome> {
+    search_term_with_chunk_observer(term, size, range, compiled, cancelled, || {})
+}
+
+fn search_term_with_chunk_observer<T: EventListener, F: FnMut()>(
+    term: &Term<T>,
+    size: TermDimensions,
+    range: SearchRange,
+    compiled: &mut CompiledSearch,
+    cancelled: &AtomicBool,
+    mut on_chunk: F,
+) -> Option<SearchOutcome> {
     let start = to_point(range.start);
     let end = to_point(range.end);
     if start > end {
@@ -88,35 +100,74 @@ fn search_term<T: EventListener>(
 
     let mut matches = Vec::new();
     let mut capped = false;
-    let mut origin = start;
-    while origin <= end {
+    let mut chunk_start = start;
+    while chunk_start <= end {
+        on_chunk();
         if cancelled.load(Ordering::Acquire) {
             return None;
         }
-        let Some(found) = term.regex_search_right(&mut compiled.regex, origin, end) else {
-            break;
-        };
-        let found_start = *found.start();
-        let found_end = *found.end();
-        if found_start < start || found_end > end {
-            break;
-        }
-        let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
-        if !compiled.options.whole_word || is_whole_word_match(term, size, found_range) {
-            if matches.len() >= MAX_SEARCH_MATCHES {
-                capped = true;
+        let chunk_end = search_chunk_end(term, size, chunk_start, end);
+        let mut origin = chunk_start;
+        while origin <= chunk_end {
+            if cancelled.load(Ordering::Acquire) {
+                return None;
+            }
+            let Some(found) = term.regex_search_right(&mut compiled.regex, origin, chunk_end)
+            else {
+                break;
+            };
+            let found_start = *found.start();
+            let found_end = *found.end();
+            if found_start < chunk_start || found_end > chunk_end {
                 break;
             }
-            matches.push(SearchMatch { range: found_range });
-        }
+            let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
+            if !compiled.options.whole_word || is_whole_word_match(term, size, found_range) {
+                // Only report the cap once a further real match exists.
+                if matches.len() >= MAX_SEARCH_MATCHES {
+                    capped = true;
+                    break;
+                }
+                matches.push(SearchMatch { range: found_range });
+            }
 
-        let Some(next) = point_after(size, found_end, end) else {
+            let Some(next) = point_after(size, found_end, chunk_end) else {
+                break;
+            };
+            origin = next;
+        }
+        if capped {
+            break;
+        }
+        let Some(next_chunk) = point_after(size, chunk_end, end) else {
             break;
         };
-        origin = next;
+        chunk_start = next_chunk;
     }
 
     (!cancelled.load(Ordering::Acquire)).then_some(SearchOutcome { matches, capped })
+}
+
+fn search_chunk_end<T: EventListener>(
+    term: &Term<T>,
+    size: TermDimensions,
+    start: Point,
+    end: Point,
+) -> Point {
+    let mut line = Line((start.line.0 + SEARCH_CHUNK_LINES - 1).min(end.line.0));
+    let last_column = Column(size.columns.saturating_sub(1));
+    while line < end.line
+        && term.grid()[Point::new(line, last_column)]
+            .flags
+            .contains(Flags::WRAPLINE)
+    {
+        line += 1;
+    }
+    if line == end.line {
+        end
+    } else {
+        Point::new(line, last_column)
+    }
 }
 
 /// Cell dimensions handed to `Term` (scrollback depth comes from `Config`).
@@ -1351,6 +1402,35 @@ mod tests {
             assert!(snapshot.cells.iter().any(|cell| cell.selected));
             assert_eq!(term.selection_range(), Some(captured));
         }
+    }
+
+    #[test]
+    fn cancelled_search_stops_at_the_next_logical_line_chunk() {
+        let mut term = core(4, 20, 1_000);
+        for _ in 0..600 {
+            term.advance(b"ordinary output\r\n");
+        }
+        let range = term.full_search_range();
+        let mut compiled = CompiledSearch::new("not present", SearchOptions::default()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut chunks = 0;
+
+        let result = search_term_with_chunk_observer(
+            &term.term,
+            term.size,
+            range,
+            &mut compiled,
+            &cancelled,
+            || {
+                chunks += 1;
+                if chunks == 2 {
+                    cancelled.store(true, Ordering::Release);
+                }
+            },
+        );
+
+        assert!(result.is_none());
+        assert_eq!(chunks, 2);
     }
 
     #[test]

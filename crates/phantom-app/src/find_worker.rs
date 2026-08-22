@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 
 use phantom_emu::{
@@ -11,6 +11,8 @@ use phantom_emu::{
 };
 
 use crate::{AppEvent, PtyOutbox};
+
+const FIND_COMMAND_CAPACITY: usize = 16;
 
 enum FindCommand {
     Create {
@@ -53,6 +55,42 @@ pub(crate) struct FindResponse {
     pub result: Result<SearchOutcome, SearchError>,
 }
 
+struct ResponseSlot {
+    value: Mutex<Option<FindResponse>>,
+    ready: Condvar,
+}
+
+impl ResponseSlot {
+    fn new() -> Self {
+        Self {
+            value: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, response: FindResponse) {
+        *self.value.lock().expect("find response mutex poisoned") = Some(response);
+        self.ready.notify_one();
+    }
+
+    fn take(&self) -> Option<FindResponse> {
+        self.value
+            .lock()
+            .expect("find response mutex poisoned")
+            .take()
+    }
+
+    #[cfg(test)]
+    fn take_timeout(&self, timeout: std::time::Duration) -> Option<FindResponse> {
+        let value = self.value.lock().expect("find response mutex poisoned");
+        let (mut value, _) = self
+            .ready
+            .wait_timeout_while(value, timeout, |value| value.is_none())
+            .expect("find response mutex poisoned");
+        value.take()
+    }
+}
+
 enum CachedCompile {
     Ready(Box<CompiledSearch>),
     Invalid {
@@ -76,8 +114,9 @@ impl CachedCompile {
 }
 
 pub(crate) struct FindWorker {
-    tx: mpsc::Sender<FindCommand>,
-    rx: mpsc::Receiver<FindResponse>,
+    tx: Option<mpsc::SyncSender<FindCommand>>,
+    response: Arc<ResponseSlot>,
+    thread: Option<thread::JoinHandle<()>>,
     generation: u64,
     cancellation: Option<Arc<AtomicBool>>,
     #[cfg(test)]
@@ -86,16 +125,19 @@ pub(crate) struct FindWorker {
 
 impl FindWorker {
     pub fn new(outbox: Arc<dyn PtyOutbox>) -> Self {
-        let (tx, commands) = mpsc::channel();
-        let (responses, rx) = mpsc::channel();
+        let (tx, commands) = mpsc::sync_channel(FIND_COMMAND_CAPACITY);
+        let response = Arc::new(ResponseSlot::new());
+        let worker_response = Arc::clone(&response);
         let compile_count = Arc::new(AtomicUsize::new(0));
         let worker_compile_count = Arc::clone(&compile_count);
-        let _ = thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("scrollback-find".to_string())
-            .spawn(move || run_worker(commands, responses, outbox, worker_compile_count));
+            .spawn(move || run_worker(commands, worker_response, outbox, worker_compile_count))
+            .ok();
         Self {
-            tx,
-            rx,
+            tx: thread.as_ref().map(|_| tx),
+            response,
+            thread,
             generation: 0,
             cancellation: None,
             #[cfg(test)]
@@ -104,14 +146,14 @@ impl FindWorker {
     }
 
     pub fn create(
-        &self,
+        &mut self,
         tab: u64,
         rows: u16,
         cols: u16,
         scrollback_lines: u32,
         cursor_shape: CursorShape,
     ) {
-        let _ = self.tx.send(FindCommand::Create {
+        self.send(FindCommand::Create {
             tab,
             rows,
             cols,
@@ -120,34 +162,31 @@ impl FindWorker {
         });
     }
 
-    pub fn advance(&mut self, tab: u64, bytes: &[u8], cancel_search: bool) {
+    pub fn advance(&mut self, tab: u64, bytes: Vec<u8>, cancel_search: bool) {
         if bytes.is_empty() {
             return;
         }
         if cancel_search {
             self.cancel();
         }
-        let _ = self.tx.send(FindCommand::Advance {
-            tab,
-            bytes: bytes.to_vec(),
-        });
+        self.send(FindCommand::Advance { tab, bytes });
     }
 
     pub fn resize(&mut self, tab: u64, rows: u16, cols: u16) {
         self.cancel();
-        let _ = self.tx.send(FindCommand::Resize { tab, rows, cols });
+        self.send(FindCommand::Resize { tab, rows, cols });
     }
 
     pub fn set_options(&mut self, scrollback_lines: u32, cursor_shape: CursorShape) {
         self.cancel();
-        let _ = self.tx.send(FindCommand::SetOptions {
+        self.send(FindCommand::SetOptions {
             scrollback_lines,
             cursor_shape,
         });
     }
 
     pub fn remove(&mut self, tab: u64) {
-        let _ = self.tx.send(FindCommand::Remove { tab });
+        self.send(FindCommand::Remove { tab });
     }
 
     pub fn submit(
@@ -156,21 +195,24 @@ impl FindWorker {
         query: String,
         options: SearchOptions,
         scope: Option<SearchRange>,
-    ) -> u64 {
+    ) -> Option<u64> {
         self.cancel();
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let cancelled = Arc::new(AtomicBool::new(false));
         self.cancellation = Some(Arc::clone(&cancelled));
-        let _ = self.tx.send(FindCommand::Search(FindRequest {
+        if !self.send(FindCommand::Search(FindRequest {
             generation,
             tab,
             query,
             options,
             scope,
             cancelled,
-        }));
-        generation
+        })) {
+            self.cancellation = None;
+            return None;
+        }
+        Some(generation)
     }
 
     pub fn cancel(&mut self) {
@@ -180,23 +222,44 @@ impl FindWorker {
     }
 
     pub fn try_recv(&self) -> Option<FindResponse> {
-        self.rx.try_recv().ok()
+        self.response.take()
     }
 
     #[cfg(test)]
     pub(crate) fn recv_timeout(&self, timeout: std::time::Duration) -> Option<FindResponse> {
-        self.rx.recv_timeout(timeout).ok()
+        self.response.take_timeout(timeout)
     }
 
     #[cfg(test)]
     fn compile_count(&self) -> usize {
         self.compile_count.load(Ordering::Relaxed)
     }
+
+    fn send(&mut self, command: FindCommand) -> bool {
+        let Some(tx) = &self.tx else {
+            return false;
+        };
+        if tx.send(command).is_ok() {
+            true
+        } else {
+            self.tx = None;
+            false
+        }
+    }
+}
+
+impl Drop for FindWorker {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn run_worker(
     commands: mpsc::Receiver<FindCommand>,
-    responses: mpsc::Sender<FindResponse>,
+    response: Arc<ResponseSlot>,
     outbox: Arc<dyn PtyOutbox>,
     compile_count: Arc<AtomicUsize>,
 ) {
@@ -269,15 +332,10 @@ fn run_worker(
                 if request.cancelled.load(Ordering::Acquire) {
                     continue;
                 }
-                if responses
-                    .send(FindResponse {
-                        generation: request.generation,
-                        result,
-                    })
-                    .is_err()
-                {
-                    continue;
-                }
+                response.publish(FindResponse {
+                    generation: request.generation,
+                    result,
+                });
                 if !outbox.send(AppEvent::FindWake) {
                     break;
                 }
@@ -298,7 +356,7 @@ mod tests {
     }
 
     fn worker() -> FindWorker {
-        let worker = FindWorker::new(Arc::new(NoopOutbox));
+        let mut worker = FindWorker::new(Arc::new(NoopOutbox));
         worker.create(7, 4, 40, 100, CursorShape::Block);
         worker
     }
@@ -307,12 +365,14 @@ mod tests {
     fn replica_preserves_matches_and_reuses_exact_compile_keys() {
         let mut worker = worker();
         let bytes = "alpha ALPHA 世界\r\nwrapped alpha".as_bytes();
-        worker.advance(7, bytes, true);
+        worker.advance(7, bytes.to_vec(), true);
         worker.resize(7, 6, 18);
         let mut authoritative = AlacrittyCore::new(4, 40, 100, CursorShape::Block);
         authoritative.advance(bytes);
         authoritative.resize(6, 18);
-        worker.submit(7, "alpha".into(), SearchOptions::default(), None);
+        worker
+            .submit(7, "alpha".into(), SearchOptions::default(), None)
+            .unwrap();
         let result = worker
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap()
@@ -324,7 +384,9 @@ mod tests {
                 .search_scrollback("alpha", SearchOptions::default(), None)
                 .unwrap()
         );
-        worker.submit(7, "alpha".into(), SearchOptions::default(), None);
+        worker
+            .submit(7, "alpha".into(), SearchOptions::default(), None)
+            .unwrap();
         assert_eq!(
             worker
                 .recv_timeout(std::time::Duration::from_secs(2))
@@ -340,7 +402,7 @@ mod tests {
             case_sensitive: true,
             ..SearchOptions::default()
         };
-        worker.submit(7, "alpha".into(), options, None);
+        worker.submit(7, "alpha".into(), options, None).unwrap();
         assert_eq!(
             worker
                 .recv_timeout(std::time::Duration::from_secs(2))
@@ -357,14 +419,14 @@ mod tests {
     #[test]
     fn replica_tracks_mutations_and_caches_invalid_regex() {
         let mut worker = worker();
-        worker.advance(7, "wide 世界 wrapped target".repeat(4).as_bytes(), true);
+        worker.advance(7, "wide 世界 wrapped target".repeat(4).into_bytes(), true);
         worker.resize(7, 6, 20);
         let options = SearchOptions {
             regex: true,
             ..SearchOptions::default()
         };
         for _ in 0..2 {
-            worker.submit(7, "[".into(), options, None);
+            worker.submit(7, "[".into(), options, None).unwrap();
             assert!(worker
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap()
@@ -377,7 +439,7 @@ mod tests {
     #[test]
     fn newer_request_cancels_older_generation() {
         let (command_tx, command_rx) = mpsc::channel();
-        let (response_tx, response_rx) = mpsc::channel();
+        let response = Arc::new(ResponseSlot::new());
         command_tx
             .send(FindCommand::Create {
                 tab: 7,
@@ -418,13 +480,46 @@ mod tests {
 
         run_worker(
             command_rx,
-            response_tx,
+            Arc::clone(&response),
             Arc::new(NoopOutbox),
             Arc::new(AtomicUsize::new(0)),
         );
 
-        let responses: Vec<_> = response_rx.try_iter().collect();
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0].generation, 2);
+        assert_eq!(response.take().unwrap().generation, 2);
+        assert!(response.take().is_none());
+    }
+
+    #[test]
+    fn command_queue_and_response_storage_are_bounded() {
+        let (tx, _rx) = mpsc::sync_channel(FIND_COMMAND_CAPACITY);
+        for tab in 0..FIND_COMMAND_CAPACITY as u64 {
+            tx.try_send(FindCommand::Remove { tab }).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(FindCommand::Remove { tab: u64::MAX }),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+
+        let response = ResponseSlot::new();
+        response.publish(FindResponse {
+            generation: 1,
+            result: Ok(SearchOutcome::default()),
+        });
+        response.publish(FindResponse {
+            generation: 2,
+            result: Ok(SearchOutcome::default()),
+        });
+        assert_eq!(response.take().unwrap().generation, 2);
+        assert!(response.take().is_none());
+    }
+
+    #[test]
+    fn failed_command_submission_is_reported() {
+        let mut worker = worker();
+        worker.tx = None;
+        assert!(worker
+            .submit(7, "target".into(), SearchOptions::default(), None)
+            .is_none());
+        assert!(worker.cancellation.is_none());
     }
 }
