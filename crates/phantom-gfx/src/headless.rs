@@ -24,6 +24,13 @@ pub struct Image {
     pixels: Vec<u8>,
 }
 
+/// Optional terminal-pane layers used by headless renderer tests.
+#[derive(Clone, Copy, Default)]
+pub struct TerminalBackground<'a> {
+    pub backdrop: Option<(&'a str, u8)>,
+    pub wash: Option<[[u8; 4]; 4]>,
+}
+
 impl Image {
     /// Tightly-packed RGBA bytes (`width * height * 4`).
     pub fn rgba(&self) -> &[u8] {
@@ -118,7 +125,31 @@ impl Harness {
 
     /// Render a snapshot (terminal grid at the origin) and read it back.
     pub fn render_snapshot(&mut self, snapshot: &Snapshot, cursor_on: bool) -> Image {
+        self.render_snapshot_with_background(snapshot, cursor_on, TerminalBackground::default())
+    }
+
+    /// Render a snapshot with the real terminal-pane background stack.
+    pub fn render_snapshot_with_background(
+        &mut self,
+        snapshot: &Snapshot,
+        cursor_on: bool,
+        background: TerminalBackground<'_>,
+    ) -> Image {
         self.renderer.begin();
+        if let Some((name, opacity)) = background.backdrop {
+            self.renderer.draw_terminal_backdrop(
+                name,
+                opacity,
+                0.0,
+                0.0,
+                self.width as f32,
+                self.height as f32,
+            );
+        }
+        if let Some(wash) = background.wash {
+            self.renderer
+                .draw_terminal_wash(wash, 0.0, 0.0, self.width as f32, self.height as f32);
+        }
         self.renderer
             .draw_terminal(&self.queue, snapshot, cursor_on, 0.0, 0.0);
         self.renderer.end(&self.device, &self.queue);

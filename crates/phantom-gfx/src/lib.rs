@@ -387,6 +387,12 @@ impl Renderer {
         self.backdrop.draw(name, opacity_percent, x, y, w, h);
     }
 
+    /// Draw a translucent terminal-theme wash above the optional backdrop
+    /// image and below terminal cells, selection, cursor, and glyphs.
+    pub fn draw_terminal_wash(&mut self, corners: [Rgba; 4], x: f32, y: f32, w: f32, h: f32) {
+        self.fill_rect_gradient(x, y, w, h, corners);
+    }
+
     /// Draw monospace `s` with its top-left at `(x, y)` in the current layer.
     /// Returns the advance width. Wide characters (CJK, emoji) advance two
     /// cells, matching the grid — IME preedit and tab titles overlap otherwise.
@@ -651,8 +657,9 @@ impl Renderer {
         let [base_solids, overlay_solids] = self.solid_counts;
         let [base_glyphs, overlay_glyphs] = self.glyph_counts;
 
-        // Draw order = compositing order: terminal backdrop, base solids, base
-        // glyphs, then the overlay layer on top.
+        // Draw order = compositing order: terminal backdrop, base solids
+        // (including the theme wash and cell backgrounds), base glyphs, then
+        // the overlay layer on top.
         self.backdrop.render(pass, &self.uniform_bind_group);
         self.draw_solids(pass, 0..base_solids);
         self.draw_glyphs(pass, 0..base_glyphs);

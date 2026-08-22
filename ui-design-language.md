@@ -77,7 +77,11 @@ Image opacity is a separate bounded setting from `0` to `60` and is applied as
 actual percent opacity by the native renderer. Disable the slider when the
 selected backdrop is `None`. Draw the backdrop across the full terminal pane
 behind the `8px` terminal text inset, with terminal cells, cursor, selection,
-IME, chrome, and overlays composited above it.
+IME, chrome, and overlays composited above it. For decorative UI themes, draw
+the theme's wash above the optional image but below terminal cell backgrounds,
+selection, cursor, and glyphs. Each wash stop must remain at or below 5% opacity
+so it tints empty/default-background cells without rewriting ANSI colours or
+reducing text contrast. Phantom remains neutral with no wash.
 
 | Backdrop | Rule |
 | --- | --- |

@@ -3640,6 +3640,15 @@ impl App {
             terminal_pane.w,
             terminal_pane.h,
         );
+        if let Some(wash) = themes::ui_theme_terminal_wash(&self.config.ui_theme) {
+            renderer.draw_terminal_wash(
+                wash,
+                terminal_pane.x,
+                terminal_pane.y,
+                terminal_pane.w,
+                terminal_pane.h,
+            );
+        }
         let hits = chrome::draw_tab_bar(
             renderer,
             &gpu.queue,
