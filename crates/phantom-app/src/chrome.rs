@@ -6,6 +6,8 @@ use std::time::Instant;
 use phantom_emu::ScrollState;
 use phantom_gfx::Renderer;
 
+use crate::ui_components::DIVIDER_RGBA;
+
 const PAD: f32 = 8.0;
 const CLOSE_W: f32 = 16.0;
 const NEW_TAB_W: f32 = 30.0;
@@ -34,6 +36,8 @@ const WINDOW_RESIZE_EDGE_W: f32 = 5.0;
 const WINDOW_RESIZE_CORNER_LEN: f32 = 12.0;
 const HOVER_FADE_SECONDS: f32 = 0.14;
 const HOVER_EPSILON: f32 = 0.01;
+const TAB_ACTIVE_EDGE_W: f32 = 2.0;
+const TAB_SEPARATOR_W: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -778,6 +782,7 @@ pub fn draw_tab_bar(
                 cell_w,
                 layout.scale_factor,
                 true,
+                i > 0,
                 hover,
                 dragging,
                 editing,
@@ -912,6 +917,7 @@ pub fn draw_tab_bar(
                 cell_w,
                 layout.scale_factor,
                 false,
+                i > 0,
                 hover,
                 dragging,
                 editing,
@@ -1600,7 +1606,8 @@ fn draw_tab_label(
     colors: &ChromeColors,
     cell_w: f32,
     scale_factor: f32,
-    underline_accent: bool,
+    horizontal: bool,
+    separated: bool,
     hover: f32,
     dragging: bool,
     editing: Option<&str>,
@@ -1615,20 +1622,28 @@ fn draw_tab_label(
             with_alpha(colors.text, (22.0 * hover) as u8),
         );
     }
+    if separated {
+        let separator = tab_separator_rect(rect, horizontal, scale_factor);
+        r.fill_rect(
+            separator.x,
+            separator.y,
+            separator.w,
+            separator.h,
+            DIVIDER_RGBA,
+        );
+    }
     if dragging {
         draw_drag_source(r, rect, colors);
     }
-    if active && underline_accent {
-        let underline_h = 2.0 * scale_factor;
+    if active {
+        let indicator = active_tab_indicator_rect(rect, horizontal, scale_factor);
         r.fill_rect(
-            rect.x,
-            rect.y + rect.h - underline_h,
-            rect.w,
-            underline_h,
+            indicator.x,
+            indicator.y,
+            indicator.w,
+            indicator.h,
             colors.accent,
         );
-    } else if active {
-        r.fill_rect(rect.x, rect.y, 2.0 * scale_factor, rect.h, colors.accent);
     }
     let pad = PAD * scale_factor;
     let close_w = CLOSE_W * scale_factor;
@@ -1649,6 +1664,44 @@ fn draw_tab_label(
         ),
     };
     r.text(queue, rect.x + pad, rect.y + pad, &label, text_color);
+}
+
+fn active_tab_indicator_rect(rect: Rect, horizontal: bool, scale_factor: f32) -> Rect {
+    let width = TAB_ACTIVE_EDGE_W * scale_factor;
+    if horizontal {
+        Rect {
+            x: rect.x,
+            y: rect.y + rect.h - width,
+            w: rect.w,
+            h: width,
+        }
+    } else {
+        Rect {
+            x: rect.x + rect.w - width,
+            y: rect.y,
+            w: width,
+            h: rect.h,
+        }
+    }
+}
+
+fn tab_separator_rect(rect: Rect, horizontal: bool, scale_factor: f32) -> Rect {
+    let width = TAB_SEPARATOR_W * scale_factor;
+    if horizontal {
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            w: width,
+            h: rect.h,
+        }
+    } else {
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: width,
+        }
+    }
 }
 
 fn draw_drag_source(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
@@ -1844,6 +1897,53 @@ mod tests {
 
         assert!(l.bar.w < VERTICAL_BAR_W);
         assert_eq!(l.viewport.w, MIN_VERTICAL_VIEWPORT_W);
+    }
+
+    #[test]
+    fn tab_decorations_follow_layout_edges_and_scale() {
+        let rect = Rect {
+            x: 40.0,
+            y: 60.0,
+            w: 200.0,
+            h: 64.0,
+        };
+
+        assert_eq!(
+            active_tab_indicator_rect(rect, true, 2.0),
+            Rect {
+                x: 40.0,
+                y: 120.0,
+                w: 200.0,
+                h: 4.0,
+            }
+        );
+        assert_eq!(
+            tab_separator_rect(rect, true, 2.0),
+            Rect {
+                x: 40.0,
+                y: 60.0,
+                w: 2.0,
+                h: 64.0,
+            }
+        );
+        assert_eq!(
+            active_tab_indicator_rect(rect, false, 2.0),
+            Rect {
+                x: 236.0,
+                y: 60.0,
+                w: 4.0,
+                h: 64.0,
+            }
+        );
+        assert_eq!(
+            tab_separator_rect(rect, false, 2.0),
+            Rect {
+                x: 40.0,
+                y: 60.0,
+                w: 200.0,
+                h: 2.0,
+            }
+        );
     }
 
     #[test]
