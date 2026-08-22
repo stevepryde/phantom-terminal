@@ -21,7 +21,7 @@ pub const REGULAR: usize = 0;
 pub const BOLD: usize = 1;
 pub const ITALIC: usize = 2;
 pub const BOLD_ITALIC: usize = 3;
-const STYLE_SLOTS: usize = 4;
+pub(crate) const STYLE_SLOTS: usize = 4;
 
 const TERMINAL_FONT_FALLBACKS: &[&str] = &[
     "JetBrainsMono Nerd Font Mono",

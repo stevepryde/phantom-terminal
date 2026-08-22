@@ -22,10 +22,10 @@ use bytemuck::{Pod, Zeroable};
 use phantom_core::AppConfig;
 use phantom_emu::{CursorShape, Snapshot};
 
-use atlas::{GlyphAtlas, GlyphKey};
+use atlas::{GlyphAtlas, GlyphEntry, GlyphKey};
 use backdrop::BackdropRenderer;
 pub use font::available_terminal_font_families;
-use font::{face_slot, FontSet, REGULAR};
+use font::{face_slot, FontSet, REGULAR, STYLE_SLOTS};
 use palette::{Palette, Rgba};
 
 const ATLAS_SIZE: u32 = 2048;
@@ -36,6 +36,36 @@ const INITIAL_INSTANCE_CAP: u64 = 4096;
 
 const LAYER_BASE: usize = 0;
 const LAYER_OVERLAY: usize = 1;
+const ASCII_GLYPHS: usize = 128;
+
+struct AsciiGlyphCache {
+    entries: [[Option<GlyphEntry>; ASCII_GLYPHS]; STYLE_SLOTS],
+}
+
+impl AsciiGlyphCache {
+    fn new() -> Self {
+        Self {
+            entries: [[None; ASCII_GLYPHS]; STYLE_SLOTS],
+        }
+    }
+
+    #[inline]
+    fn get(&self, slot: usize, ch: char) -> Option<GlyphEntry> {
+        ch.is_ascii()
+            .then(|| self.entries[slot.min(STYLE_SLOTS - 1)][ch as usize])
+            .flatten()
+    }
+
+    fn insert(&mut self, slot: usize, ch: char, entry: GlyphEntry) {
+        if ch.is_ascii() {
+            self.entries[slot.min(STYLE_SLOTS - 1)][ch as usize] = Some(entry);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries = [[None; ASCII_GLYPHS]; STYLE_SLOTS];
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -72,6 +102,9 @@ pub struct Renderer {
     palette: Palette,
     font: FontSet,
     atlas: GlyphAtlas,
+    // Atlas repacks clear this table in `begin`; font changes replace the
+    // renderer, so entries never outlive either source of their glyph UVs.
+    ascii_glyphs: AsciiGlyphCache,
     backdrop: BackdropRenderer,
 
     solid_pipeline: wgpu::RenderPipeline,
@@ -223,6 +256,7 @@ impl Renderer {
             palette,
             font,
             atlas,
+            ascii_glyphs: AsciiGlyphCache::new(),
             backdrop,
             solid_pipeline,
             glyph_pipeline,
@@ -317,7 +351,9 @@ impl Renderer {
         // An atlas eviction deferred from an overflow last frame lands here,
         // before any glyph instance is emitted — instances must never outlive
         // the packing their UVs reference.
-        self.atlas.begin_frame();
+        if self.atlas.begin_frame() {
+            self.ascii_glyphs.clear();
+        }
         for layer in 0..2 {
             self.solids[layer].clear();
             self.glyphs[layer].clear();
@@ -559,6 +595,10 @@ impl Renderer {
         baseline_y: f32,
         color: Rgba,
     ) {
+        if let Some(entry) = self.ascii_glyphs.get(slot, ch) {
+            self.emit_glyph_entry(entry, pen_x, baseline_y, color);
+            return;
+        }
         let Some(resolved) = self.font.resolve_glyph(slot, ch) else {
             return;
         };
@@ -566,13 +606,23 @@ impl Renderer {
             face: resolved.face,
             glyph_id: resolved.glyph_id,
         };
-        let entry = match self.atlas.get(key) {
-            Some(entry) => entry,
+        let (entry, cacheable) = match self.atlas.get(key) {
+            Some(entry) => (entry, true),
             None => match self.font.rasterize(resolved) {
-                Some(raster) => self.atlas.insert(queue, key, &raster),
-                None => self.atlas.insert_failed(key),
+                Some(raster) => {
+                    let entry = self.atlas.insert(queue, key, &raster);
+                    (entry, self.atlas.get(key).is_some())
+                }
+                None => (self.atlas.insert_failed(key), true),
             },
         };
+        if cacheable {
+            self.ascii_glyphs.insert(slot, ch, entry);
+        }
+        self.emit_glyph_entry(entry, pen_x, baseline_y, color);
+    }
+
+    fn emit_glyph_entry(&mut self, entry: GlyphEntry, pen_x: f32, baseline_y: f32, color: Rgba) {
         if !entry.empty {
             let gx = (pen_x + entry.left as f32).round();
             let gy = (baseline_y - entry.top as f32).round();
@@ -853,4 +903,71 @@ fn dim(c: Rgba) -> Rgba {
         (c[2] as f32 * 0.66) as u8,
         c[3],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(marker: f32, page: u32) -> GlyphEntry {
+        GlyphEntry {
+            uv_min: [marker, 0.0],
+            uv_max: [marker, 1.0],
+            left: 0,
+            top: 0,
+            width: 1,
+            height: 1,
+            is_color: false,
+            page,
+            empty: false,
+        }
+    }
+
+    #[test]
+    fn ascii_cache_is_direct_mapped_and_style_specific() {
+        let mut cache = AsciiGlyphCache::new();
+        cache.insert(REGULAR, 'A', entry(1.0, 0));
+        cache.insert(font::BOLD, 'A', entry(2.0, 1));
+
+        assert_eq!(
+            cache.get(REGULAR, 'A').map(|item| item.uv_min[0]),
+            Some(1.0)
+        );
+        assert_eq!(
+            cache.get(font::BOLD, 'A').map(|item| item.uv_min[0]),
+            Some(2.0)
+        );
+        assert_eq!(cache.get(font::BOLD, 'A').map(|item| item.page), Some(1));
+        assert!(cache.get(font::ITALIC, 'A').is_none());
+    }
+
+    #[test]
+    fn ascii_cache_leaves_unicode_to_the_existing_fallback() {
+        let mut cache = AsciiGlyphCache::new();
+        cache.insert(REGULAR, '❯', entry(1.0, 1));
+
+        assert!(cache.get(REGULAR, '❯').is_none());
+    }
+
+    #[test]
+    fn ascii_cache_clear_invalidates_every_style() {
+        let mut cache = AsciiGlyphCache::new();
+        for slot in 0..STYLE_SLOTS {
+            cache.insert(slot, 'x', entry(slot as f32, 1));
+        }
+
+        cache.clear();
+
+        for slot in 0..STYLE_SLOTS {
+            assert!(cache.get(slot, 'x').is_none());
+        }
+    }
+
+    #[test]
+    fn ascii_cache_storage_is_fixed() {
+        assert_eq!(
+            std::mem::size_of::<AsciiGlyphCache>(),
+            STYLE_SLOTS * ASCII_GLYPHS * std::mem::size_of::<Option<GlyphEntry>>()
+        );
+    }
 }

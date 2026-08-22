@@ -122,12 +122,15 @@ impl AtlasIndex {
 
     /// Apply a deferred evict-and-repack. Must run before any glyph is placed
     /// this frame so no emitted instance ever references the old packing.
-    fn begin_frame(&mut self) {
+    fn begin_frame(&mut self) -> bool {
         if self.pending_reset {
             self.pending_reset = false;
             self.packers.clear();
             self.packers.push(ShelfPacker::new(self.size, self.size));
             self.cache.clear();
+            true
+        } else {
+            false
         }
     }
 
@@ -256,8 +259,8 @@ impl GlyphAtlas {
 
     /// Apply any eviction deferred from an overflow last frame. Call at the
     /// start of each frame, before any glyph is emitted.
-    pub fn begin_frame(&mut self) {
-        self.index.begin_frame();
+    pub fn begin_frame(&mut self) -> bool {
+        self.index.begin_frame()
     }
 
     /// Cache a rasterization failure as an empty entry so it isn't retried —
@@ -368,6 +371,7 @@ mod tests {
     #[test]
     fn full_atlas_failure_is_transient_and_succeeds_after_repack() {
         let mut idx = AtlasIndex::new(32, 1);
+        assert!(!idx.begin_frame());
         let (entry, upload) = idx.place(key(1), &raster(32, 32));
         assert!(!entry.empty && upload.is_some());
         // No space left: blank entry, no upload, and crucially not cached —
@@ -380,7 +384,7 @@ mod tests {
         assert!(idx.pending_reset);
         assert!(idx.cache.contains_key(&key(1)));
         // Next frame the repack frees space and the same glyph places.
-        idx.begin_frame();
+        assert!(idx.begin_frame());
         assert!(!idx.pending_reset);
         assert!(idx.cache.is_empty());
         let (entry, upload) = idx.place(key(2), &raster(8, 8));
@@ -414,7 +418,7 @@ mod tests {
         assert!(idx.pending_reset);
         assert_eq!(idx.cache.len(), 2);
 
-        idx.begin_frame();
+        assert!(idx.begin_frame());
         assert_eq!(idx.packers.len(), 1);
         assert!(idx.cache.is_empty());
         assert!(!idx.pending_reset);
