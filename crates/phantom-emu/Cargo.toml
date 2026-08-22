@@ -6,6 +6,9 @@ authors = ["Steve Pryde"]
 license = "MIT"
 edition = "2021"
 
+[lints]
+workspace = true
+
 # The terminal model lives behind the `VtCore` trait. Today it is backed by
 # `alacritty_terminal` (the Zed approach: borrow a battle-tested core, own the
 # renderer); the trait keeps the engine swappable (e.g. libghostty-vt) without

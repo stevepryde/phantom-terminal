@@ -6,6 +6,9 @@ authors = ["Steve Pryde"]
 license = "MIT"
 edition = "2021"
 
+[lints]
+workspace = true
+
 # Hand-rolled wgpu terminal renderer. Rasterizes the configured font with swash
 # (faces discovered via fontique) into a glyph atlas, then draws the grid with two
 # instanced pipelines: solid quads (backgrounds, cursor, underline/strike) and

@@ -2,6 +2,17 @@
 members = ["crates/phantom-core", "crates/phantom-emu", "crates/phantom-gfx", "crates/phantom-app"]
 resolver = "2"
 
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
 # Shared dependency versions for every workspace member. Members opt in with
 # `dep.workspace = true`, so a version bump happens in exactly one place.
 [workspace.dependencies]

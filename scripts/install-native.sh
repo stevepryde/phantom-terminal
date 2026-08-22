@@ -69,6 +69,18 @@ BIN_SRC="target/release/$BIN_NAME"
 
 OS="$(uname -s)"
 
+# Cargo requests symbol stripping through the release profile, but some Rust
+# toolchains leave the binary untouched when their optional rust-objcopy cannot
+# load. The native strip tool makes the install artifact deterministic.
+if command -v strip >/dev/null 2>&1; then
+  case "$OS" in
+    Darwin) strip "$BIN_SRC" ;;
+    Linux) strip --strip-all "$BIN_SRC" ;;
+  esac
+else
+  warn "native strip tool unavailable; relying on Cargo release-profile stripping."
+fi
+
 case "$OS" in
   Darwin)
     # Assemble a .app bundle around the binary by hand (cargo produces a plain
