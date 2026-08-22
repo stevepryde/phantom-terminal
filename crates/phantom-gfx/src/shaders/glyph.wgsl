@@ -7,7 +7,7 @@ struct Uniforms {
     _pad: vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(1) @binding(0) var atlas_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var atlas_samp: sampler;
 
 struct VsIn {
@@ -17,6 +17,7 @@ struct VsIn {
     @location(3) uv_max: vec2<f32>,
     @location(4) color: vec4<f32>,
     @location(5) is_color: f32,
+    @location(6) atlas_page: u32,
 };
 
 struct VsOut {
@@ -24,6 +25,7 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) is_color: f32,
+    @interpolate(flat) @location(3) atlas_page: u32,
 };
 
 @vertex
@@ -43,12 +45,13 @@ fn vs(@builtin(vertex_index) vi: u32, in: VsIn) -> VsOut {
     out.uv = in.uv_min + corner * (in.uv_max - in.uv_min);
     out.color = in.color;
     out.is_color = in.is_color;
+    out.atlas_page = in.atlas_page;
     return out;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let texel = textureSample(atlas_tex, atlas_samp, in.uv);
+    let texel = textureSample(atlas_tex, atlas_samp, in.uv, i32(in.atlas_page));
     if (in.is_color > 0.5) {
         return texel;
     }
