@@ -3175,7 +3175,6 @@ impl App {
                 return;
             }
         };
-        let at_shell_prompt = self.active_tab_at_shell_prompt();
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -3198,8 +3197,7 @@ impl App {
         }
         self.snap_active_terminal_to_prompt();
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.frequent_commands.prepare_line(at_shell_prompt);
-            tab.frequent_commands.observe_text(&text);
+            tab.frequent_commands.observe_paste();
         }
         if text.contains('\n') || text.contains('\r') {
             self.arm_cwd_polling(CWD_POLL_WINDOW);

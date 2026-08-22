@@ -71,6 +71,13 @@ impl FrequentCommands {
         }
     }
 
+    /// Clipboard content is not authoritative evidence of a command the user
+    /// executed. Mark the current line unreliable so a later Enter cannot
+    /// record either the paste or a typed prefix/suffix as a partial command.
+    pub fn observe_paste(&mut self) {
+        self.invalidate_current_line();
+    }
+
     pub fn observe_key(&mut self, key: Key, control: bool) {
         match (key, control) {
             (Key::Enter, _) => self.submit_current_line(),
@@ -234,6 +241,27 @@ mod tests {
         commands.observe_text("right");
         commands.observe_key(Key::Enter, false);
         assert_eq!(commands.top(), ["right"]);
+    }
+
+    #[test]
+    fn paste_content_and_partial_surrounding_text_are_never_recorded() {
+        let mut commands = FrequentCommands::default();
+        commands.prepare_line(true);
+        commands.observe_text("typed-prefix ");
+
+        // Paste content is deliberately not supplied to the tracker. This is
+        // the same for plain and bracketed multiline paste.
+        commands.observe_paste();
+        commands.observe_text("typed-suffix");
+        commands.observe_key(Key::Enter, false);
+        assert!(commands.top().is_empty());
+
+        // The real Enter resets the unreliable line, so the next command can
+        // be observed normally from a newly recognized prompt.
+        commands.prepare_line(true);
+        commands.observe_text("visible");
+        commands.observe_key(Key::Enter, false);
+        assert_eq!(commands.top(), ["visible"]);
     }
 
     #[test]
