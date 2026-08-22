@@ -9,6 +9,7 @@ trap 'rm -rf "$scratch"' EXIT
 
 new_fixture() {
   fixture=$1
+  package_name=${2:-phantom-core}
   mkdir -p "$fixture/crates/app/src"
   printf '%s\n' \
     '[workspace]' \
@@ -16,48 +17,169 @@ new_fixture() {
     'resolver = "2"' >"$fixture/Cargo.toml"
   printf '%s\n' \
     '[package]' \
-    'name = "fixture-app"' \
+    "name = \"$package_name\"" \
     'version = "0.1.0"' \
     'edition = "2021"' >"$fixture/crates/app/Cargo.toml"
   printf '%s\n' 'pub fn local_only() {}' >"$fixture/crates/app/src/lib.rs"
+}
+
+new_dependency() {
+  dependency=$1
+  package_name=$2
+  version=${3:-99.0.0}
+  mkdir -p "$dependency/src"
+  printf '%s\n' \
+    '[package]' \
+    "name = \"$package_name\"" \
+    "version = \"$version\"" \
+    'edition = "2021"' >"$dependency/Cargo.toml"
+  printf '%s\n' 'pub fn dependency() {}' >"$dependency/src/lib.rs"
 }
 
 run_gate() {
   PHANTOM_NO_NETWORK_ROOT=$1 "$gate"
 }
 
-echo "==> clean fixture passes"
+expect_failure() {
+  fixture=$1
+  expected=$2
+  if output=$(run_gate "$fixture" 2>&1); then
+    echo "fixture unexpectedly passed: $fixture" >&2
+    exit 1
+  fi
+  if ! grep -q "$expected" <<<"$output"; then
+    echo "$output" >&2
+    echo "fixture did not report expected finding: $expected" >&2
+    exit 1
+  fi
+}
+
+echo "==> harmless address types, comments, and strings pass"
 clean="$scratch/clean"
 new_fixture "$clean"
+printf '%s\n' \
+  'pub const EXAMPLE: &str = "std::net::TcpStream::connect";' \
+  '// std::net::UdpSocket::bind is forbidden in executable code.' \
+  'pub fn local_address(port: u16) -> std::net::SocketAddr {' \
+  '    std::net::SocketAddr::from(([127, 0, 0, 1], port))' \
+  '}' >"$clean/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$clean/Cargo.toml"
 run_gate "$clean"
 
-echo "==> renamed HTTP dependency fails"
-renamed="$scratch/renamed"
-dependency="$scratch/dependencies/reqwest-shim"
-new_fixture "$renamed"
-mkdir -p "$dependency/src"
+echo "==> workspace source outside crates is scanned"
+outside="$scratch/outside-crates"
+mkdir -p "$outside/components/core/src"
+printf '%s\n' \
+  '[workspace]' \
+  'members = ["components/core"]' \
+  'resolver = "2"' >"$outside/Cargo.toml"
 printf '%s\n' \
   '[package]' \
-  'name = "reqwest"' \
-  'version = "99.0.0"' \
-  'edition = "2021"' >"$dependency/Cargo.toml"
-printf '%s\n' 'pub fn request() {}' >"$dependency/src/lib.rs"
+  'name = "phantom-core"' \
+  'version = "0.1.0"' \
+  'edition = "2021"' >"$outside/components/core/Cargo.toml"
+printf '%s\n' 'pub fn bind() { let _ = std::net::UdpSocket::bind("127.0.0.1:0"); }' \
+  >"$outside/components/core/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$outside/Cargo.toml"
+expect_failure "$outside" 'direct socket API:'
+
+for client in reqwest minreq; do
+  echo "==> renamed $client dependency fails"
+  renamed="$scratch/renamed-$client"
+  dependency="$scratch/dependencies/$client-shim"
+  new_fixture "$renamed"
+  new_dependency "$dependency" "$client"
+  printf '%s\n' \
+    '[package]' \
+    'name = "phantom-core"' \
+    'version = "0.1.0"' \
+    'edition = "2021"' \
+    '' \
+    '[dependencies]' \
+    "transport = { package = \"$client\", path = \"../../../dependencies/$client-shim\" }" \
+    >"$renamed/crates/app/Cargo.toml"
+  cargo generate-lockfile --offline --manifest-path "$renamed/Cargo.toml"
+  expect_failure "$renamed" "resolved network client: $client"
+done
+
+echo "==> unreviewed direct dependency fails even with an unknown name"
+unknown="$scratch/unknown-client"
+unknown_dependency="$scratch/dependencies/innocent-wrapper"
+new_fixture "$unknown"
+new_dependency "$unknown_dependency" "innocent-wrapper"
 printf '%s\n' \
   '[package]' \
-  'name = "fixture-app"' \
+  'name = "phantom-core"' \
   'version = "0.1.0"' \
   'edition = "2021"' \
   '' \
   '[dependencies]' \
-  'transport = { package = "reqwest", path = "../../../dependencies/reqwest-shim" }' \
-  >"$renamed/crates/app/Cargo.toml"
-cargo generate-lockfile --offline --manifest-path "$renamed/Cargo.toml"
-if output=$(run_gate "$renamed" 2>&1); then
-  echo "renamed HTTP dependency unexpectedly passed" >&2
-  exit 1
-fi
-echo "$output" | grep -q 'resolved package: reqwest'
+  'helper = { package = "innocent-wrapper", path = "../../../dependencies/innocent-wrapper" }' \
+  >"$unknown/crates/app/Cargo.toml"
+cargo generate-lockfile --offline --manifest-path "$unknown/Cargo.toml"
+expect_failure "$unknown" 'unreviewed direct dependency: phantom-core -> innocent-wrapper'
+
+echo "==> unauthorized transitive socket transport fails"
+transitive="$scratch/transitive"
+wrapper="$scratch/dependencies/directories-wrapper"
+socket2="$scratch/dependencies/socket2-shim"
+new_fixture "$transitive"
+new_dependency "$wrapper" "directories"
+new_dependency "$socket2" "socket2"
+printf '%s\n' \
+  '[package]' \
+  'name = "directories"' \
+  'version = "99.0.0"' \
+  'edition = "2021"' \
+  '' \
+  '[dependencies]' \
+  'transport = { package = "socket2", path = "../socket2-shim" }' >"$wrapper/Cargo.toml"
+printf '%s\n' \
+  '[package]' \
+  'name = "phantom-core"' \
+  'version = "0.1.0"' \
+  'edition = "2021"' \
+  '' \
+  '[dependencies]' \
+  'directories = { path = "../../../dependencies/directories-wrapper" }' \
+  >"$transitive/crates/app/Cargo.toml"
+cargo generate-lockfile --offline --manifest-path "$transitive/Cargo.toml"
+expect_failure "$transitive" 'resolved socket transport: socket2'
+
+echo "==> approved AccessKit ancestry passes"
+accesskit="$scratch/accesskit"
+new_fixture "$accesskit" phantom-app
+for package in egui-winit accesskit_winit accesskit_unix; do
+  new_dependency "$scratch/dependencies/$package" "$package" 99.0.0
+done
+new_dependency "$scratch/dependencies/zbus" zbus 5.19.0
+new_dependency "$scratch/dependencies/async-io" async-io 2.6.0
+printf '%s\n' '' '[dependencies]' \
+  'egui-winit = { path = "../../../dependencies/egui-winit" }' \
+  >>"$accesskit/crates/app/Cargo.toml"
+printf '%s\n' '' '[dependencies]' \
+  'accesskit_winit = { path = "../accesskit_winit" }' \
+  >>"$scratch/dependencies/egui-winit/Cargo.toml"
+printf '%s\n' '' '[dependencies]' \
+  'accesskit_unix = { path = "../accesskit_unix" }' \
+  >>"$scratch/dependencies/accesskit_winit/Cargo.toml"
+printf '%s\n' '' '[dependencies]' \
+  'zbus = { path = "../zbus" }' \
+  >>"$scratch/dependencies/accesskit_unix/Cargo.toml"
+printf '%s\n' '' '[dependencies]' \
+  'async-io = { path = "../async-io" }' \
+  >>"$scratch/dependencies/zbus/Cargo.toml"
+cargo generate-lockfile --offline --manifest-path "$accesskit/Cargo.toml"
+run_gate "$accesskit"
+
+echo "==> unauthorized zbus ancestry fails"
+unauthorized="$scratch/unauthorized-zbus"
+new_fixture "$unauthorized"
+printf '%s\n' '' '[dependencies]' \
+  'directories = { package = "zbus", path = "../../../dependencies/zbus" }' \
+  >>"$unauthorized/crates/app/Cargo.toml"
+cargo generate-lockfile --offline --manifest-path "$unauthorized/Cargo.toml"
+expect_failure "$unauthorized" 'unauthorized path to zbus'
 
 echo "==> direct std::net use fails"
 socket="$scratch/socket"
@@ -67,10 +189,21 @@ printf '%s\n' \
   '    let _ = std::net::TcpStream::connect("127.0.0.1:9");' \
   '}' >"$socket/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$socket/Cargo.toml"
-if output=$(run_gate "$socket" 2>&1); then
-  echo "direct std::net use unexpectedly passed" >&2
-  exit 1
-fi
-echo "$output" | grep -q 'uses a direct socket API'
+expect_failure "$socket" 'direct socket API:'
+
+echo "==> grouped and aliased libc socket imports fail"
+libc_alias="$scratch/libc-alias"
+libc_dependency="$scratch/dependencies/libc-shim"
+new_fixture "$libc_alias"
+new_dependency "$libc_dependency" libc
+printf '%s\n' '' '[dependencies]' \
+  'libc = { path = "../../../dependencies/libc-shim" }' \
+  >>"$libc_alias/crates/app/Cargo.toml"
+printf '%s\n' \
+  'use libc::{connect as dial, socket as open_socket};' \
+  'pub fn aliases() { let _ = (dial, open_socket); }' \
+  >"$libc_alias/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$libc_alias/Cargo.toml"
+expect_failure "$libc_alias" 'direct socket API:'
 
 echo "no-network fixture tests passed"
