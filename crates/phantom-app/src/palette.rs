@@ -19,6 +19,7 @@ pub enum PaletteAction {
     OpenSettings,
     FindInScrollback,
     ToggleFullscreen,
+    FocusContextSidebar,
     NewTabWithProfile(String),
     SetUiTheme(String),
 }
@@ -214,6 +215,7 @@ impl PaletteAction {
             Self::OpenSettings => "open_settings".to_string(),
             Self::FindInScrollback => "find_in_scrollback".to_string(),
             Self::ToggleFullscreen => "toggle_fullscreen".to_string(),
+            Self::FocusContextSidebar => "focus_context_sidebar".to_string(),
             Self::NewTabWithProfile(id) => format!("new_tab_profile:{id}"),
             Self::SetUiTheme(theme) => format!("set_ui_theme:{theme}"),
         }
@@ -266,6 +268,14 @@ fn build_commands(config: &AppConfig) -> Vec<Command> {
             shortcut: Some(BuiltinShortcut::ToggleFullscreen.keys().into()),
         },
     ];
+    if config.context_actions.enabled {
+        commands.push(Command {
+            label: "Focus Context Sidebar".into(),
+            action: PaletteAction::FocusContextSidebar,
+            group: PaletteGroup::Commands,
+            shortcut: None,
+        });
+    }
     for profile in &config.shell_profiles {
         commands.push(Command {
             label: format!("New Tab: {}", profile.name),
@@ -405,5 +415,24 @@ mod tests {
             palette.execute_selected(),
             Some(PaletteAction::ToggleFullscreen)
         );
+    }
+
+    #[test]
+    fn context_sidebar_focus_command_is_discoverable_only_when_enabled() {
+        let mut config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        palette.open(&config);
+        palette.set_query("Focus Context Sidebar".to_string());
+
+        assert_eq!(palette.rows().len(), 1);
+        assert_eq!(
+            palette.execute_selected(),
+            Some(PaletteAction::FocusContextSidebar)
+        );
+
+        config.context_actions.enabled = false;
+        palette.open(&config);
+        palette.set_query("Focus Context Sidebar".to_string());
+        assert_eq!(palette.execute_selected(), None);
     }
 }

@@ -238,6 +238,18 @@ impl UiState {
         self.find.is_open() || self.context_ui.owns_keyboard()
     }
 
+    /// Enter the contextual sidebar's egui focus order from the terminal.
+    /// Returns whether expanding the sidebar changed persisted configuration.
+    pub fn focus_context_sidebar(&mut self, config: &mut AppConfig) -> bool {
+        if !config.context_actions.enabled {
+            return false;
+        }
+        let changed = config.context_actions.panel_collapsed;
+        config.context_actions.panel_collapsed = false;
+        self.context_ui.request_sidebar_focus();
+        changed
+    }
+
     pub fn open_find(&mut self, selection_available: bool) {
         self.find.open(selection_available);
     }
