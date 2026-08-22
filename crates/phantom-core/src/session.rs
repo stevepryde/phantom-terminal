@@ -729,6 +729,172 @@ fn open_or_create_db_file(
     opened.map_err(|error| probe_error(path, &error))
 }
 
+#[cfg(target_os = "macos")]
+mod mac_acl {
+    use std::ffi::{c_int, c_void};
+    use std::os::fd::{AsRawFd, RawFd};
+
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+
+    unsafe extern "C" {
+        fn acl_free(object: *mut c_void) -> c_int;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
+        fn acl_get_tag_type(entry: *mut c_void, tag_type: *mut c_int) -> c_int;
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: c_int, acl: *mut c_void, acl_type: c_int) -> c_int;
+    }
+
+    struct Acl(*mut c_void);
+
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            let _ = unsafe { acl_free(self.0) };
+        }
+    }
+
+    fn load(fd: RawFd) -> std::io::Result<Option<Acl>> {
+        let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
+        if !acl.is_null() {
+            return Ok(Some(Acl(acl)));
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOENT)
+        ) {
+            // A filesystem with no ACL support cannot grant access beyond its
+            // Unix mode bits.
+            return Ok(None);
+        }
+        Err(error)
+    }
+
+    fn inspect(fd: RawFd) -> std::io::Result<(bool, bool)> {
+        let Some(acl) = load(fd)? else {
+            return Ok((false, false));
+        };
+        let mut entry = std::ptr::null_mut();
+        let mut entry_id = ACL_FIRST_ENTRY;
+        let mut any = false;
+        let mut allowing = false;
+        loop {
+            let result = unsafe { acl_get_entry(acl.0, entry_id, &mut entry) };
+            if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+                break;
+            }
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            any = true;
+            let mut tag_type = 0;
+            if unsafe { acl_get_tag_type(entry, &mut tag_type) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            allowing |= tag_type == ACL_EXTENDED_ALLOW;
+            entry_id = ACL_NEXT_ENTRY;
+        }
+        Ok((any, allowing))
+    }
+
+    pub(super) fn reject_allowing(
+        file: &std::fs::File,
+        path: &std::path::Path,
+    ) -> crate::error::AppResult<()> {
+        let (_, allowing) = inspect(file.as_raw_fd()).map_err(|error| {
+            crate::error::AppError::Other(format!(
+                "could not inspect ACL of session store ancestor {}: {error}",
+                path.display()
+            ))
+        })?;
+        if allowing {
+            return Err(crate::error::AppError::Other(format!(
+                "refusing to use session store ancestor {}: an extended ACL grants additional access",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn clear(
+        file: &std::fs::File,
+        path: &std::path::Path,
+        what: &str,
+    ) -> crate::error::AppResult<()> {
+        let (any, _) = inspect(file.as_raw_fd()).map_err(|error| {
+            crate::error::AppError::Other(format!(
+                "could not inspect ACL of {what} {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !any {
+            return Ok(());
+        }
+
+        let empty = unsafe { acl_init(0) };
+        if empty.is_null() {
+            return Err(crate::error::AppError::Other(format!(
+                "could not allocate an empty ACL for {what} {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let empty = Acl(empty);
+        if unsafe { acl_set_fd_np(file.as_raw_fd(), empty.0, ACL_TYPE_EXTENDED) } != 0 {
+            return Err(crate::error::AppError::Other(format!(
+                "could not remove ACL from {what} {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let (remaining, _) = inspect(file.as_raw_fd()).map_err(|error| {
+            crate::error::AppError::Other(format!(
+                "could not verify ACL of {what} {}: {error}",
+                path.display()
+            ))
+        })?;
+        if remaining {
+            return Err(crate::error::AppError::Other(format!(
+                "refusing to use {what} {}: extended ACL entries could not be removed",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_entries(file: &std::fs::File) -> std::io::Result<bool> {
+        inspect(file.as_raw_fd()).map(|(any, _)| any)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reject_permissive_ancestor_acl(file: &std::fs::File, path: &std::path::Path) -> AppResult<()> {
+    mac_acl::reject_allowing(file, path)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn reject_permissive_ancestor_acl(_file: &std::fs::File, _path: &std::path::Path) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_extended_acl(file: &std::fs::File, path: &std::path::Path, what: &str) -> AppResult<()> {
+    mac_acl::clear(file, path, what)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn clear_extended_acl(
+    _file: &std::fs::File,
+    _path: &std::path::Path,
+    _what: &str,
+) -> AppResult<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn validate_controlling_directory(file: &std::fs::File, path: &std::path::Path) -> AppResult<()> {
     use std::os::unix::fs::MetadataExt;
@@ -756,6 +922,7 @@ fn validate_controlling_directory(file: &std::fs::File, path: &std::path::Path) 
             path.display()
         )));
     }
+    reject_permissive_ancestor_acl(file, path)?;
     Ok(())
 }
 
@@ -794,20 +961,19 @@ fn ensure_exact_owner_mode(
         )));
     }
     let mut mode = meta.mode() & 0o7777;
-    if mode != want {
-        if unsafe { libc::fchmod(file.as_raw_fd(), want as libc::mode_t) } != 0 {
-            let error = std::io::Error::last_os_error();
-            return Err(AppError::Other(format!(
-                "could not restrict permissions of {what} {}: {error}",
-                path.display()
-            )));
-        }
-        mode = file
-            .metadata()
-            .map_err(|error| probe_error(path, &error))?
-            .mode()
-            & 0o7777;
+    if mode != want && unsafe { libc::fchmod(file.as_raw_fd(), want as libc::mode_t) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(AppError::Other(format!(
+            "could not restrict permissions of {what} {}: {error}",
+            path.display()
+        )));
     }
+    clear_extended_acl(file, path, what)?;
+    mode = file
+        .metadata()
+        .map_err(|error| probe_error(path, &error))?
+        .mode()
+        & 0o7777;
     if mode != want {
         return Err(AppError::Other(format!(
             "refusing to use {what} {}: mode {mode:04o} could not be restricted to {want:04o}",
@@ -1163,6 +1329,17 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    fn add_everyone_allow_acl(path: &std::path::Path) {
+        let status = std::process::Command::new("chmod")
+            .arg("+a")
+            .arg("everyone allow read,write,execute,delete")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     #[cfg(unix)]
     fn open_at_creates_private_dir_and_db() {
@@ -1274,6 +1451,21 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn open_at_rejects_permissive_acl_on_controlling_ancestor() {
+        let scratch = ScratchDir::new("unsafe-ancestor-acl");
+        let ancestor = scratch.path().join("ancestor");
+        std::fs::create_dir(&ancestor).unwrap();
+        add_everyone_allow_acl(&ancestor);
+
+        let error = SessionStore::open_at(&ancestor.join("data").join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("extended ACL"), "{error}");
+        assert!(!ancestor.join("data").exists());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn open_at_rejects_non_regular_db_path() {
         let scratch = ScratchDir::new("non-regular");
@@ -1345,6 +1537,29 @@ mod tests {
 
         let _store = SessionStore::open_at(&db).unwrap();
 
+        assert_eq!(mode_of(&data), 0o700);
+        assert_eq!(mode_of(&db), 0o600);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn open_at_removes_extended_acls_from_store_objects() {
+        let scratch = ScratchDir::new("strip-acl");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let db = data.join("phantom.db");
+        std::fs::File::create(&db).unwrap();
+        chmod(&db, 0o600);
+        add_everyone_allow_acl(&data);
+        add_everyone_allow_acl(&db);
+
+        let _store = SessionStore::open_at(&db).unwrap();
+
+        let directory = std::fs::File::open(&data).unwrap();
+        let database = std::fs::File::open(&db).unwrap();
+        assert!(!mac_acl::has_entries(&directory).unwrap());
+        assert!(!mac_acl::has_entries(&database).unwrap());
         assert_eq!(mode_of(&data), 0o700);
         assert_eq!(mode_of(&db), 0o600);
     }
