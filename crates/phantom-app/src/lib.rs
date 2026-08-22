@@ -132,6 +132,36 @@ fn resolve_new_tab_launch(
     launch.startup = startup;
     Ok(launch)
 }
+
+fn existing_directory(cwd: &str) -> Option<String> {
+    (!cwd.is_empty() && Path::new(cwd).is_dir()).then(|| cwd.to_string())
+}
+
+#[derive(Default)]
+struct CwdPollResult {
+    changed: bool,
+    active_changed: bool,
+}
+
+fn update_tab_cwds(
+    tabs: &mut [Tab],
+    active: usize,
+    mut cwd_for: impl FnMut(u32) -> Option<String>,
+) -> CwdPollResult {
+    let mut result = CwdPollResult::default();
+    for (index, tab) in tabs.iter_mut().enumerate() {
+        let Some(cwd) = cwd_for(tab.pty_id) else {
+            continue;
+        };
+        if cwd == tab.cwd {
+            continue;
+        }
+        tab.cwd = cwd;
+        result.changed = true;
+        result.active_changed |= index == active;
+    }
+    result
+}
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 /// Pixel-delta scroll divisor used only before the renderer exists.
@@ -1144,7 +1174,7 @@ impl App {
                     // gets renamed and the active index drifts.
                     if !self.spawn_tab_with_persistence(
                         rec.shell_profile_id.clone(),
-                        Some(rec.cwd.clone()),
+                        existing_directory(&rec.cwd),
                         false,
                     ) {
                         continue;
@@ -1182,11 +1212,7 @@ impl App {
     /// so the spawn cannot fail on a stale path.
     fn inherited_cwd(&self) -> Option<String> {
         let cwd = &self.tabs.get(self.active)?.cwd;
-        if !cwd.is_empty() && Path::new(cwd).is_dir() {
-            Some(cwd.clone())
-        } else {
-            None
-        }
+        existing_directory(cwd)
     }
 
     /// Spawn a tab; returns whether a tab was actually added.
@@ -2953,20 +2979,15 @@ impl App {
         self.request_redraw();
     }
 
-    /// Poll the active tab's shell cwd; update its title and persist on change.
+    /// Poll every live shell cwd; update tab titles and persist changes together.
     fn poll_cwd(&mut self) {
-        let Some(tab) = self.tabs.get(self.active) else {
-            return;
-        };
-        let pty_id = tab.pty_id;
-        let current = tab.cwd.clone();
-        if let Some(cwd) = self.pty.cwd(pty_id) {
-            if cwd != current {
-                self.tabs[self.active].cwd = cwd;
-                self.mark_dirty();
+        let result = update_tab_cwds(&mut self.tabs, self.active, |pty_id| self.pty.cwd(pty_id));
+        if result.changed {
+            self.mark_dirty();
+            if result.active_changed {
                 self.schedule_context_discovery();
-                self.request_redraw();
             }
+            self.request_redraw();
         }
     }
 
@@ -4053,6 +4074,70 @@ mod tests {
 
         app.tabs[0].cwd = String::new();
         assert_eq!(app.inherited_cwd(), None);
+    }
+
+    #[test]
+    fn cwd_poll_updates_background_tabs_in_one_bounded_pass() {
+        let mut tabs = vec![
+            Tab::new(
+                0,
+                AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+                11,
+                "/active".to_string(),
+                None,
+            ),
+            Tab::new(
+                1,
+                AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+                22,
+                "/stale-background".to_string(),
+                None,
+            ),
+        ];
+        let mut polled = Vec::new();
+
+        let result = update_tab_cwds(&mut tabs, 0, |pty_id| {
+            polled.push(pty_id);
+            match pty_id {
+                11 => Some("/active".to_string()),
+                22 => Some("/fresh-background".to_string()),
+                _ => None,
+            }
+        });
+
+        assert_eq!(polled, [11, 22]);
+        assert!(result.changed);
+        assert!(!result.active_changed);
+        assert_eq!(tabs[0].cwd, "/active");
+        assert_eq!(tabs[1].cwd, "/fresh-background");
+    }
+
+    #[test]
+    fn restore_cwd_rejects_missing_paths_and_files() {
+        let directory = std::env::temp_dir();
+        let directory = directory.to_string_lossy().into_owned();
+        assert_eq!(existing_directory(&directory), Some(directory.clone()));
+
+        let file = std::env::current_exe().unwrap();
+        assert_eq!(existing_directory(&file.to_string_lossy()), None);
+
+        let missing =
+            Path::new(&directory).join(format!("phantom-stale-restore-{}", std::process::id()));
+        assert!(!missing.exists());
+        assert_eq!(existing_directory(&missing.to_string_lossy()), None);
+
+        let mut config = AppConfig::default();
+        config.shell_profiles[0].cwd = Some(directory.clone());
+        let launch = resolve_new_tab_launch(
+            &config,
+            None,
+            existing_directory(&missing.to_string_lossy()),
+            None,
+            24,
+            80,
+        )
+        .unwrap();
+        assert_eq!(launch.cwd.as_deref(), Some(directory.as_str()));
     }
 
     #[test]
