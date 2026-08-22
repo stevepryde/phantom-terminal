@@ -125,3 +125,17 @@ fn skill_target_selection_and_usage_errors_are_explicit() {
         .unwrap();
     assert_eq!(invalid.status.code(), Some(2));
 }
+
+#[test]
+fn invalid_cwd_exits_before_launching_the_gui() {
+    let temp = TestDir::new("invalid-cwd");
+    let missing = temp.path().join("does-not-exist");
+
+    let output = phantom().arg("--cwd").arg(&missing).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("phantom: invalid --cwd"));
+    assert!(stderr.contains(&missing.display().to_string()));
+}

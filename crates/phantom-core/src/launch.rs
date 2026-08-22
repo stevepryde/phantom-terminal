@@ -1,11 +1,13 @@
-use serde::Serialize;
-
 use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
 };
+
+use serde::Serialize;
+
+use crate::{AppError, AppResult};
 
 const MAX_LAUNCH_CWD_LEN: usize = 4096;
 
@@ -20,13 +22,14 @@ pub struct LaunchState {
 }
 
 impl LaunchState {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> AppResult<Self> {
         let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        parsed_args_to_state(parse_launch_args_with_home(
+        let parsed = parse_launch_args_with_home(
             env::args_os().skip(1),
             &current_dir,
             default_home_dir().as_deref(),
-        ))
+        )?;
+        Ok(parsed_args_to_state(parsed))
     }
 
     pub fn context(&self) -> LaunchContext {
@@ -62,16 +65,16 @@ fn parse_launch_args_with_home<I>(
     args: I,
     current_dir: &Path,
     _home_dir: Option<&Path>,
-) -> ParsedLaunch
+) -> AppResult<ParsedLaunch>
 where
     I: IntoIterator<Item = OsString>,
 {
     let args: Vec<OsString> = args.into_iter().collect();
     if args.iter().any(|arg| arg == "--normal") {
-        return ParsedLaunch {
+        return Ok(ParsedLaunch {
             cwd: None,
             remember_tabs: true,
-        };
+        });
     }
 
     let mut saw_empty_cwd_request = false;
@@ -81,10 +84,10 @@ where
                 .get(index + 1)
                 .filter(|path| !option_like(path) && !path.is_empty())
             {
-                return ParsedLaunch {
-                    cwd: resolve_launch_cwd(path, current_dir),
+                return Ok(ParsedLaunch {
+                    cwd: Some(resolve_launch_cwd(path, current_dir)?),
                     remember_tabs: false,
-                };
+                });
             }
             saw_empty_cwd_request = true;
         }
@@ -94,18 +97,18 @@ where
                 saw_empty_cwd_request = true;
                 continue;
             }
-            return ParsedLaunch {
-                cwd: resolve_launch_cwd(&OsString::from(value), current_dir),
+            return Ok(ParsedLaunch {
+                cwd: Some(resolve_launch_cwd(&OsString::from(value), current_dir)?),
                 remember_tabs: false,
-            };
+            });
         }
     }
 
     if saw_empty_cwd_request {
-        return ParsedLaunch::default();
+        return Ok(ParsedLaunch::default());
     }
 
-    ParsedLaunch::default()
+    Ok(ParsedLaunch::default())
 }
 
 fn option_like(arg: &OsStr) -> bool {
@@ -117,7 +120,7 @@ fn option_value(arg: &OsStr, prefix: &str) -> Option<String> {
     text.strip_prefix(prefix).map(ToOwned::to_owned)
 }
 
-fn resolve_launch_cwd(arg: &OsStr, current_dir: &Path) -> Option<String> {
+fn resolve_launch_cwd(arg: &OsStr, current_dir: &Path) -> AppResult<String> {
     let path = if let Some(file_path) = file_url_path(arg) {
         PathBuf::from(file_path)
     } else {
@@ -128,14 +131,29 @@ fn resolve_launch_cwd(arg: &OsStr, current_dir: &Path) -> Option<String> {
     } else {
         current_dir.join(path)
     };
-    let metadata = fs::metadata(&absolute).ok()?;
+    let metadata = fs::metadata(&absolute).map_err(|error| {
+        AppError::Other(format!(
+            "invalid --cwd '{}': {error}",
+            absolute.to_string_lossy()
+        ))
+    })?;
     let dir = if metadata.is_dir() {
         absolute
     } else {
-        absolute.parent()?.to_path_buf()
+        absolute.parent().map(Path::to_path_buf).ok_or_else(|| {
+            AppError::Other(format!(
+                "invalid --cwd '{}': file has no parent directory",
+                absolute.to_string_lossy()
+            ))
+        })?
     };
     let canonical = fs::canonicalize(&dir).unwrap_or(dir);
-    normalize_cwd_path(&canonical)
+    normalize_cwd_path(&canonical).ok_or_else(|| {
+        AppError::Other(format!(
+            "invalid --cwd '{}': resolved path is empty or too long",
+            canonical.to_string_lossy()
+        ))
+    })
 }
 
 fn normalize_cwd_path(path: &Path) -> Option<String> {
@@ -197,7 +215,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str], current_dir: &Path, home_dir: Option<&Path>) -> ParsedLaunch {
-        parse_launch_args_with_home(args.iter().map(OsString::from), current_dir, home_dir)
+        parse_launch_args_with_home(args.iter().map(OsString::from), current_dir, home_dir).unwrap()
     }
 
     #[test]
@@ -257,13 +275,20 @@ mod tests {
     }
 
     #[test]
-    fn cwd_option_with_invalid_path_still_disables_remembering() {
+    fn cwd_option_with_invalid_path_is_an_error() {
         let cwd = env::current_dir().unwrap();
-        let parsed = parse(&["--cwd", "src/does-not-exist"], &cwd, Some(&cwd));
-        let state = parsed_args_to_state(parsed);
+        let error = parse_launch_args_with_home(
+            [
+                OsString::from("--cwd"),
+                OsString::from("src/does-not-exist"),
+            ],
+            &cwd,
+            Some(&cwd),
+        )
+        .unwrap_err();
 
-        assert!(!state.context().remember_tabs);
-        assert_eq!(state.context().cwd, None);
+        assert!(error.to_string().contains("invalid --cwd"));
+        assert!(error.to_string().contains("src/does-not-exist"));
     }
 
     #[test]
