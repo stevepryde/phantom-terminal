@@ -78,6 +78,9 @@ pub(crate) struct ContextUi {
     /// prevents terminal or scroll content beneath the edge from stealing a
     /// resize after the initial press.
     sidebar_resize_active: bool,
+    /// Transfers focus between the launcher and collapse button after the
+    /// control changes identity with the sidebar state.
+    focus_toggle: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,8 +195,14 @@ impl ContextUi {
                 sidebar_frame(alpha, 4)
                     .corner_radius(4)
                     .show(ui, |ui| {
-                        if context_icon_button(ui, true).clicked() {
+                        let launcher = context_icon_button(ui, true);
+                        if self.focus_toggle {
+                            launcher.request_focus();
+                            self.focus_toggle = false;
+                        }
+                        if launcher.clicked() {
                             config.context_actions.panel_collapsed = false;
+                            self.focus_toggle = true;
                             true
                         } else {
                             false
@@ -309,8 +318,14 @@ impl ContextUi {
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     ui.add_space(4.0);
-                    if context_icon_button(ui, false).clicked() {
+                    let collapse = context_icon_button(ui, false);
+                    if self.focus_toggle {
+                        collapse.request_focus();
+                        self.focus_toggle = false;
+                    }
+                    if collapse.clicked() {
                         config.context_actions.panel_collapsed = true;
+                        self.focus_toggle = true;
                         outcome.config_changed = true;
                     }
                 },
@@ -510,12 +525,21 @@ impl ContextUi {
             .operations
             .iter()
             .find(|operation| selected.matches(operation))?;
-        action_row(ui, RUN_SPDEPLOY_LABEL)
-            .clicked()
-            .then(|| ContextRequest::RunSpdeploy {
-                config_path: operation.config_path.clone(),
-                operation: operation.name.clone(),
-            })
+        ui.push_id(
+            (
+                "run_spdeploy",
+                section_id,
+                &operation.config_path,
+                &operation.name,
+            ),
+            |ui| action_row(ui, RUN_SPDEPLOY_LABEL),
+        )
+        .inner
+        .clicked()
+        .then(|| ContextRequest::RunSpdeploy {
+            config_path: operation.config_path.clone(),
+            operation: operation.name.clone(),
+        })
     }
 }
 
@@ -563,13 +587,14 @@ fn draw_section_header(
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     header.widget_info(|| {
-        egui::WidgetInfo::selected(
+        egui::WidgetInfo::labeled(
             egui::WidgetType::CollapsingHeader,
             true,
-            !collapsed,
-            &section.title,
+            section_label(section),
         )
     });
+    ui.ctx()
+        .accesskit_node_builder(header.id, |node| node.set_expanded(!collapsed));
     let header_visuals = ui.style().interact(&header);
     if header.hovered() || header.has_focus() {
         ui.painter()
@@ -709,20 +734,24 @@ fn draw_recent_directories(
             (ui.available_width() - 2.0 * ROW_TEXT_INSET).max(0.0),
         );
         let elided = text != path;
-        let mut response = full_width_row_with_height(
-            ui,
-            DIRECTORY_ROW_HEIGHT,
-            Sense::click(),
-            |ui, rect, color| {
-                ui.painter().text(
-                    egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    text,
-                    FontId::monospace(DIRECTORY_TEXT_SIZE),
-                    color,
-                );
-            },
-        );
+        let mut response = ui
+            .push_id(("recent_directory", &directory.path), |ui| {
+                full_width_row_with_height(
+                    ui,
+                    DIRECTORY_ROW_HEIGHT,
+                    Sense::click(),
+                    |ui, rect, color| {
+                        ui.painter().text(
+                            egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            text,
+                            FontId::monospace(DIRECTORY_TEXT_SIZE),
+                            color,
+                        );
+                    },
+                )
+            })
+            .inner;
         if elided {
             response = response.on_hover_text(&path);
         }
@@ -750,15 +779,19 @@ fn draw_frequent_commands(
             (ui.available_width() - 2.0 * ROW_TEXT_INSET).max(0.0),
         );
         let elided = text != *command;
-        let mut response = full_width_row(ui, Sense::click(), |ui, rect, color| {
-            ui.painter().text(
-                egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                text,
-                FontId::monospace(DIRECTORY_TEXT_SIZE),
-                color,
-            );
-        });
+        let mut response = ui
+            .push_id(("frequent_command", command), |ui| {
+                full_width_row(ui, Sense::click(), |ui, rect, color| {
+                    ui.painter().text(
+                        egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        text,
+                        FontId::monospace(DIRECTORY_TEXT_SIZE),
+                        color,
+                    );
+                })
+            })
+            .inner;
         if elided {
             response = response.on_hover_text(command);
         }
@@ -1073,15 +1106,23 @@ fn manifest_task_location(tab: &ManifestTab, root: &Path) -> Option<String> {
 }
 
 fn draw_trusted_manifest(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
-    let mut request =
-        action_row(ui, START_ALL_TASKS_LABEL)
-            .clicked()
-            .then(|| ContextRequest::OpenManifestAll {
-                root: manifest.root.clone(),
-                manifest_source: manifest.manifest_source.clone(),
-            });
+    let mut request = ui
+        .push_id(("manifest_all", &manifest.root), |ui| {
+            action_row(ui, START_ALL_TASKS_LABEL)
+        })
+        .inner
+        .clicked()
+        .then(|| ContextRequest::OpenManifestAll {
+            root: manifest.root.clone(),
+            manifest_source: manifest.manifest_source.clone(),
+        });
     for tab in &manifest.tabs {
-        if action_row(ui, &task_start_label(&tab.title)).clicked() && request.is_none() {
+        let row = ui
+            .push_id(("manifest_tab", &tab.id), |ui| {
+                action_row(ui, &task_start_label(&tab.title))
+            })
+            .inner;
+        if row.clicked() && request.is_none() {
             request = Some(ContextRequest::OpenManifestTab {
                 root: manifest.root.clone(),
                 manifest_source: manifest.manifest_source.clone(),
@@ -1162,7 +1203,7 @@ fn spdeploy_dropdown(
 mod tests {
     use super::*;
     use egui::{
-        accesskit::{Action, Role, Toggled},
+        accesskit::{Action, Role},
         Context, Id,
     };
     use phantom_core::{MANIFEST_PLUGIN_ID, RECENT_DIRECTORIES_PLUGIN_ID, SPDEPLOY_PLUGIN_ID};
@@ -1271,8 +1312,8 @@ mod tests {
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == Role::Button
-                && node.label() == Some("Soulfire workspace")
-                && node.toggled() == Some(Toggled::True)
+                && node.label() == Some("Tasks")
+                && node.is_expanded() == Some(true)
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == Role::Splitter

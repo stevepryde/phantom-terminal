@@ -78,6 +78,9 @@ impl FindState {
     pub fn open(&mut self, selection_available: bool) {
         self.open = true;
         self.selection_available = selection_available;
+        if !selection_available {
+            self.options.selection_only = false;
+        }
         self.results = FindResultSummary::default();
         self.request_focus();
     }
@@ -217,6 +220,15 @@ impl FindState {
             );
             info.label = Some("Find query".to_string());
             info
+        });
+        ui.ctx().accesskit_node_builder(edit.response.id, |node| {
+            // This query is always editable. Clear stale disabled state from
+            // another control's disabled scope before adding validation data.
+            node.clear_disabled();
+            if let Some(error) = invalid_tooltip.as_deref() {
+                node.set_invalid(egui::accesskit::Invalid::True);
+                node.set_description(error);
+            }
         });
         if self.focus_requested {
             edit.response.request_focus();
@@ -550,6 +562,19 @@ mod tests {
     }
 
     #[test]
+    fn reopening_without_a_selection_clears_selection_only_scope() {
+        let mut state = FindState::default();
+        state.open(true);
+        state.options.selection_only = true;
+        state.close();
+
+        state.open(false);
+
+        assert!(!state.options.selection_only);
+        assert!(!state.selection_available);
+    }
+
+    #[test]
     fn bar_stays_left_of_context_boundary_and_below_terminal_top() {
         let terminal = egui::Rect::from_min_max(egui::pos2(144.0, 42.0), egui::pos2(1200.0, 800.0));
         let layout = find_bar_layout(terminal, 900.0);
@@ -606,6 +631,13 @@ mod tests {
         let terminal = egui::Rect::from_min_max(egui::pos2(20.0, 32.0), egui::pos2(1000.0, 700.0));
         let mut state = FindState::default();
         state.open(false);
+        state.query = "[".to_string();
+        state.set_results(FindResultSummary {
+            error: Some(FindError::InvalidRegex(
+                "unclosed character class".to_string(),
+            )),
+            ..Default::default()
+        });
 
         let output = ctx.run_ui(
             egui::RawInput {
@@ -624,7 +656,10 @@ mod tests {
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == Role::TextInput
                 && node.label() == Some("Find query")
-                && node.value() == Some("")
+                && node.value() == Some("[")
+                && !node.is_disabled()
+                && node.invalid() == Some(egui::accesskit::Invalid::True)
+                && node.description() == Some("unclosed character class")
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == Role::Button

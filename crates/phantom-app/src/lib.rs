@@ -3744,9 +3744,32 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         if matches!(event, WindowEvent::RedrawRequested) {
+            if let (Some(gpu), Some(egui)) = (self.gpu.as_ref(), self.egui.as_mut()) {
+                egui.on_accesskit_window_event(&gpu.window, &event);
+            }
             self.render();
             return;
         }
+
+        let terminal_owns_keyboard = terminal_owns_keyboard(
+            self.palette.open,
+            self.rename.is_some(),
+            self.ui.settings_open(),
+            self.ui.context_owns_keyboard(),
+        );
+        let egui_response = match (self.gpu.as_ref(), self.egui.as_mut()) {
+            (Some(gpu), Some(egui)) if terminal_owns_keyboard && is_keyboard_event(&event) => {
+                egui.on_accesskit_window_event(&gpu.window, &event);
+                None
+            }
+            (Some(gpu), Some(egui)) => Some(egui.on_window_event(&gpu.window, &event)),
+            _ => None,
+        };
+        if egui_response.is_some_and(|response| response.repaint) {
+            self.request_redraw();
+        }
+        let consumed = egui_response.is_some_and(|response| response.consumed);
+
         if matches!(event, WindowEvent::CursorLeft { .. }) {
             self.clear_chrome_hover();
         }
@@ -3768,24 +3791,6 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
-        let terminal_owns_keyboard = terminal_owns_keyboard(
-            self.palette.open,
-            self.rename.is_some(),
-            self.ui.settings_open(),
-            self.ui.context_owns_keyboard(),
-        );
-        let egui_response = if terminal_owns_keyboard && is_keyboard_event(&event) {
-            None
-        } else {
-            match (self.gpu.as_ref(), self.egui.as_mut()) {
-                (Some(gpu), Some(egui)) => Some(egui.on_window_event(&gpu.window, &event)),
-                _ => None,
-            }
-        };
-        if egui_response.is_some_and(|response| response.repaint) {
-            self.request_redraw();
-        }
-        let consumed = egui_response.is_some_and(|response| response.consumed);
         let cell_height_px = self
             .renderer
             .as_ref()
