@@ -669,8 +669,19 @@ def validate_sources(metadata):
         manifest_path = Path(package["manifest_path"])
         try:
             resolved_manifest = manifest_path.resolve(strict=True)
+        except OSError as error:
+            blocked.add(
+                f"could not resolve repository package {package['name']} "
+                f"{package['version']}: {error}"
+            )
+            continue
+        try:
             relative_manifest = str(resolved_manifest.relative_to(workspace_root))
-        except (OSError, ValueError):
+        except ValueError:
+            blocked.add(
+                f"repository package is outside workspace: {package['name']} "
+                f"{package['version']} at {resolved_manifest}"
+            )
             continue
         approved = APPROVED_REPO_PACKAGES.get((package["name"], package["version"]))
         if approved is None or relative_manifest != approved[0]:
@@ -687,6 +698,21 @@ def validate_sources(metadata):
             continue
         if actual_digest != approved[1]:
             blocked.add(f"repository package source changed: {relative_manifest}")
+        for target in package["targets"]:
+            if "custom-build" in target["kind"]:
+                blocked.add(
+                    f"repository generated-code target is not allowed: {target['src_path']}"
+                )
+            target_path = Path(target["src_path"])
+            try:
+                resolved_target = target_path.resolve(strict=True)
+                resolved_target.relative_to(package_root)
+            except (OSError, ValueError):
+                blocked.add(
+                    f"repository target source is outside its package: {target_path}"
+                )
+            if target_path.is_symlink() or not target_path.is_file():
+                blocked.add(f"repository target source is not a readable file: {target_path}")
         repo_macro_roots.append((package_root, approved[2]))
         collect_sources(package_root)
 

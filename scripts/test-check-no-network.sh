@@ -167,7 +167,10 @@ printf '%s\n' \
   'helper = { package = "innocent-wrapper", path = "../../../dependencies/innocent-wrapper" }' \
   >"$unknown/crates/app/Cargo.toml"
 cargo generate-lockfile --offline --manifest-path "$unknown/Cargo.toml"
+cargo check --offline --manifest-path "$unknown/Cargo.toml" >/dev/null 2>&1
 expect_failure "$unknown" 'unreviewed direct dependency identity: phantom-core -> innocent-wrapper'
+unknown_output=$(run_gate "$unknown" 2>&1 || true)
+grep -q 'repository package is outside workspace: innocent-wrapper' <<<"$unknown_output"
 
 echo "==> unauthorized transitive socket transport fails"
 transitive="$scratch/transitive"
