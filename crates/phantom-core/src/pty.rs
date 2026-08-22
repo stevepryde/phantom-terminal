@@ -28,6 +28,9 @@ const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const WRITE_QUEUE_MESSAGES: usize = 256;
 const MAX_REPLY_BYTES: usize = 64 * 1024;
 const WRITE_REPLY_QUEUE_MESSAGES: usize = 16;
+/// Covers ordinary key encodings, mouse reports, and terminal protocol replies
+/// without a heap allocation. Larger logical inputs remain one owned message.
+const INLINE_WRITE_BYTES: usize = 64;
 const MAX_LAUNCH_ENV_VARS: usize = 128;
 const MAX_LAUNCH_ENV_KEY_LEN: usize = 128;
 const MAX_LAUNCH_ENV_VALUE_LEN: usize = 16 * 1024;
@@ -134,8 +137,47 @@ struct WriterQueue {
 }
 
 enum WriterMessage {
-    Input(Vec<u8>),
-    Reply(Vec<u8>),
+    Input(QueuedBytes),
+    Reply(QueuedBytes),
+}
+
+enum QueuedBytes {
+    Inline {
+        len: u8,
+        bytes: [u8; INLINE_WRITE_BYTES],
+    },
+    Heap(Vec<u8>),
+}
+
+impl QueuedBytes {
+    fn from_slice(data: &[u8]) -> Self {
+        if data.len() <= INLINE_WRITE_BYTES {
+            let mut bytes = [0; INLINE_WRITE_BYTES];
+            bytes[..data.len()].copy_from_slice(data);
+            Self::Inline {
+                len: data.len() as u8,
+                bytes,
+            }
+        } else {
+            Self::Heap(data.to_vec())
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[cfg(test)]
+    fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline { .. })
+    }
 }
 
 impl WriterQueue {
@@ -160,7 +202,7 @@ impl WriterQueue {
             return Err(AppError::Pty("terminal is not accepting input".to_string()));
         }
         self.send_reserved(
-            WriterMessage::Input(data.to_vec()),
+            WriterMessage::Input(QueuedBytes::from_slice(data)),
             &self.queued_bytes,
             &self.queued_messages,
             data.len(),
@@ -192,7 +234,7 @@ impl WriterQueue {
             ));
         }
         self.send_reserved(
-            WriterMessage::Reply(data.to_vec()),
+            WriterMessage::Reply(QueuedBytes::from_slice(data)),
             &self.queued_reply_bytes,
             &self.queued_replies,
             data.len(),
@@ -418,7 +460,9 @@ impl PtyManager {
                         WriterMessage::Input(data) => (data, &queued_bytes, &queued_messages),
                         WriterMessage::Reply(data) => (data, &queued_reply_bytes, &queued_replies),
                     };
-                    let result = writer.write_all(&data).and_then(|_| writer.flush());
+                    let result = writer
+                        .write_all(data.as_slice())
+                        .and_then(|_| writer.flush());
                     // Release the budget only after the blocking write, so
                     // buffered plus in-flight input stays within the bound.
                     bytes.fetch_sub(data.len(), Ordering::AcqRel);
@@ -1463,7 +1507,44 @@ mod tests {
 
     fn input(message: WriterMessage) -> Vec<u8> {
         match message {
-            WriterMessage::Input(data) => data,
+            WriterMessage::Input(data) => data.as_slice().to_vec(),
+            WriterMessage::Reply(_) => panic!("expected user input"),
+        }
+    }
+
+    #[test]
+    fn tiny_writes_use_inline_queue_storage() {
+        let (queue, rx) = writer_queue(2);
+        queue.enqueue(b"x").unwrap();
+        queue.enqueue_reply(b"\x1b[1;1R").unwrap();
+
+        match rx.try_recv().unwrap() {
+            WriterMessage::Input(data) => {
+                assert!(data.is_inline());
+                assert_eq!(data.as_slice(), b"x");
+            }
+            WriterMessage::Reply(_) => panic!("expected user input"),
+        }
+        match rx.try_recv().unwrap() {
+            WriterMessage::Reply(data) => {
+                assert!(data.is_inline());
+                assert_eq!(data.as_slice(), b"\x1b[1;1R");
+            }
+            WriterMessage::Input(_) => panic!("expected terminal reply"),
+        }
+    }
+
+    #[test]
+    fn large_writes_keep_exact_owned_payload() {
+        let (queue, rx) = writer_queue(1);
+        let payload = vec![b'x'; INLINE_WRITE_BYTES + 1];
+        queue.enqueue(&payload).unwrap();
+
+        match rx.try_recv().unwrap() {
+            WriterMessage::Input(data) => {
+                assert!(!data.is_inline());
+                assert_eq!(data.as_slice(), payload);
+            }
             WriterMessage::Reply(_) => panic!("expected user input"),
         }
     }
@@ -1536,7 +1617,7 @@ mod tests {
 
         assert_eq!(input(rx.try_recv().unwrap()), filler);
         match rx.try_recv().unwrap() {
-            WriterMessage::Reply(data) => assert_eq!(data, b"\x1b[1;1R"),
+            WriterMessage::Reply(data) => assert_eq!(data.as_slice(), b"\x1b[1;1R"),
             WriterMessage::Input(_) => panic!("expected terminal reply"),
         }
     }
@@ -1554,7 +1635,7 @@ mod tests {
             assert_eq!(input(rx.try_recv().unwrap()), b"x");
         }
         match rx.try_recv().unwrap() {
-            WriterMessage::Reply(data) => assert_eq!(data, b"reply"),
+            WriterMessage::Reply(data) => assert_eq!(data.as_slice(), b"reply"),
             WriterMessage::Input(_) => panic!("expected terminal reply"),
         }
     }
@@ -1569,7 +1650,7 @@ mod tests {
 
         assert_eq!(input(rx.try_recv().unwrap()), b"before");
         match rx.try_recv().unwrap() {
-            WriterMessage::Reply(data) => assert_eq!(data, b"reply"),
+            WriterMessage::Reply(data) => assert_eq!(data.as_slice(), b"reply"),
             WriterMessage::Input(_) => panic!("expected terminal reply"),
         }
         assert_eq!(input(rx.try_recv().unwrap()), b"after");
