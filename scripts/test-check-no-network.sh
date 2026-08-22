@@ -317,6 +317,20 @@ cargo generate-lockfile --offline --manifest-path "$root_alias/Cargo.toml"
 cargo check --offline --manifest-path "$root_alias/Cargo.toml" >/dev/null 2>&1
 expect_failure "$root_alias" 'direct socket API:'
 
+echo "==> extern-crate std authority aliases fail and compile"
+extern_root_alias="$scratch/extern-root-alias"
+new_fixture "$extern_root_alias"
+printf '%s\n' \
+  'extern crate std as system;' \
+  'use system::net as transport;' \
+  'use transport::TcpStream as Stream;' \
+  'pub fn dial() {' \
+  '    let _ = Stream::connect("127.0.0.1:9");' \
+  '}' >"$extern_root_alias/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$extern_root_alias/Cargo.toml"
+cargo check --offline --manifest-path "$extern_root_alias/Cargo.toml" >/dev/null 2>&1
+expect_failure "$extern_root_alias" 'direct socket API:'
+
 echo "==> nested std::net module aliases fail and compile"
 nested_net_alias="$scratch/nested-net-alias"
 new_fixture "$nested_net_alias"
@@ -329,6 +343,20 @@ printf '%s\n' \
 cargo generate-lockfile --offline --manifest-path "$nested_net_alias/Cargo.toml"
 cargo check --offline --manifest-path "$nested_net_alias/Cargo.toml" >/dev/null 2>&1
 expect_failure "$nested_net_alias" 'direct socket API:'
+
+echo "==> grouped std::net self imports cannot seed alias chains"
+grouped_net_self="$scratch/grouped-net-self"
+new_fixture "$grouped_net_self"
+printf '%s\n' \
+  'use std::net::{self};' \
+  'use net as transport;' \
+  'use transport::TcpStream as Stream;' \
+  'pub fn connect() {' \
+  '    let _ = Stream::connect("127.0.0.1:9");' \
+  '}' >"$grouped_net_self/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$grouped_net_self/Cargo.toml"
+cargo check --offline --manifest-path "$grouped_net_self/Cargo.toml" >/dev/null 2>&1
+expect_failure "$grouped_net_self" 'direct socket API:'
 
 echo "==> libc module aliases fail"
 libc_module_alias="$scratch/libc-module-alias"

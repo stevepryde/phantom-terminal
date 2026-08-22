@@ -423,13 +423,17 @@ def source_violation(tokens, approved_custom_macros):
             if (
                 imports_net_module
                 or "*" in use_tree
-                or find_sequence(use_tree, ("self", "as")) is not None
+                or "self" in use_tree
                 or any(socket_type in use_tree for socket_type in SOCKET_TYPES)
             ):
                 return index
 
     for index in range(len(values) - 4):
-        if values[index : index + 3] == ["extern", "crate", "libc"] and "as" in values[index + 3 : index + 5]:
+        if (
+            values[index : index + 2] == ["extern", "crate"]
+            and values[index + 2] in {"core", "libc", "std"}
+            and "as" in values[index + 3 : index + 5]
+        ):
             return index
 
     for index, value in enumerate(values):
