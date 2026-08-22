@@ -527,6 +527,13 @@ enum MouseEvent {
     WheelDown,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WheelRoute {
+    TabStrip,
+    MouseReport,
+    Terminal,
+}
+
 #[derive(Clone, Copy)]
 enum ClipAction {
     Copy,
@@ -601,6 +608,7 @@ pub struct App {
     tab_drag: Option<TabDrag>,
     scroll_drag: Option<ScrollDrag>,
     wheel_line_remainder: f32,
+    wheel_route: Option<WheelRoute>,
 
     clipboard: Option<Box<dyn ClipboardAccess>>,
     left_down: bool,
@@ -721,6 +729,7 @@ impl App {
             tab_drag: None,
             scroll_drag: None,
             wheel_line_remainder: 0.0,
+            wheel_route: None,
             clipboard: arboard::Clipboard::new()
                 .ok()
                 .map(|clipboard| Box::new(clipboard) as Box<dyn ClipboardAccess>),
@@ -2837,25 +2846,28 @@ impl App {
         let (px, py) = self.cursor_pos;
         // Wheel over an overflowing tab strip scrolls the strip, not the
         // terminal. Wheel-up moves toward the first tab.
-        if let Some(hits) = self.last_hits.as_ref() {
-            if hits.max_tab_scroll > 0.0 && hits.tab_strip.contains(px, py) {
-                let scale = self
-                    .gpu
-                    .as_ref()
-                    .map(|gpu| gpu.scale_factor())
-                    .unwrap_or(1.0);
-                let step = lines * TAB_STRIP_WHEEL_PX * scale;
-                self.tab_scroll = (self.tab_scroll - step).clamp(0.0, hits.max_tab_scroll);
-                self.request_redraw();
-                return;
-            }
+        let tab_scroll_limit = self.last_hits.as_ref().and_then(|hits| {
+            (hits.max_tab_scroll > 0.0 && hits.tab_strip.contains(px, py))
+                .then_some(hits.max_tab_scroll)
+        });
+        if let Some(max_tab_scroll) = tab_scroll_limit {
+            self.select_wheel_route(WheelRoute::TabStrip);
+            let scale = self
+                .gpu
+                .as_ref()
+                .map(|gpu| gpu.scale_factor())
+                .unwrap_or(1.0);
+            let step = lines * TAB_STRIP_WHEEL_PX * scale;
+            self.tab_scroll = (self.tab_scroll - step).clamp(0.0, max_tab_scroll);
+            self.request_redraw();
+            return;
         }
         if self.active_mouse_mode().reports() {
-            let ticks = lines.round() as i32;
+            let ticks = self.accumulate_wheel_delta(WheelRoute::MouseReport, lines);
             if ticks == 0 {
                 return;
             }
-            let event = if lines > 0.0 {
+            let event = if ticks > 0 {
                 MouseEvent::WheelUp
             } else {
                 MouseEvent::WheelDown
@@ -2864,22 +2876,40 @@ impl App {
                 self.report_mouse(px, py, event);
             }
         } else {
-            self.wheel_line_remainder += lines * WHEEL_LINES_PER_NOTCH;
-            let whole_lines = if self.wheel_line_remainder >= 0.0 {
-                self.wheel_line_remainder.floor()
-            } else {
-                self.wheel_line_remainder.ceil()
-            } as i32;
+            let whole_lines =
+                self.accumulate_wheel_delta(WheelRoute::Terminal, lines * WHEEL_LINES_PER_NOTCH);
             if whole_lines == 0 {
                 return;
             }
-            self.wheel_line_remainder -= whole_lines as f32;
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 // Positive lines (wheel up) scroll back into history.
                 tab.core.scroll(whole_lines);
             }
             self.request_redraw();
         }
+    }
+
+    fn select_wheel_route(&mut self, route: WheelRoute) {
+        if self.wheel_route != Some(route) {
+            self.wheel_line_remainder = 0.0;
+            self.wheel_route = Some(route);
+        }
+    }
+
+    fn accumulate_wheel_delta(&mut self, route: WheelRoute, delta: f32) -> i32 {
+        if delta.abs() < f32::EPSILON {
+            return 0;
+        }
+        self.select_wheel_route(route);
+        if self.wheel_line_remainder != 0.0
+            && self.wheel_line_remainder.is_sign_positive() != delta.is_sign_positive()
+        {
+            self.wheel_line_remainder = 0.0;
+        }
+        self.wheel_line_remainder += delta;
+        let whole = self.wheel_line_remainder.trunc() as i32;
+        self.wheel_line_remainder -= whole as f32;
+        whole
     }
 
     /// Encode and send a mouse event to a mouse-aware application.
@@ -4567,6 +4597,37 @@ mod tests {
         assert!(!terminal_owns_keyboard(false, true, false, false));
         assert!(!terminal_owns_keyboard(false, false, true, false));
         assert!(!terminal_owns_keyboard(false, false, false, true));
+    }
+
+    #[test]
+    fn mouse_reporting_accumulates_fractional_wheel_lines() {
+        let mut app = test_app();
+
+        for _ in 0..3 {
+            assert_eq!(app.accumulate_wheel_delta(WheelRoute::MouseReport, 0.25), 0);
+        }
+        assert_eq!(app.accumulate_wheel_delta(WheelRoute::MouseReport, 0.25), 1);
+        assert_eq!(app.wheel_line_remainder, 0.0);
+    }
+
+    #[test]
+    fn wheel_accumulator_resets_on_direction_and_route_changes() {
+        let mut app = test_app();
+
+        assert_eq!(app.accumulate_wheel_delta(WheelRoute::MouseReport, 0.75), 0);
+        assert_eq!(
+            app.accumulate_wheel_delta(WheelRoute::MouseReport, -0.25),
+            0
+        );
+        assert_eq!(app.wheel_line_remainder, -0.25);
+
+        assert_eq!(app.accumulate_wheel_delta(WheelRoute::Terminal, 0.25), 0);
+        assert_eq!(app.wheel_line_remainder, 0.25);
+
+        app.select_wheel_route(WheelRoute::TabStrip);
+        assert_eq!(app.wheel_line_remainder, 0.0);
+        assert_eq!(app.accumulate_wheel_delta(WheelRoute::MouseReport, 0.25), 0);
+        assert_eq!(app.wheel_line_remainder, 0.25);
     }
 
     #[test]
