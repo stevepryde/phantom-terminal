@@ -11,9 +11,24 @@ new_fixture() {
   fixture=$1
   package_name=${2:-phantom-core}
   mkdir -p "$fixture/crates/app/src"
+  members='"crates/app"'
+  for workspace_name in phantom-app phantom-core phantom-emu phantom-gfx; do
+    if [ "$workspace_name" = "$package_name" ]; then
+      continue
+    fi
+    stub="$fixture/crates/stub-$workspace_name"
+    mkdir -p "$stub/src"
+    members="$members, \"crates/stub-$workspace_name\""
+    printf '%s\n' \
+      '[package]' \
+      "name = \"$workspace_name\"" \
+      'version = "0.1.0"' \
+      'edition = "2021"' >"$stub/Cargo.toml"
+    printf '%s\n' 'pub fn local_only() {}' >"$stub/src/lib.rs"
+  done
   printf '%s\n' \
     '[workspace]' \
-    'members = ["crates/app"]' \
+    "members = [$members]" \
     'resolver = "2"' >"$fixture/Cargo.toml"
   printf '%s\n' \
     '[package]' \
@@ -71,6 +86,10 @@ packages = {package["id"]: package for package in metadata["packages"]}
 for node in metadata["resolve"]["nodes"]:
     if packages[node["id"]]["name"] == "egui-winit":
         node["features"].append("links")
+    if packages[node["id"]]["name"] == "phantom-core":
+        for dependency in node["deps"]:
+            if packages[dependency["pkg"]]["name"] == "libc":
+                dependency["name"] = "native"
 with open(path, "w", encoding="utf-8") as metadata_file:
     json.dump(metadata, metadata_file)
 PY
@@ -79,6 +98,7 @@ if output=$(python3 "$script_dir/check-no-network.py" "$feature_metadata" 2>&1);
   exit 1
 fi
 grep -q 'unreviewed features for egui-winit' <<<"$output"
+grep -q 'unreviewed direct dependency identity: phantom-core -> libc' <<<"$output"
 
 echo "==> harmless address types, comments, and strings pass"
 clean="$scratch/clean"
@@ -86,6 +106,7 @@ new_fixture "$clean"
 printf '%s\n' \
   'pub const EXAMPLE: &str = "std::net::TcpStream::connect";' \
   'pub const ATTRIBUTE_EXAMPLE: &str = r##"#[link_name = "socket"]"##;' \
+  'pub fn link_name() {}' \
   '// std::net::UdpSocket::bind is forbidden in executable code.' \
   'use libc::{openat, O_CLOEXEC};' \
   'pub fn local_address(port: u16) -> std::net::SocketAddr {' \
@@ -305,6 +326,131 @@ printf '%s\n' \
   >"$compiler_input/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$compiler_input/Cargo.toml"
 expect_failure "$compiler_input" 'direct socket API:'
+
+echo "==> conditional path and aliased include compiler inputs fail and compile"
+for compiler_escape in cfg-path include-alias; do
+  escape_fixture="$scratch/$compiler_escape"
+  new_fixture "$escape_fixture"
+  if [ "$compiler_escape" = cfg-path ]; then
+    printf '%s\n' \
+      '#[cfg_attr(unix, path = "../../../network.rs")]' \
+      'mod network;' >"$escape_fixture/crates/app/src/lib.rs"
+    printf '%s\n' \
+      'pub fn socket() { let _ = std::net::TcpStream::connect("127.0.0.1:9"); }' \
+      >"$escape_fixture/network.rs"
+  else
+    printf '%s\n' \
+      'use std::include as bring;' \
+      'bring!("../../../included.rs");' >"$escape_fixture/crates/app/src/lib.rs"
+    printf '%s\n' \
+      'pub fn socket() { let _ = std::net::TcpStream::connect("127.0.0.1:9"); }' \
+      >"$escape_fixture/included.rs"
+  fi
+  cargo generate-lockfile --offline --manifest-path "$escape_fixture/Cargo.toml"
+  cargo check --offline --manifest-path "$escape_fixture/Cargo.toml" >/dev/null 2>&1
+  expect_failure "$escape_fixture" 'direct socket API:'
+done
+
+echo "==> renamed approved libc authority fails and compiles"
+renamed_libc="$scratch/renamed-libc"
+compile_libc="$scratch/dependencies/compile-libc"
+new_fixture "$renamed_libc"
+new_dependency "$compile_libc" libc 0.2.186
+printf '%s\n' \
+  'pub unsafe fn socket(_: i32, _: i32, _: i32) -> i32 { -1 }' \
+  'pub unsafe fn dlsym(_: usize, _: usize) -> usize { 0 }' \
+  'pub const SYS_socket: i64 = 1;' \
+  'pub unsafe fn syscall(_: i64, _: i32, _: i32, _: i32) -> i64 { -1 }' \
+  >"$compile_libc/src/lib.rs"
+printf '%s\n' '' '[dependencies]' \
+  'native = { package = "libc", path = "../../../dependencies/compile-libc" }' \
+  >>"$renamed_libc/crates/app/Cargo.toml"
+printf '%s\n' \
+  'use native::*;' \
+  'pub fn open() { let _ = unsafe { socket(0, 0, 0) }; }' \
+  >"$renamed_libc/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$renamed_libc/Cargo.toml"
+cargo check --offline --manifest-path "$renamed_libc/Cargo.toml" >/dev/null 2>&1
+expect_failure "$renamed_libc" 'unreviewed direct dependency identity:'
+
+echo "==> libc syscall socket authority fails and compiles"
+syscall_fixture="$scratch/libc-syscall"
+new_fixture "$syscall_fixture"
+printf '%s\n' '' '[dependencies]' \
+  'libc = { path = "../../../dependencies/compile-libc" }' \
+  >>"$syscall_fixture/crates/app/Cargo.toml"
+printf '%s\n' \
+  'pub fn open() {' \
+  '    let _ = unsafe { libc::syscall(libc::SYS_socket, 0, 0, 0) };' \
+  '    let _ = unsafe { libc::dlsym(0, 0) };' \
+  '}' >"$syscall_fixture/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$syscall_fixture/Cargo.toml"
+cargo check --offline --manifest-path "$syscall_fixture/Cargo.toml" >/dev/null 2>&1
+expect_failure "$syscall_fixture" 'direct socket API:'
+
+echo "==> workspace build scripts fail before generated Rust can compile"
+build_script="$scratch/build-script"
+new_fixture "$build_script"
+printf '%s\n' 'mod generated;' >"$build_script/crates/app/src/lib.rs"
+printf '%s\n' \
+  'fn main() {' \
+  '    std::fs::write(' \
+  '        "src/generated.rs",' \
+  '        "pub fn socket() { let _ = std::net::TcpStream::connect(\"127.0.0.1:9\"); }",' \
+  '    ).unwrap();' \
+  '}' >"$build_script/crates/app/build.rs"
+cargo generate-lockfile --offline --manifest-path "$build_script/Cargo.toml"
+expect_failure "$build_script" 'workspace generated-code target is not allowed:'
+cargo check --offline --manifest-path "$build_script/Cargo.toml" >/dev/null 2>&1
+
+echo "==> unknown and inline-assembly macros fail and compile"
+for macro_case in unknown-macro inline-assembly; do
+  macro_fixture="$scratch/$macro_case"
+  new_fixture "$macro_fixture"
+  if [ "$macro_case" = unknown-macro ]; then
+    printf '%s\n' \
+      'macro_rules! inert { () => { 1 }; }' \
+      'pub fn value() -> i32 { inert!() }' >"$macro_fixture/crates/app/src/lib.rs"
+  else
+    printf '%s\n' \
+      'pub unsafe fn machine_code() {' \
+      '    core::arch::asm!("nop");' \
+      '}' >"$macro_fixture/crates/app/src/lib.rs"
+  fi
+  cargo generate-lockfile --offline --manifest-path "$macro_fixture/Cargo.toml"
+  cargo check --offline --manifest-path "$macro_fixture/Cargo.toml" >/dev/null 2>&1
+  expect_failure "$macro_fixture" 'direct socket API:'
+done
+
+echo "==> proc macros and out-of-package targets fail and compile"
+proc_macro_fixture="$scratch/proc-macro"
+new_fixture "$proc_macro_fixture"
+printf '%s\n' '' '[lib]' 'proc-macro = true' >>"$proc_macro_fixture/crates/app/Cargo.toml"
+printf '%s\n' \
+  'extern crate proc_macro;' \
+  'use proc_macro::TokenStream;' \
+  '#[proc_macro]' \
+  'pub fn inert(_: TokenStream) -> TokenStream { TokenStream::new() }' \
+  >"$proc_macro_fixture/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$proc_macro_fixture/Cargo.toml"
+cargo check --offline --manifest-path "$proc_macro_fixture/Cargo.toml" >/dev/null 2>&1
+expect_failure "$proc_macro_fixture" 'workspace generated-code target is not allowed:'
+
+outside_target="$scratch/outside-target"
+new_fixture "$outside_target"
+printf '%s\n' '' '[lib]' 'path = "../../external.rs"' \
+  >>"$outside_target/crates/app/Cargo.toml"
+printf '%s\n' 'pub fn local_only() {}' >"$outside_target/external.rs"
+cargo generate-lockfile --offline --manifest-path "$outside_target/Cargo.toml"
+cargo check --offline --manifest-path "$outside_target/Cargo.toml" >/dev/null 2>&1
+expect_failure "$outside_target" 'Cargo target source is outside its package:'
+
+echo "==> malformed Rust fails closed"
+malformed="$scratch/malformed"
+new_fixture "$malformed"
+printf '%s\n' '/* unterminated' >"$malformed/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$malformed/Cargo.toml"
+expect_failure "$malformed" 'could not parse Rust source'
 
 echo "==> grouped and aliased libc socket imports fail"
 libc_alias="$scratch/libc-alias"

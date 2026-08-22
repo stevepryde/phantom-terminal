@@ -39,6 +39,8 @@ ALLOWED_DIRECT_WORKSPACE = {
     "phantom-gfx": {"phantom-core", "phantom-emu"},
 }
 
+EXPECTED_WORKSPACE = set(ALLOWED_DIRECT_EXTERNAL)
+
 PROTOCOL_CLIENTS = {
     "attohttpc", "awc", "curl", "ehttp", "fastwebsockets", "h2", "hyper",
     "hyper-util", "isahc", "libssh2-sys", "minreq", "quinn", "quinn-proto",
@@ -112,28 +114,16 @@ APPROVED_FEATURES = {
     },
 }
 
-SOCKET_PATTERNS = [
-    re.compile(r"\bstd\s*::\s*net\s*::\s*(TcpStream|TcpListener|UdpSocket)\b"),
-    re.compile(r"\bnet\s*::\s*(TcpStream|TcpListener|UdpSocket)\b"),
-    re.compile(r"\bnet\s*::\s*\{[^}]*\b(TcpStream|TcpListener|UdpSocket)\b", re.S),
-    re.compile(r"\buse\s+std\s*::\s*net\s*(?:;|\bas\b)"),
-    re.compile(r"\buse\s+std\s*::\s*\{[^}]*\bnet\s*(?:,|\bas\b|\})", re.S),
-    re.compile(r"\b(TcpStream|TcpListener|UdpSocket)\s*::\s*(connect|bind)\b"),
-    re.compile(r"\b(tokio|async_std|smol|mio)\s*::\s*net\b"),
-    re.compile(r"\bsocket2\s*::"),
-    re.compile(r"\bnix\s*::\s*sys\s*::\s*socket\b"),
-    re.compile(r"\bextern\s+crate\s+libc\s+as\b"),
-    re.compile(r"\buse\s+(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*libc\s+as\b"),
-    re.compile(r"\buse\s*\{[^}]*\blibc\s+as\b", re.S),
-    re.compile(r"\buse\s+(?:::)?libc\s*::\s*\{[^}]*\bself\s+as\b", re.S),
-    re.compile(r"\b(?:pub\s+)?use\s+(?:::)?libc\s*::\s*(?:\*|\{[^}]*\*)", re.S),
-    re.compile(r"\blibc\s*::\s*(socket|connect|bind)\b"),
-    re.compile(r"\blibc\s*::\s*\{[^}]*\b(socket|connect|bind)\b", re.S),
-    re.compile(r"\b(?:unsafe\s+)?extern\s*\{[^}]*\b(socket|connect|bind)\s*\(", re.S),
-    re.compile(r"\blink_name\b"),
-    re.compile(r"#\s*\[\s*path\s*="),
-    re.compile(r"\binclude\s*!\s*[({]"),
-]
+TOKEN_RE = re.compile(r"r#[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|::|->|=>|[^\s]")
+IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+SOCKET_TYPES = {"TcpStream", "TcpListener", "UdpSocket"}
+SOCKET_FUNCTIONS = {"socket", "connect", "bind", "syscall", "dlopen", "dlsym"}
+ALLOWED_MACROS = {
+    "assert", "assert_eq", "assert_ne", "cfg", "env", "eprintln", "format",
+    "harness_or_skip", "include_bytes", "include_str", "json", "macro_rules",
+    "matches", "panic", "params", "print", "println", "vec", "vertex_attr_array",
+    "write",
+}
 
 
 def strip_comments_and_literals(source):
@@ -162,6 +152,8 @@ def strip_comments_and_literals(source):
                     i += 2
                 else:
                     i += 1
+            if depth:
+                raise ValueError("unterminated block comment")
             for offset in range(start, i):
                 if result[offset] != "\n":
                     result[offset] = " "
@@ -174,7 +166,9 @@ def strip_comments_and_literals(source):
             i += raw.end()
             end_marker = '"' + hashes
             end = source.find(end_marker, i)
-            i = length if end < 0 else end + len(end_marker)
+            if end < 0:
+                raise ValueError("unterminated raw string")
+            i = end + len(end_marker)
             for offset in range(start, i):
                 if result[offset] != "\n":
                     result[offset] = " "
@@ -193,6 +187,8 @@ def strip_comments_and_literals(source):
                 escaped = char == "\\" and not escaped
                 if char != "\\":
                     escaped = False
+            else:
+                raise ValueError("unterminated string")
             for offset in range(start, i):
                 if result[offset] != "\n":
                     result[offset] = " "
@@ -207,6 +203,161 @@ def strip_comments_and_literals(source):
             continue
         i += 1
     return "".join(result)
+
+
+def rust_tokens(source):
+    tokens = []
+    for match in TOKEN_RE.finditer(source):
+        value = match.group(0)
+        if value.startswith("r#"):
+            value = value[2:]
+        tokens.append((value, match.start()))
+    return tokens
+
+
+def sequence_at(values, start, sequence):
+    return values[start : start + len(sequence)] == list(sequence)
+
+
+def find_sequence(values, sequence):
+    for index in range(len(values) - len(sequence) + 1):
+        if sequence_at(values, index, sequence):
+            return index
+    return None
+
+
+def source_violation(tokens):
+    values = [value for value, _ in tokens]
+
+    delimiters = {"(": ")", "[": "]", "{": "}"}
+    stack = []
+    for index, value in enumerate(values):
+        if value in delimiters:
+            stack.append((delimiters[value], index))
+        elif value in delimiters.values():
+            if not stack or stack[-1][0] != value:
+                return index
+            stack.pop()
+    if stack:
+        return stack[-1][1]
+
+    for index in range(len(values) - 2):
+        if values[index + 1] != "!" or values[index + 2] not in {"(", "[", "{"}:
+            continue
+        macro_name = values[index]
+        if not IDENTIFIER_RE.fullmatch(macro_name) or macro_name in {"if", "while"}:
+            continue
+        if macro_name not in ALLOWED_MACROS:
+            return index
+
+    for index in range(len(values) - 1):
+        if values[index : index + 2] != ["#", "["]:
+            continue
+        depth = 1
+        end = index + 2
+        while end < len(values) and depth:
+            if values[end] == "[":
+                depth += 1
+            elif values[end] == "]":
+                depth -= 1
+            end += 1
+        attribute = values[index + 2 : end - 1]
+        authorities = {"path", "link", "link_name", "link_ordinal"}
+        if attribute and (
+            attribute[0] in authorities
+            or (attribute[0] == "cfg_attr" and any(item in authorities for item in attribute))
+        ):
+            return index
+
+    direct_sequences = [
+        ("std", "::", "net", "::", "TcpStream"),
+        ("std", "::", "net", "::", "TcpListener"),
+        ("std", "::", "net", "::", "UdpSocket"),
+        ("net", "::", "TcpStream"),
+        ("net", "::", "TcpListener"),
+        ("net", "::", "UdpSocket"),
+        ("tokio", "::", "net"),
+        ("async_std", "::", "net"),
+        ("smol", "::", "net"),
+        ("mio", "::", "net"),
+        ("socket2", "::"),
+        ("nix", "::", "sys", "::", "socket"),
+        ("libc", "::", "socket"),
+        ("libc", "::", "connect"),
+        ("libc", "::", "bind"),
+        ("libc", "::", "syscall"),
+        ("libc", "::", "dlopen"),
+        ("libc", "::", "dlsym"),
+        ("TcpStream", "::", "connect"),
+        ("TcpListener", "::", "bind"),
+        ("UdpSocket", "::", "bind"),
+    ]
+    for sequence in direct_sequences:
+        index = find_sequence(values, sequence)
+        if index is not None:
+            return index
+
+    for index, value in enumerate(values):
+        if value != "use":
+            continue
+        end = index + 1
+        depth = 0
+        while end < len(values):
+            if values[end] in {"{", "(", "["}:
+                depth += 1
+            elif values[end] in {"}", ")", "]"}:
+                depth -= 1
+            elif values[end] == ";" and depth == 0:
+                break
+            end += 1
+        use_tree = values[index + 1 : end]
+        if "include" in use_tree:
+            return index
+        if "libc" in use_tree:
+            libc_index = use_tree.index("libc")
+            aliases_libc = (
+                "*" in use_tree
+                or any(symbol in use_tree for symbol in SOCKET_FUNCTIONS)
+                or sequence_at(use_tree, libc_index, ("libc", "as"))
+                or find_sequence(use_tree, ("self", "as")) is not None
+            )
+            if aliases_libc:
+                return index
+        if "std" in use_tree and "net" in use_tree:
+            net_index = use_tree.index("net")
+            imports_net_module = (
+                net_index + 1 == len(use_tree)
+                or use_tree[net_index + 1] != "::"
+            )
+            if (
+                imports_net_module
+                or "*" in use_tree
+                or any(socket_type in use_tree for socket_type in SOCKET_TYPES)
+            ):
+                return index
+
+    for index in range(len(values) - 4):
+        if values[index : index + 3] == ["extern", "crate", "libc"] and "as" in values[index + 3 : index + 5]:
+            return index
+
+    for index, value in enumerate(values):
+        if value != "extern":
+            continue
+        try:
+            start = values.index("{", index + 1)
+        except ValueError:
+            continue
+        depth = 1
+        end = start + 1
+        while end < len(values) and depth:
+            if values[end] == "{":
+                depth += 1
+            elif values[end] == "}":
+                depth -= 1
+            end += 1
+        if any(symbol in values[start + 1 : end - 1] for symbol in SOCKET_FUNCTIONS - {"syscall"}):
+            return index
+    return None
 
 
 def reachable(nodes_by_id, start, target):
@@ -233,6 +384,10 @@ def validate_graph(metadata):
     workspace_ids = set(metadata["workspace_members"])
     blocked = set()
 
+    workspace_names = {packages_by_id[package_id]["name"] for package_id in workspace_ids}
+    if workspace_names != EXPECTED_WORKSPACE:
+        blocked.add(f"unreviewed workspace package set: {sorted(workspace_names)}")
+
     resolved_names = {packages_by_id[package_id]["name"] for package_id in nodes_by_id}
     for name in sorted(resolved_names & PROTOCOL_CLIENTS):
         blocked.add(f"resolved network client: {name}")
@@ -254,6 +409,9 @@ def validate_graph(metadata):
                 package["source"] == CRATES_IO
                 and allowed_external.get(dependency_name) == package["version"]
             )
+            canonical_edge_name = dependency_name.replace("-", "_")
+            if dependency["name"] != canonical_edge_name:
+                approved = False
             if not approved:
                 blocked.add(
                     "unreviewed direct dependency identity: "
@@ -367,13 +525,19 @@ def validate_sources(metadata):
         package_dir = Path(package["manifest_path"]).parent
         roots = {package_dir}
         for target in package["targets"]:
+            if any(kind in {"custom-build", "proc-macro"} for kind in target["kind"]):
+                blocked.add(
+                    f"workspace generated-code target is not allowed: {target['src_path']}"
+                )
             target_path = Path(target["src_path"])
-            if not target_path.is_file():
+            if target_path.is_symlink() or not target_path.is_file():
                 blocked.add(f"Cargo target source is not a readable file: {target_path}")
             try:
-                target_path.relative_to(package_dir)
-            except ValueError:
-                roots.add(target_path.parent)
+                resolved_target = target_path.resolve(strict=True)
+                resolved_package = package_dir.resolve(strict=True)
+                resolved_target.relative_to(resolved_package)
+            except (OSError, ValueError):
+                blocked.add(f"Cargo target source is outside its package: {target_path}")
         for root in roots:
             collect_sources(root)
 
@@ -383,13 +547,17 @@ def validate_sources(metadata):
         except (OSError, UnicodeError) as error:
             blocked.add(f"could not read Rust source {source_file}: {error}")
             continue
-        code = strip_comments_and_literals(source)
-        for pattern in SOCKET_PATTERNS:
-            match = pattern.search(code)
-            if match:
-                line = code.count("\n", 0, match.start()) + 1
-                blocked.add(f"direct socket API: {source_file}:{line}")
-                break
+        try:
+            code = strip_comments_and_literals(source)
+        except ValueError as error:
+            blocked.add(f"could not parse Rust source {source_file}: {error}")
+            continue
+        tokens = rust_tokens(code)
+        violation = source_violation(tokens)
+        if violation is not None:
+            offset = tokens[violation][1]
+            line = code.count("\n", 0, offset) + 1
+            blocked.add(f"direct socket API: {source_file}:{line}")
     return blocked
 
 
