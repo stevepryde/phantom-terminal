@@ -499,6 +499,7 @@ pub struct AlacrittyCore {
     responses: Rc<RefCell<Vec<u8>>>,
     size: TermDimensions,
     terminal_options: (u32, CursorShape),
+    search_matches: Vec<SearchRange>,
     active_search_match: Option<SearchRange>,
     snapshot_generation: u64,
     snapshot_cache: RefCell<Option<(u64, Rc<Snapshot>)>>,
@@ -520,6 +521,7 @@ impl AlacrittyCore {
             responses,
             size,
             terminal_options: (scrollback_lines, default_cursor),
+            search_matches: Vec::new(),
             active_search_match: None,
             snapshot_generation: 0,
             snapshot_cache: RefCell::new(None),
@@ -536,7 +538,7 @@ impl AlacrittyCore {
         }
         // Shrinking history rotates absolute grid coordinates; the app will
         // recompute live search results against the new layout.
-        self.active_search_match = None;
+        self.clear_search_highlights();
         self.term
             .set_options(term_config(scrollback_lines, default_cursor));
         self.terminal_options = options;
@@ -576,10 +578,10 @@ impl VtCore for AlacrittyCore {
         if bytes.is_empty() {
             return;
         }
-        // Keep the last active range painted while the app coalesces streamed
-        // output into its debounced search refresh. The refresh replaces this
-        // potentially rotated range shortly; clearing it here makes the active
-        // highlight blink off between every pair of PTY chunks.
+        // Keep the last result map painted while the app coalesces streamed
+        // output into its debounced search refresh. The refresh replaces these
+        // potentially rotated ranges shortly; clearing them here makes the
+        // highlights blink off between every pair of PTY chunks.
         self.parser.advance(&mut self.term, bytes);
         self.invalidate_snapshot();
     }
@@ -590,7 +592,7 @@ impl VtCore for AlacrittyCore {
             return;
         }
         // Reflow changes the coordinate mapping even when the text is stable.
-        self.active_search_match = None;
+        self.clear_search_highlights();
         self.size = size;
         self.term.resize(self.size);
         self.invalidate_snapshot();
@@ -746,6 +748,18 @@ impl VtCore for AlacrittyCore {
         }
     }
 
+    fn set_search_matches(&mut self, search_matches: &[SearchMatch]) {
+        let matches = search_matches
+            .iter()
+            .take(MAX_SEARCH_MATCHES)
+            .map(|search_match| self.clamp_search_range(search_match.range))
+            .collect::<Vec<_>>();
+        if self.search_matches != matches {
+            self.search_matches = matches;
+            self.invalidate_snapshot();
+        }
+    }
+
     fn mouse_mode(&self) -> MouseMode {
         let mode = self.term.mode();
         let protocol = if mode.contains(TermMode::MOUSE_MOTION) {
@@ -797,9 +811,18 @@ impl AlacrittyCore {
                 1
             };
             let selected = selection.is_some_and(|range| range.contains(indexed.point));
+            let point = from_point(indexed.point);
             let search_match = self
                 .active_search_match
-                .is_some_and(|range| range.contains(from_point(indexed.point)));
+                .is_some_and(|range| range.contains(point));
+            let search_match_inactive = !search_match
+                && self
+                    .search_matches
+                    .get(
+                        self.search_matches
+                            .partition_point(|range| range.end < point),
+                    )
+                    .is_some_and(|range| range.contains(point));
             cells[row as usize * cols_us + col] = SnapCell {
                 c: cell.c,
                 fg: map_color(cell.fg),
@@ -808,6 +831,7 @@ impl AlacrittyCore {
                 width,
                 selected,
                 search_match,
+                search_match_inactive,
             };
         }
 
@@ -836,6 +860,11 @@ impl AlacrittyCore {
 
     fn invalidate_snapshot(&mut self) {
         self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+    }
+
+    fn clear_search_highlights(&mut self) {
+        self.search_matches.clear();
+        self.active_search_match = None;
     }
 
     /// Convert a viewport cell `(row, col)` into an absolute grid point,
@@ -1203,6 +1232,55 @@ mod tests {
     }
 
     #[test]
+    fn active_and_inactive_search_matches_are_distinct_from_selection() {
+        let mut term = core(2, 20, 100);
+        term.advance(b"hit gap hit");
+        let matches = term
+            .search_scrollback("hit", SearchOptions::default(), None)
+            .unwrap()
+            .matches;
+        assert_eq!(matches.len(), 2);
+
+        term.set_search_matches(&matches);
+        term.set_active_search_match(Some(matches[0]));
+        term.selection_start(0, 8, SelSide::Left);
+        term.selection_update(0, 10, SelSide::Right);
+        let selection = term.selection_range();
+
+        let first = term.snapshot();
+        assert_eq!(
+            first.cells.iter().filter(|cell| cell.search_match).count(),
+            3
+        );
+        assert_eq!(
+            first
+                .cells
+                .iter()
+                .filter(|cell| cell.search_match_inactive)
+                .count(),
+            3
+        );
+        assert!(first.cell(0, 8).unwrap().selected);
+        assert!(first.cell(0, 8).unwrap().search_match_inactive);
+
+        term.set_active_search_match(Some(matches[1]));
+        let second = term.snapshot();
+        assert!(second.cell(0, 0).unwrap().search_match_inactive);
+        assert!(second.cell(0, 8).unwrap().search_match);
+        assert!(second.cell(0, 8).unwrap().selected);
+        assert_eq!(term.selection_range(), selection);
+
+        term.set_search_matches(&[]);
+        term.set_active_search_match(None);
+        let cleared = term.snapshot();
+        assert!(!cleared
+            .cells
+            .iter()
+            .any(|cell| cell.search_match || cell.search_match_inactive));
+        assert_eq!(term.selection_range(), selection);
+    }
+
+    #[test]
     fn no_op_mutations_keep_the_cached_snapshot() {
         let mut term = core(4, 20, 100);
         let initial = term.snapshot();
@@ -1212,6 +1290,7 @@ mod tests {
         term.scroll(-1);
         term.scroll_to_offset(0);
         term.selection_clear();
+        term.set_search_matches(&[]);
         term.set_active_search_match(None);
         term.set_terminal_options(100, CursorShape::Block);
 

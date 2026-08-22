@@ -441,6 +441,7 @@ impl Renderer {
         let cursor_color = self.palette.cursor();
         let selection_color = self.palette.selection();
         let search_match_color = [cursor_color[0], cursor_color[1], cursor_color[2], 92];
+        let inactive_search_match_color = [cursor_color[0], cursor_color[1], cursor_color[2], 40];
         let cursor = snap.cursor;
         let show_cursor = cursor.visible && cursor_on;
         let rows = (snap.rows as usize).min(max_grid.0);
@@ -494,7 +495,9 @@ impl Renderer {
                 // Find is intentionally distinct from the ordinary terminal
                 // selection so selection-only search never destroys what the
                 // user selected for copying.
-                if cell.search_match {
+                if cell.search_match_inactive {
+                    self.fill_rect(x, y, cw * wide, ch, inactive_search_match_color);
+                } else if cell.search_match {
                     self.fill_rect(x, y, cw * wide, ch, search_match_color);
                     let underline_height = (ch * 0.10).max(1.0);
                     self.fill_rect(

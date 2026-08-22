@@ -101,6 +101,13 @@ pub trait VtCore {
     /// This does not replace or mutate the user's ordinary terminal selection.
     fn set_active_search_match(&mut self, search_match: Option<SearchMatch>);
 
+    /// Set every temporary find match used to render the visible result map.
+    ///
+    /// The app supplies the bounded, buffer-ordered result set from its latest
+    /// completed search. This does not replace or mutate the user's ordinary
+    /// terminal selection.
+    fn set_search_matches(&mut self, search_matches: &[SearchMatch]);
+
     /// The application's requested mouse-reporting mode.
     fn mouse_mode(&self) -> MouseMode;
 
@@ -172,6 +179,8 @@ pub struct SnapCell {
     pub selected: bool,
     /// True when the cell is within the active find match.
     pub search_match: bool,
+    /// True when the cell is within a non-active find match.
+    pub search_match_inactive: bool,
 }
 
 impl Default for SnapCell {
@@ -184,6 +193,7 @@ impl Default for SnapCell {
             width: 1,
             selected: false,
             search_match: false,
+            search_match_inactive: false,
         }
     }
 }
