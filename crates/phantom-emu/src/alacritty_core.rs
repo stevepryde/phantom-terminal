@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -43,6 +44,79 @@ impl EventListener for ResponseSink {
         }
         // Title/Bell/clipboard/etc. are handled at the app layer (Phase 3).
     }
+}
+
+/// A compiled terminal regex and the exact query/options key it represents.
+///
+/// Workers can retain this across buffer snapshots; the DFA caches are reused
+/// only while the full key is unchanged.
+pub struct CompiledSearch {
+    query: String,
+    options: SearchOptions,
+    regex: RegexSearch,
+}
+
+impl CompiledSearch {
+    pub fn new(query: &str, options: SearchOptions) -> Result<Self, SearchError> {
+        let pattern = search_pattern(query, options);
+        let regex = RegexSearch::new(&pattern)
+            .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
+        Ok(Self {
+            query: query.to_owned(),
+            options,
+            regex,
+        })
+    }
+
+    pub fn matches(&self, query: &str, options: SearchOptions) -> bool {
+        self.query == query && self.options == options
+    }
+}
+
+fn search_term<T: EventListener>(
+    term: &Term<T>,
+    size: TermDimensions,
+    range: SearchRange,
+    compiled: &mut CompiledSearch,
+    cancelled: &AtomicBool,
+) -> Option<SearchOutcome> {
+    let start = to_point(range.start);
+    let end = to_point(range.end);
+    if start > end {
+        return Some(SearchOutcome::default());
+    }
+
+    let mut matches = Vec::new();
+    let mut capped = false;
+    let mut origin = start;
+    while origin <= end {
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        let Some(found) = term.regex_search_right(&mut compiled.regex, origin, end) else {
+            break;
+        };
+        let found_start = *found.start();
+        let found_end = *found.end();
+        if found_start < start || found_end > end {
+            break;
+        }
+        let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
+        if !compiled.options.whole_word || is_whole_word_match(term, size, found_range) {
+            if matches.len() >= MAX_SEARCH_MATCHES {
+                capped = true;
+                break;
+            }
+            matches.push(SearchMatch { range: found_range });
+        }
+
+        let Some(next) = point_after(size, found_end, end) else {
+            break;
+        };
+        origin = next;
+    }
+
+    (!cancelled.load(Ordering::Acquire)).then_some(SearchOutcome { matches, capped })
 }
 
 /// Cell dimensions handed to `Term` (scrollback depth comes from `Config`).
@@ -121,6 +195,19 @@ impl AlacrittyCore {
             .set_options(term_config(scrollback_lines, default_cursor));
         self.terminal_options = options;
         self.invalidate_snapshot();
+    }
+
+    /// Search this core with a worker-owned compiled regex. The background
+    /// find replica uses this to keep matching and DFA caches off the UI
+    /// thread while retaining the emulator's exact coordinate mapping.
+    pub fn search_compiled(
+        &self,
+        compiled: &mut CompiledSearch,
+        range: Option<SearchRange>,
+        cancelled: &AtomicBool,
+    ) -> Option<SearchOutcome> {
+        let range = self.clamp_search_range(range.unwrap_or_else(|| self.full_search_range()));
+        search_term(&self.term, self.size, range, compiled, cancelled)
     }
 }
 
@@ -289,47 +376,16 @@ impl VtCore for AlacrittyCore {
         if query.is_empty() {
             return Ok(SearchOutcome::default());
         }
-
-        let pattern = search_pattern(query, options);
-        let mut regex = RegexSearch::new(&pattern)
-            .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
+        let mut compiled = CompiledSearch::new(query, options)?;
         let range = self.clamp_search_range(range.unwrap_or_else(|| self.full_search_range()));
-        let start = to_point(range.start);
-        let end = to_point(range.end);
-        if start > end {
-            return Ok(SearchOutcome::default());
-        }
-
-        let mut matches = Vec::new();
-        let mut capped = false;
-        let mut origin = start;
-        while origin <= end {
-            let Some(found) = self.term.regex_search_right(&mut regex, origin, end) else {
-                break;
-            };
-            let found_start = *found.start();
-            let found_end = *found.end();
-            if found_start < start || found_end > end {
-                break;
-            }
-            let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
-            if !options.whole_word || self.is_whole_word_match(found_range) {
-                // Only report the cap once a further real match exists, so
-                // `capped` never lies about a buffer with exactly the cap.
-                if matches.len() >= MAX_SEARCH_MATCHES {
-                    capped = true;
-                    break;
-                }
-                matches.push(SearchMatch { range: found_range });
-            }
-
-            let Some(next) = self.point_after(found_end, end) else {
-                break;
-            };
-            origin = next;
-        }
-
-        Ok(SearchOutcome { matches, capped })
+        Ok(search_term(
+            &self.term,
+            self.size,
+            range,
+            &mut compiled,
+            &AtomicBool::new(false),
+        )
+        .unwrap_or_default())
     }
 
     fn set_active_search_match(&mut self, search_match: Option<SearchMatch>) {
@@ -474,15 +530,6 @@ impl AlacrittyCore {
         )
     }
 
-    fn point_after(&self, point: Point, limit: Point) -> Option<Point> {
-        let next = if point.column.0 + 1 < self.size.columns {
-            Point::new(point.line, point.column + 1)
-        } else {
-            Point::new(point.line + 1, Column(0))
-        };
-        (next <= limit).then_some(next)
-    }
-
     fn scroll_range_into_view(&mut self, range: SearchRange) {
         let viewport_rows = self.size.screen_lines as i32;
         let current_offset = self.term.grid().display_offset() as i32;
@@ -497,86 +544,105 @@ impl AlacrittyCore {
         };
         self.scroll_to_offset(target_line.saturating_neg() as usize);
     }
+}
 
-    fn is_whole_word_match(&self, range: SearchRange) -> bool {
-        let start = to_point(range.start);
-        let end = to_point(range.end);
-        let starts_with_word = regex_syntax::is_word_character(self.term.grid()[start].c);
-        let ends_with_word = regex_syntax::is_word_character(self.term.grid()[end].c);
-        let word_before = self
-            .previous_text_point(start)
-            .is_some_and(|point| regex_syntax::is_word_character(self.term.grid()[point].c));
-        let word_after = self
-            .next_text_point(end)
-            .is_some_and(|point| regex_syntax::is_word_character(self.term.grid()[point].c));
-        starts_with_word != word_before && ends_with_word != word_after
+fn point_after(size: TermDimensions, point: Point, limit: Point) -> Option<Point> {
+    let next = if point.column.0 + 1 < size.columns {
+        Point::new(point.line, point.column + 1)
+    } else {
+        Point::new(point.line + 1, Column(0))
+    };
+    (next <= limit).then_some(next)
+}
+
+fn is_whole_word_match<T: EventListener>(
+    term: &Term<T>,
+    size: TermDimensions,
+    range: SearchRange,
+) -> bool {
+    let start = to_point(range.start);
+    let end = to_point(range.end);
+    let starts_with_word = regex_syntax::is_word_character(term.grid()[start].c);
+    let ends_with_word = regex_syntax::is_word_character(term.grid()[end].c);
+    let word_before = previous_text_point(term, size, start)
+        .is_some_and(|point| regex_syntax::is_word_character(term.grid()[point].c));
+    let word_after = next_text_point(term, size, end)
+        .is_some_and(|point| regex_syntax::is_word_character(term.grid()[point].c));
+    starts_with_word != word_before && ends_with_word != word_after
+}
+
+fn previous_text_point<T: EventListener>(
+    term: &Term<T>,
+    size: TermDimensions,
+    point: Point,
+) -> Option<Point> {
+    let mut line = point.line;
+    let mut column = point.column.0;
+    if column == 0 {
+        if line <= term.topmost_line() {
+            return None;
+        }
+        let previous_line = line - 1;
+        let last_column = Column(size.columns.saturating_sub(1));
+        if !term.grid()[Point::new(previous_line, last_column)]
+            .flags
+            .contains(Flags::WRAPLINE)
+        {
+            return None;
+        }
+        line = previous_line;
+        column = size.columns;
     }
 
-    fn previous_text_point(&self, point: Point) -> Option<Point> {
-        let mut line = point.line;
-        let mut column = point.column.0;
-        if column == 0 {
-            if line <= self.term.topmost_line() {
-                return None;
-            }
-            let previous_line = line - 1;
-            let last_column = Column(self.size.columns.saturating_sub(1));
-            if !self.term.grid()[Point::new(previous_line, last_column)]
-                .flags
-                .contains(Flags::WRAPLINE)
-            {
-                return None;
-            }
-            line = previous_line;
-            column = self.size.columns;
+    while column > 0 {
+        column -= 1;
+        let candidate = Point::new(line, Column(column));
+        if !term.grid()[candidate]
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            return Some(candidate);
         }
-
-        while column > 0 {
-            column -= 1;
-            let candidate = Point::new(line, Column(column));
-            if !self.term.grid()[candidate]
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                return Some(candidate);
-            }
-        }
-        None
     }
+    None
+}
 
-    fn next_text_point(&self, point: Point) -> Option<Point> {
-        let grid = self.term.grid();
-        let mut line = point.line;
-        let mut column = point.column.0
-            + if grid[point].flags.contains(Flags::WIDE_CHAR) {
-                2
-            } else {
-                1
-            };
+fn next_text_point<T: EventListener>(
+    term: &Term<T>,
+    size: TermDimensions,
+    point: Point,
+) -> Option<Point> {
+    let grid = term.grid();
+    let mut line = point.line;
+    let mut column = point.column.0
+        + if grid[point].flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
 
-        loop {
-            if column >= self.size.columns {
-                let last_column = Column(self.size.columns.saturating_sub(1));
-                if line >= self.term.bottommost_line()
-                    || !grid[Point::new(line, last_column)]
-                        .flags
-                        .contains(Flags::WRAPLINE)
-                {
-                    return None;
-                }
-                line += 1;
-                column = 0;
-            }
-
-            let candidate = Point::new(line, Column(column));
-            if !grid[candidate]
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    loop {
+        if column >= size.columns {
+            let last_column = Column(size.columns.saturating_sub(1));
+            if line >= term.bottommost_line()
+                || !grid[Point::new(line, last_column)]
+                    .flags
+                    .contains(Flags::WRAPLINE)
             {
-                return Some(candidate);
+                return None;
             }
-            column += 1;
+            line += 1;
+            column = 0;
         }
+
+        let candidate = Point::new(line, Column(column));
+        if !grid[candidate]
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            return Some(candidate);
+        }
+        column += 1;
     }
 }
 
