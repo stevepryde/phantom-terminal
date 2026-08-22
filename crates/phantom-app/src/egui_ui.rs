@@ -1552,9 +1552,7 @@ fn command_palette_overlay(
                         let button = Button::selectable(row.selected, text)
                             .min_size(egui::vec2(ui.available_width(), 32.0));
                         let clicked = ui
-                            .push_id(("palette_result", &row.label), |ui| {
-                                ui.add(button).clicked()
-                            })
+                            .push_id(("palette_result", &row.id), |ui| ui.add(button).clicked())
                             .inner;
                         if clicked {
                             action = palette.execute_filtered(row.filtered_index);
