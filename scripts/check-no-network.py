@@ -25,7 +25,10 @@ ALLOWED_DIRECT_EXTERNAL = {
         "portable-pty": "0.9.0", "rusqlite": "0.40.1", "serde": "1.0.228",
         "serde_json": "1.0.150", "thiserror": "2.0.18",
     },
-    "phantom-emu": {"alacritty_terminal": "0.26.0", "regex-syntax": "0.8.11"},
+    "phantom-emu": {
+        "alacritty_terminal": "0.26.0", "regex-automata": "0.4.15",
+        "regex-syntax": "0.8.11",
+    },
     "phantom-gfx": {
         "bytemuck": "1.25.1", "epaint_default_fonts": "0.35.0",
         "fontique": "0.11.0", "image": "0.25.10", "png": "0.18.1",
@@ -96,7 +99,18 @@ APPROVED_FEATURES = {
         "default", "std", "unicode", "unicode-age", "unicode-bool", "unicode-case",
         "unicode-gencat", "unicode-perl", "unicode-script", "unicode-segment",
     },
-    "rusqlite": {"bundled", "cache", "default", "ffi-sqlite-wasm-rs", "hashlink", "modern_sqlite"},
+    "regex-automata": {
+        "alloc", "default", "dfa", "dfa-build", "dfa-onepass", "dfa-search",
+        "hybrid", "meta", "nfa", "nfa-backtrack", "nfa-pikevm", "nfa-thompson",
+        "perf", "perf-inline", "perf-literal", "perf-literal-multisubstring",
+        "perf-literal-substring", "std", "syntax", "unicode", "unicode-age",
+        "unicode-bool", "unicode-case", "unicode-gencat", "unicode-perl",
+        "unicode-script", "unicode-segment", "unicode-word-boundary",
+    },
+    "rusqlite": {
+        "blob", "bundled", "cache", "default", "ffi-sqlite-wasm-rs", "hashlink",
+        "modern_sqlite",
+    },
     "serde": {"alloc", "default", "derive", "rc", "serde_derive", "std"},
     "serde_json": {"default", "std"},
     "swash": {"default", "render", "scale", "std"},
@@ -126,6 +140,10 @@ BUILTIN_MACROS = {
 }
 
 APPROVED_CUSTOM_MACRO_FILES = {
+    "crates/phantom-emu/src/alacritty_core.rs": (
+        "af4782addaacb9a2df8b43660e810d81d30ca4b0e45203d6ac4ffe1396f9987b",
+        {"reset_state"},
+    ),
     "crates/phantom-gfx/tests/headless.rs": (
         "194bf25be61f92c20873cf26e90660e1269cbf42efa2f167048d8d05b6229b74",
         {"harness_or_skip"},
