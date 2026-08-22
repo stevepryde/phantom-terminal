@@ -20,7 +20,7 @@ use crate::context_actions::{
     FrequentCommandsSection, ManifestSection, ManifestTab, ManifestTrustState,
     RecentDirectoriesSection, SpdeploySection, SpdeployTrustState,
 };
-use crate::ui_components::{with_alpha, CustomDropdown, DIVIDER, SIDEBAR_SURFACE};
+use crate::ui_components::{with_alpha, CustomDropdown, DIVIDER, FOCUS_ACCENT, SIDEBAR_SURFACE};
 
 const ACTION_ROW_HEIGHT: f32 = 28.0;
 const ACTION_TEXT_SIZE: f32 = 12.0;
@@ -82,6 +82,10 @@ pub(crate) struct ContextUi {
     /// Transfers focus between the launcher and collapse button after the
     /// control changes identity with the sidebar state.
     focus_toggle: bool,
+    /// Moves keyboard focus into the persistent sidebar on its next visible
+    /// frame. This bridges the terminal-owned input path into egui without
+    /// changing ordinary terminal Tab handling.
+    focus_sidebar_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +135,10 @@ impl ContextUi {
 
     pub fn owns_keyboard(&self) -> bool {
         self.owns_keyboard
+    }
+
+    pub fn request_sidebar_focus(&mut self) {
+        self.focus_sidebar_requested = true;
     }
 
     #[cfg(test)]
@@ -197,9 +205,10 @@ impl ContextUi {
                     .corner_radius(4)
                     .show(ui, |ui| {
                         let launcher = context_icon_button(ui, true);
-                        if self.focus_toggle {
+                        if self.focus_toggle || self.focus_sidebar_requested {
                             launcher.request_focus();
                             self.focus_toggle = false;
+                            self.focus_sidebar_requested = false;
                         }
                         if launcher.clicked() {
                             config.context_actions.panel_collapsed = false;
@@ -320,9 +329,10 @@ impl ContextUi {
                 |ui| {
                     ui.add_space(4.0);
                     let collapse = context_icon_button(ui, false);
-                    if self.focus_toggle {
+                    if self.focus_toggle || self.focus_sidebar_requested {
                         collapse.request_focus();
                         self.focus_toggle = false;
+                        self.focus_sidebar_requested = false;
                     }
                     if collapse.clicked() {
                         config.context_actions.panel_collapsed = true;
@@ -397,7 +407,36 @@ impl ContextUi {
             node.add_action(Action::Increment);
             node.add_action(Action::SetValue);
         });
-        if resize.hovered() || self.sidebar_resize_active {
+        let keyboard_width = if resize.has_focus() {
+            root_ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    resize.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        ..Default::default()
+                    },
+                );
+            });
+            root_ui.input(|input| {
+                let step = if input.modifiers.shift { 20.0 } else { 10.0 };
+                if input.key_pressed(egui::Key::ArrowLeft) {
+                    Some(sidebar_width + step)
+                } else if input.key_pressed(egui::Key::ArrowRight) {
+                    Some(sidebar_width - step)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(requested_width) = keyboard_width {
+            let requested_width =
+                requested_width.clamp(MIN_CONTEXT_SIDEBAR_WIDTH as f32, max_width);
+            width_changed = (requested_width - sidebar_width).abs() >= 0.5;
+            sidebar_width = requested_width;
+        }
+        if resize.hovered() || resize.has_focus() || self.sidebar_resize_active {
             root_ui
                 .ctx()
                 .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -405,6 +444,8 @@ impl ContextUi {
 
         let handle_color = if self.sidebar_resize_active {
             root_ui.visuals().widgets.active.fg_stroke.color
+        } else if resize.has_focus() {
+            FOCUS_ACCENT
         } else if resize.hovered() {
             root_ui.visuals().widgets.hovered.fg_stroke.color
         } else {
@@ -414,7 +455,7 @@ impl ContextUi {
             panel_rect.left(),
             panel_rect.y_range(),
             egui::Stroke::new(
-                if resize.hovered() || self.sidebar_resize_active {
+                if resize.hovered() || resize.has_focus() || self.sidebar_resize_active {
                     2.0
                 } else {
                     1.0
@@ -1349,6 +1390,19 @@ mod tests {
     }
 
     #[test]
+    fn explicit_sidebar_entry_focuses_egui_without_requiring_a_pointer() {
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        let mut state = ContextUi::default();
+        state.request_sidebar_focus();
+
+        let (_, focused) = run_frame(&ctx, &mut state, &mut config);
+
+        assert!(focused);
+        assert!(state.owns_keyboard());
+    }
+
+    #[test]
     fn expanded_sidebar_exposes_controls_values_and_expanded_state() {
         let ctx = Context::default();
         ctx.enable_accesskit();
@@ -1452,6 +1506,52 @@ mod tests {
 
         assert_eq!(config.context_actions.sidebar_width, 270);
         assert!(outcome.unwrap().config_changed);
+    }
+
+    #[test]
+    fn focused_sidebar_divider_resizes_with_horizontal_arrows() {
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        let mut state = ContextUi::default();
+        let screen_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        ctx.memory_mut(|memory| {
+            memory.request_focus(Id::new("phantom_context_actions_resize"));
+        });
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                state.draw(ui, &mut config, &snapshot(), 42.0, 220);
+            },
+        );
+
+        let mut outcome = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                outcome = Some(state.draw(ui, &mut config, &snapshot(), 42.0, 220));
+            },
+        );
+
+        assert_eq!(config.context_actions.sidebar_width, 270);
+        assert!(outcome.unwrap().config_changed);
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(Id::new("phantom_context_actions_resize"))
+        );
     }
 
     #[test]

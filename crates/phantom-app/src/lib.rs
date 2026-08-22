@@ -1765,6 +1765,11 @@ impl App {
             }
             PaletteAction::FindInScrollback => self.open_find(),
             PaletteAction::ToggleFullscreen => self.toggle_fullscreen(),
+            PaletteAction::FocusContextSidebar => {
+                if self.ui.focus_context_sidebar(&mut self.config) {
+                    self.mark_config_dirty();
+                }
+            }
         }
         self.request_redraw();
     }

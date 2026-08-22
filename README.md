@@ -121,8 +121,13 @@ project-specific actions. Closing it restores the full terminal width and leaves
 a floating reopen icon in the content area's top-right. Each provider section is
 a collapsible accordion, and its state—along with sidebar width/open state and
 global provider enablement in **Settings → Context Actions**—is remembered across
-restarts. Directories stays first in the stable provider order. It combines the
-five most recently used and five most frequently used directories, removes
+restarts. To enter the sidebar without a mouse, open the command palette
+(`CmdOrCtrl+K` by default) and choose **Focus Context Sidebar**. `Tab` and
+`Shift+Tab` then move through its controls, `Left`/`Right` resize a focused
+divider (`Shift` uses larger steps), and `Escape` returns focus to the terminal.
+Ordinary terminal `Tab` continues to send a tab character until this explicit
+focus path is used. Directories stays first in the stable provider order. It
+combines the five most recently used and five most frequently used directories, removes
 duplicates, and displays them alphabetically in dense rows with the home prefix
 shown as `~`; click a row to open that directory in a new tab. Frequent commands
 remain visible as a manual reference, but Phantom does not inject commands or
