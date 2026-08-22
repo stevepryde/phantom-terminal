@@ -2086,6 +2086,12 @@ impl App {
             self.handle_action(action);
             return;
         }
+        // Super is an application shortcut modifier, not a terminal modifier.
+        // Once the app-level routes above decline a chord, consume it instead
+        // of dropping Super during VT encoding and leaking the bare key.
+        if self.mods.sup {
+            return;
+        }
         // Otherwise: send to the focused terminal.
         let app_cursor = self
             .tabs
@@ -4205,6 +4211,70 @@ mod tests {
             Some("Could not send text: pty error: no such pty")
         );
         assert!(app.preedit.is_empty());
+    }
+
+    #[test]
+    fn unbound_super_characters_and_digits_do_not_reach_the_pty() {
+        for (key, text) in [
+            (Key::Char('a'), "a"),
+            (Key::Char('p'), "p"),
+            (Key::Char('0'), "0"),
+        ] {
+            let mut app = test_app();
+            app.tabs.push(Tab::new(
+                0,
+                AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+                u32::MAX,
+                String::new(),
+                None,
+            ));
+
+            app.handle_input(AppInput::Key {
+                key,
+                text: Some(text.to_string()),
+                mods: Mods {
+                    sup: true,
+                    ..Mods::default()
+                },
+            });
+
+            assert_eq!(
+                app.notice_text(),
+                None,
+                "unbound Super+{text} attempted a PTY write"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_primary_chord_is_handled_before_the_super_guard() {
+        let mut app = test_app();
+        app.config.keybindings = vec![phantom_core::Keybinding {
+            id: "palette".to_string(),
+            action: "palette.toggle".to_string(),
+            keys: "CmdOrCtrl+P".to_string(),
+        }];
+        app.keymap = Keymap::from_config(&app.config.keybindings);
+        let mods = if cfg!(target_os = "macos") {
+            Mods {
+                sup: true,
+                ..Mods::default()
+            }
+        } else {
+            Mods {
+                ctrl: true,
+                ..Mods::default()
+            }
+        };
+
+        app.handle_input(AppInput::Key {
+            key: Key::Char('p'),
+            text: Some("p".to_string()),
+            mods,
+        });
+
+        assert!(app.palette.open);
+        assert_eq!(app.notice_text(), None);
     }
 
     #[test]
