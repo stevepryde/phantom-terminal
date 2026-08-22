@@ -132,7 +132,12 @@ APPROVED_FEATURES = {
 TOKEN_RE = re.compile(r"r#[^\W\d]\w*|[^\W\d]\w*|::|->|=>|[^\s]")
 IDENTIFIER_RE = re.compile(r"[^\W\d]\w*")
 SOCKET_TYPES = {"TcpStream", "TcpListener", "UdpSocket", "ToSocketAddrs"}
-SOCKET_FUNCTIONS = {"socket", "connect", "bind", "syscall", "dlopen", "dlsym"}
+SOCKET_FUNCTIONS = {
+    "accept", "accept4", "bind", "connect", "dlopen", "dlsym", "getaddrinfo",
+    "getaddrinfo_a", "gethostbyaddr", "gethostbyname", "gethostbyname2",
+    "getnameinfo", "listen", "recv", "recvfrom", "res_query", "res_search",
+    "res_send", "send", "sendto", "socket", "socketpair", "syscall",
+}
 BUILTIN_MACROS = {
     "assert", "assert_eq", "assert_ne", "cfg", "env", "eprintln", "format",
     "include_bytes", "include_str", "json", "matches", "panic", "params", "print",
@@ -352,16 +357,13 @@ def source_violation(tokens, approved_custom_macros):
         ("mio", "::", "net"),
         ("socket2", "::"),
         ("nix", "::", "sys", "::", "socket"),
-        ("libc", "::", "socket"),
-        ("libc", "::", "connect"),
-        ("libc", "::", "bind"),
-        ("libc", "::", "syscall"),
-        ("libc", "::", "dlopen"),
-        ("libc", "::", "dlsym"),
         ("TcpStream", "::", "connect"),
         ("TcpListener", "::", "bind"),
         ("UdpSocket", "::", "bind"),
     ]
+    direct_sequences.extend(
+        ("libc", "::", function) for function in sorted(SOCKET_FUNCTIONS)
+    )
     for sequence in direct_sequences:
         index = find_sequence(values, sequence)
         if index is not None:

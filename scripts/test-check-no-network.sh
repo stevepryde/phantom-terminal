@@ -409,6 +409,7 @@ new_fixture "$renamed_libc"
 new_dependency "$compile_libc" libc 0.2.186
 printf '%s\n' \
   'pub unsafe fn socket(_: i32, _: i32, _: i32) -> i32 { -1 }' \
+  'pub unsafe fn getaddrinfo(_: usize, _: usize, _: usize, _: usize) -> i32 { -1 }' \
   'pub unsafe fn dlsym(_: usize, _: usize) -> usize { 0 }' \
   'pub const SYS_socket: i64 = 1;' \
   'pub unsafe fn syscall(_: i64, _: i32, _: i32, _: i32) -> i64 { -1 }' \
@@ -438,6 +439,24 @@ printf '%s\n' \
 cargo generate-lockfile --offline --manifest-path "$syscall_fixture/Cargo.toml"
 cargo check --offline --manifest-path "$syscall_fixture/Cargo.toml" >/dev/null 2>&1
 expect_failure "$syscall_fixture" 'direct socket API:'
+
+echo "==> raw and libc DNS resolution authorities fail and compile"
+dns_fixture="$scratch/dns-resolution"
+new_fixture "$dns_fixture"
+printf '%s\n' '' '[dependencies]' \
+  'libc = { path = "../../../dependencies/compile-libc" }' \
+  >>"$dns_fixture/crates/app/Cargo.toml"
+printf '%s\n' \
+  'unsafe extern "C" {' \
+  '    fn getaddrinfo(node: usize, service: usize, hints: usize, result: usize) -> i32;' \
+  '}' \
+  'pub fn resolve() {' \
+  '    let _ = getaddrinfo;' \
+  '    let _ = libc::getaddrinfo;' \
+  '}' >"$dns_fixture/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$dns_fixture/Cargo.toml"
+cargo check --offline --manifest-path "$dns_fixture/Cargo.toml" >/dev/null 2>&1
+expect_failure "$dns_fixture" 'direct socket API:'
 
 echo "==> workspace build scripts fail before generated Rust can compile"
 build_script="$scratch/build-script"
