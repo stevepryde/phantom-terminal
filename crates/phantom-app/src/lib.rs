@@ -903,8 +903,22 @@ impl App {
         self.request_redraw();
     }
 
-    /// Whether the find bar is actually on screen: egui skips drawing it while
-    /// a side panel or the command palette is up even though find stays open.
+    /// Toggle the settings panel, closing an open find session first: the
+    /// panel hides the find bar, and find must never stay open (and go stale)
+    /// while its bar is not drawn. Both the keyboard action and the chrome
+    /// settings button route through here so they behave identically.
+    fn toggle_settings(&mut self) {
+        if self.ui.find_open() {
+            self.close_find();
+        }
+        self.ui.toggle_settings(&self.config);
+        self.request_redraw();
+    }
+
+    /// Whether the find bar is actually on screen. Every path that opens the
+    /// palette or a side panel closes find first, so an open find session
+    /// implies a visible bar; the extra checks are defense in depth because
+    /// egui skips drawing the bar while either surface is up.
     fn find_bar_visible(&self) -> bool {
         self.ui.find_open() && !self.palette.open && !self.ui.panel_open()
     }
@@ -1342,14 +1356,16 @@ impl App {
                 if self.palette.open {
                     self.palette.close();
                 } else {
+                    // The palette hides the find bar; a find session must not
+                    // stay open (and go stale) behind it.
+                    if self.ui.find_open() {
+                        self.close_find();
+                    }
                     self.palette.open(&self.config);
                 }
                 self.request_redraw();
             }
-            Action::ToggleSettings => {
-                self.ui.toggle_settings(&self.config);
-                self.request_redraw();
-            }
+            Action::ToggleSettings => self.toggle_settings(),
         }
     }
 
@@ -1370,7 +1386,14 @@ impl App {
                 self.config.ui_theme = name;
                 self.mark_config_dirty();
             }
-            PaletteAction::OpenSettings => self.ui.open_settings(&self.config),
+            PaletteAction::OpenSettings => {
+                // Opening the palette already closed find, but enforce the
+                // invariant locally: the panel hides the find bar.
+                if self.ui.find_open() {
+                    self.close_find();
+                }
+                self.ui.open_settings(&self.config);
+            }
         }
         self.request_redraw();
     }
@@ -2129,13 +2152,7 @@ impl App {
         }
         match hit {
             Some(Hit::New) => self.spawn_tab(None, None),
-            Some(Hit::Settings) => {
-                if self.ui.find_open() {
-                    self.close_find();
-                }
-                self.ui.toggle_settings(&self.config);
-                self.request_redraw();
-            }
+            Some(Hit::Settings) => self.toggle_settings(),
             Some(Hit::WindowControl(control)) => self.handle_window_control(control),
             Some(Hit::Close(i)) => self.close_tab(i),
             Some(Hit::Switch(i)) => self.switch_tab(i),
@@ -3906,6 +3923,45 @@ mod tests {
 
         assert!(app.find_open());
         app.switch_tab(1);
+        assert!(!app.find_open());
+    }
+
+    #[test]
+    fn opening_settings_or_the_palette_closes_find() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.tabs[0].advance_pty(b"find me");
+
+        // Keyboard settings must behave like the chrome button: the panel
+        // hides the find bar, so find must not stay open behind it.
+        app.open_find();
+        assert!(app.find_open());
+        app.handle_action(Action::ToggleSettings);
+        assert!(app.ui.settings_open());
+        assert!(!app.find_open());
+        app.handle_action(Action::ToggleSettings);
+        assert!(!app.ui.settings_open());
+
+        // Opening the palette closes find for the same reason.
+        app.open_find();
+        assert!(app.find_open());
+        app.handle_action(Action::TogglePalette);
+        assert!(app.palette.open);
+        assert!(!app.find_open());
+        app.handle_action(Action::TogglePalette);
+        assert!(!app.palette.open);
+
+        // A palette-dispatched settings open enforces the invariant locally.
+        app.open_find();
+        assert!(app.find_open());
+        app.dispatch_palette(PaletteAction::OpenSettings);
+        assert!(app.ui.settings_open());
         assert!(!app.find_open());
     }
 
