@@ -186,7 +186,7 @@ fn tilde_key(num: u8, mods: Modifiers) -> Vec<u8> {
 fn function_key(n: u8, mods: Modifiers) -> Vec<u8> {
     match n {
         1..=4 => {
-            let final_byte = [b'P', b'Q', b'R', b'S'][(n - 1) as usize];
+            let final_byte = (*b"PQRS")[(n - 1) as usize];
             if mods.any() {
                 format!("\x1b[1;{}{}", mods.xterm_code(), final_byte as char).into_bytes()
             } else {

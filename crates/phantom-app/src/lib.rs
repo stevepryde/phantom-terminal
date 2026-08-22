@@ -1324,6 +1324,15 @@ impl App {
         }
     }
 
+    /// Grid currently applied to the active terminal core and its PTY.
+    fn active_terminal_grid(&self) -> (u16, u16) {
+        self.tabs
+            .get(self.active)
+            .map(|tab| tab.core.size())
+            .or(self.last_terminal_grid)
+            .unwrap_or_else(|| self.viewport_grid())
+    }
+
     fn request_redraw(&mut self) {
         if self.redraw_queued {
             return;
@@ -2393,7 +2402,7 @@ impl App {
                 _ => None,
             };
             if let Some(dir) = dir {
-                let page = (self.viewport_grid().0 as i32).max(1);
+                let page = (self.active_terminal_grid().0 as i32).max(1);
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.core.scroll(dir * page);
                 }
@@ -2645,22 +2654,14 @@ impl App {
     /// Map a window pixel to a viewport `(row, col, side)`, if inside the grid.
     fn viewport_cell(&self, px: f32, py: f32) -> Option<(usize, usize, SelSide)> {
         let layout = self.layout()?;
-        let vp = layout.viewport;
-        if !vp.contains(px, py) {
-            return None;
-        }
-        let (cw, ch) = self.renderer.as_ref()?.cell_size();
-        let (rows, cols) = self.viewport_grid();
-        let lx = px - vp.x;
-        let ly = py - vp.y;
-        let col = ((lx / cw).floor() as i64).clamp(0, cols as i64 - 1) as usize;
-        let row = ((ly / ch).floor() as i64).clamp(0, rows as i64 - 1) as usize;
-        let side = if lx - col as f32 * cw < cw / 2.0 {
-            SelSide::Left
-        } else {
-            SelSide::Right
-        };
-        Some((row, col, side))
+        let cell_size = self.renderer.as_ref()?.cell_size();
+        viewport_cell_for_grid(
+            layout.viewport,
+            cell_size,
+            self.active_terminal_grid(),
+            px,
+            py,
+        )
     }
 
     fn active_mouse_mode(&self) -> phantom_emu::MouseMode {
@@ -4464,6 +4465,33 @@ fn apply_terminal_grid_to_tabs(
     failures
 }
 
+fn viewport_cell_for_grid(
+    viewport: chrome::Rect,
+    (cell_width, cell_height): (f32, f32),
+    (rows, cols): (u16, u16),
+    px: f32,
+    py: f32,
+) -> Option<(usize, usize, SelSide)> {
+    if !viewport.contains(px, py)
+        || rows == 0
+        || cols == 0
+        || cell_width <= 0.0
+        || cell_height <= 0.0
+    {
+        return None;
+    }
+    let lx = px - viewport.x;
+    let ly = py - viewport.y;
+    let col = ((lx / cell_width).floor() as i64).clamp(0, i64::from(cols) - 1) as usize;
+    let row = ((ly / cell_height).floor() as i64).clamp(0, i64::from(rows) - 1) as usize;
+    let side = if lx - col as f32 * cell_width < cell_width / 2.0 {
+        SelSide::Left
+    } else {
+        SelSide::Right
+    };
+    Some((row, col, side))
+}
+
 fn cursor_shape(style: &str) -> CursorShape {
     match style {
         "bar" => CursorShape::Beam,
@@ -6094,6 +6122,94 @@ mod tests {
             .notice_text()
             .unwrap()
             .contains("previous grid was preserved"));
+    }
+
+    #[test]
+    fn mouse_protocol_coordinates_use_applied_grid_during_resize_debounce() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(24, 80, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.last_terminal_grid = Some((24, 80));
+        app.pending_terminal_grid = Some((40, 120));
+
+        let cell = viewport_cell_for_grid(
+            chrome::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1_200.0,
+                h: 800.0,
+            },
+            (10.0, 20.0),
+            app.active_terminal_grid(),
+            1_005.0,
+            705.0,
+        )
+        .unwrap();
+
+        assert_eq!(cell, (23, 79, SelSide::Right));
+        assert_eq!(
+            encode_mouse_sgr(0, cell.1 as u16, cell.0 as u16, true),
+            b"\x1b[<0;80;24M"
+        );
+    }
+
+    #[test]
+    fn selection_clamping_switches_only_after_successful_resize() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(24, 80, 100, CursorShape::Block),
+            10,
+            String::new(),
+            None,
+        ));
+        app.last_terminal_grid = Some((24, 80));
+        app.pending_terminal_grid = Some((40, 120));
+        let viewport = chrome::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1_200.0,
+            h: 800.0,
+        };
+
+        assert_eq!(
+            viewport_cell_for_grid(
+                viewport,
+                (10.0, 20.0),
+                app.active_terminal_grid(),
+                1_005.0,
+                705.0,
+            ),
+            Some((23, 79, SelSide::Right))
+        );
+
+        let failures = apply_terminal_grid_to_tabs(&mut app.tabs, 40, 120, |_| {
+            Err(phantom_core::AppError::Pty("driver rejected resize".into()))
+        });
+        assert_eq!(failures.len(), 1);
+        app.last_terminal_grid = None;
+        assert_eq!(app.active_terminal_grid(), (24, 80));
+
+        let failures = apply_terminal_grid_to_tabs(&mut app.tabs, 40, 120, |_| Ok(()));
+        assert!(failures.is_empty());
+        app.last_terminal_grid = Some((40, 120));
+        app.pending_terminal_grid = None;
+
+        assert_eq!(
+            viewport_cell_for_grid(
+                viewport,
+                (10.0, 20.0),
+                app.active_terminal_grid(),
+                1_005.0,
+                705.0,
+            ),
+            Some((35, 100, SelSide::Right))
+        );
     }
 
     #[test]
