@@ -29,6 +29,9 @@ use font::{face_slot, FontSet, REGULAR};
 use palette::{Palette, Rgba};
 
 const ATLAS_SIZE: u32 = 2048;
+// Two pages are the smallest sufficient expansion over the old single atlas;
+// the device limit still clamps this on unusually constrained adapters.
+const MAX_ATLAS_PAGES: u32 = 2;
 const INITIAL_INSTANCE_CAP: u64 = 4096;
 
 const LAYER_BASE: usize = 0;
@@ -61,7 +64,8 @@ struct GlyphInstance {
     uv_max: [f32; 2],
     color: [f32; 4],
     is_color: f32,
-    _pad: [f32; 3],
+    atlas_page: u32,
+    _pad: [u32; 2],
 }
 
 pub struct Renderer {
@@ -117,7 +121,7 @@ impl Renderer {
             config.line_height,
         )?;
         let metrics = font.metrics();
-        let atlas = GlyphAtlas::new(device, ATLAS_SIZE);
+        let atlas = GlyphAtlas::new(device, ATLAS_SIZE, MAX_ATLAS_PAGES);
 
         // Uniform: screen size in physical px.
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -157,7 +161,7 @@ impl Renderer {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     },
                     count: None,
@@ -589,6 +593,7 @@ impl Renderer {
                 uv_max,
                 color,
                 entry.is_color,
+                entry.page,
             ));
         }
     }
@@ -708,6 +713,7 @@ fn glyph(
     uv_max: [f32; 2],
     color: Rgba,
     is_color: bool,
+    atlas_page: u32,
 ) -> GlyphInstance {
     GlyphInstance {
         pos: [x, y],
@@ -716,7 +722,8 @@ fn glyph(
         uv_max,
         color: to_linear(color),
         is_color: if is_color { 1.0 } else { 0.0 },
-        _pad: [0.0; 3],
+        atlas_page,
+        _pad: [0; 2],
     }
 }
 
@@ -795,13 +802,14 @@ fn solid_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 fn glyph_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-    const ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    const ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
         0 => Float32x2, // pos
         1 => Float32x2, // size
         2 => Float32x2, // uv_min
         3 => Float32x2, // uv_max
         4 => Float32x4, // color
         5 => Float32,   // is_color
+        6 => Uint32,    // atlas_page
     ];
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<GlyphInstance>() as u64,
