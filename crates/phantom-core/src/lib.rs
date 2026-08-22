@@ -19,6 +19,9 @@ pub mod pty;
 pub mod session;
 pub mod spawn;
 
+/// Maximum number of terminal tabs that may be live or persisted at once.
+pub const MAX_TABS: usize = 128;
+
 pub use config::{AppConfig, Keybinding, ShellProfile, Theme, WindowSize, UI_THEMES};
 pub use context::{
     load_context_manifest, load_context_manifest_source, parse_context_manifest,
@@ -37,6 +40,6 @@ pub use launch::{LaunchContext, LaunchState};
 pub use pty::{resolve_program, LaunchOpts, PtyManager, PtySink, SpawnOpts, StartupCommand};
 pub use session::{
     SessionStore, TabRecord, MAX_TAB_CWD_LEN, MAX_TAB_ID_LEN, MAX_TAB_PROFILE_ID_LEN,
-    MAX_TAB_RECORDS, MAX_TAB_TITLE_LEN,
+    MAX_TAB_TITLE_LEN,
 };
 pub use spawn::{default_home_dir, resolve_launch_opts};

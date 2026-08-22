@@ -54,7 +54,7 @@ use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
     default_home_dir, resolve_launch_opts, resolve_program, resolve_trusted_task,
     trust_context_manifest, AppConfig, LaunchContext, LaunchOpts, PtyManager, PtySink,
-    SessionStore, StartupCommand, TabRecord, WindowSize, MAX_TAB_TITLE_LEN,
+    SessionStore, StartupCommand, TabRecord, WindowSize, MAX_TABS, MAX_TAB_TITLE_LEN,
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
@@ -1300,6 +1300,10 @@ impl App {
     }
 
     fn spawn_new_tab(&mut self, request: NewTabRequest) -> bool {
+        if self.tabs.len() >= MAX_TABS {
+            self.show_notice(format!("Cannot open more than {MAX_TABS} tabs"));
+            return false;
+        }
         if self.ui.find_open() {
             self.close_find();
         }
@@ -4426,6 +4430,47 @@ mod tests {
         app.copy_selection();
 
         assert_eq!(app.notice_text(), None);
+    }
+
+    #[test]
+    fn tab_limit_allows_128th_rejects_129th_and_shutdown_persists_all() {
+        let store = SessionStore::in_memory_for_tests().unwrap();
+        let mut app = App::new(
+            Arc::new(NoopOutbox),
+            AppConfig::default(),
+            Some(store.clone()),
+            LaunchContext {
+                cwd: None,
+                remember_tabs: true,
+            },
+        );
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        for id in 0..(MAX_TABS - 1) {
+            app.tabs.push(Tab::new(
+                id as u64,
+                AlacrittyCore::new(1, 1, 0, CursorShape::Block),
+                u32::MAX,
+                cwd.clone(),
+                None,
+            ));
+        }
+        app.active = app.tabs.len() - 1;
+        app.next_tab_id = app.tabs.len() as u64;
+
+        assert!(app.spawn_tab_with_persistence(None, Some(cwd.clone()), false));
+        assert_eq!(app.tabs.len(), MAX_TABS);
+
+        assert!(!app.spawn_tab_with_persistence(None, Some(cwd), true));
+        assert_eq!(app.tabs.len(), MAX_TABS);
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some("Cannot open more than 128 tabs")
+        );
+
+        app.request_exit();
+        let remembered = store.load_tabs().unwrap();
+        assert_eq!(remembered.len(), MAX_TABS);
+        assert!(remembered.last().unwrap().is_active);
     }
 
     #[test]

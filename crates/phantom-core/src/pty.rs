@@ -12,8 +12,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
-
-const MAX_LIVE_PTY_SESSIONS: usize = 256;
+use crate::MAX_TABS;
 
 /// Input is forwarded to a per-session writer thread as one owned message per
 /// logical input operation (a keystroke, an IME commit, a whole bracketed
@@ -258,7 +257,7 @@ impl Default for PtyManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU32::new(0),
             live_sessions: Arc::new(AtomicUsize::new(0)),
-            max_sessions: MAX_LIVE_PTY_SESSIONS,
+            max_sessions: MAX_TABS,
             reaper_tx: spawn_reaper(),
         }
     }
@@ -269,7 +268,7 @@ impl Default for PtyManager {
 /// thread can't be spawned, the dangling sender makes every `try_send` fail and
 /// `kill` falls back to inline kill+reap.
 fn spawn_reaper() -> SyncSender<PtySession> {
-    // Bound comfortably above MAX_LIVE_PTY_SESSIONS so a burst of kills never
+    // Bound comfortably above MAX_TABS so a burst of kills never
     // hits the inline (UI-thread-stalling) fallback just because the queue is
     // momentarily full.
     let (tx, rx) = std::sync::mpsc::sync_channel::<PtySession>(1024);
@@ -1207,6 +1206,22 @@ mod tests {
         assert_eq!(error, "pty error: too many terminals");
         drop(reservation);
         assert!(manager.reserve_session().is_ok());
+    }
+
+    #[test]
+    fn default_pty_limit_matches_shared_tab_limit() {
+        let manager = PtyManager::new();
+        let reservations: Vec<_> = (0..MAX_TABS)
+            .map(|_| manager.reserve_session().unwrap())
+            .collect();
+
+        let error = match manager.reserve_session() {
+            Ok(_) => panic!("expected shared tab cap error"),
+            Err(error) => error.to_string(),
+        };
+
+        assert_eq!(reservations.len(), MAX_TABS);
+        assert_eq!(error, "pty error: too many terminals");
     }
 
     #[cfg(unix)]
