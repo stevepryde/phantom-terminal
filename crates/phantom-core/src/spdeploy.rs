@@ -70,13 +70,7 @@ pub fn load_spdeploy_graph(root: &Path) -> AppResult<Option<SpdeployGraph>> {
         return invalid("spdeploy project root must be a UTF-8 directory");
     }
     let mut sources = BTreeMap::new();
-    collect_fs_sources(
-        &root,
-        SPDEPLOY_CONFIG_FILE,
-        0,
-        &mut sources,
-        &mut Vec::new(),
-    )?;
+    collect_fs_sources(&root, SPDEPLOY_CONFIG_FILE, 0, &mut sources)?;
     let sources = sources
         .into_iter()
         .map(|(relative_path, source)| TrustedSpdeploySource {
@@ -122,18 +116,19 @@ struct ParsedGraph {
     sources: Vec<TrustedSpdeploySource>,
 }
 
+// `type: deploy` paths on non-submenu operations are operation-call edges,
+// not includes. Same-file sibling calls (`path: deploy.yml` + `operation:`)
+// and mutual calls across files are valid; revisiting an already-collected
+// source is a no-op. Submenu-only operations are ignored: they are not listed
+// and their targets are not part of this directory's trust graph.
 fn collect_fs_sources(
     root: &Path,
     relative_path: &str,
     depth: usize,
     sources: &mut BTreeMap<String, String>,
-    active: &mut Vec<String>,
 ) -> AppResult<()> {
     if depth > MAX_DEPTH {
         return invalid(format!("spdeploy config depth exceeds {MAX_DEPTH}"));
-    }
-    if active.iter().any(|path| path == relative_path) {
-        return invalid("spdeploy config cycle detected");
     }
     if sources.contains_key(relative_path) {
         return Ok(());
@@ -158,13 +153,11 @@ fn collect_fs_sources(
     let source = String::from_utf8(bytes)
         .map_err(|_| AppError::InvalidConfig(format!("{} must be valid UTF-8", path.display())))?;
     let value = parse_yaml(relative_path, &source)?;
-    active.push(relative_path.to_string());
     let children = deploy_children(&value, relative_path)?;
     sources.insert(relative_path.to_string(), source);
     for child in children {
-        collect_fs_sources(root, &child, depth + 1, sources, active)?;
+        collect_fs_sources(root, &child, depth + 1, sources)?;
     }
-    active.pop();
     Ok(())
 }
 
@@ -177,13 +170,7 @@ fn parse_source_graph(sources: &[TrustedSpdeploySource]) -> AppResult<ParsedGrap
     let root_value = parse_yaml(SPDEPLOY_CONFIG_FILE, source_map[SPDEPLOY_CONFIG_FILE])?;
     let project_name = config_name(&root_value)?;
     let mut required = HashSet::new();
-    collect_required(
-        SPDEPLOY_CONFIG_FILE,
-        &source_map,
-        0,
-        &mut Vec::new(),
-        &mut required,
-    )?;
+    collect_required(SPDEPLOY_CONFIG_FILE, &source_map, 0, &mut required)?;
     if required.len() != sources.len()
         || sources
             .iter()
@@ -192,14 +179,7 @@ fn parse_source_graph(sources: &[TrustedSpdeploySource]) -> AppResult<ParsedGrap
         return invalid("trusted spdeploy sources contain missing or unrelated configs");
     }
     let mut operations = Vec::new();
-    collect_menu_operations(
-        SPDEPLOY_CONFIG_FILE,
-        &source_map,
-        0,
-        &[],
-        &mut Vec::new(),
-        &mut operations,
-    )?;
+    collect_root_operations(&source_map, &mut operations)?;
     Ok(ParsedGraph {
         project_name,
         operations,
@@ -211,14 +191,10 @@ fn collect_required(
     relative_path: &str,
     sources: &BTreeMap<&str, &str>,
     depth: usize,
-    active: &mut Vec<String>,
     required: &mut HashSet<String>,
 ) -> AppResult<()> {
     if depth > MAX_DEPTH {
         return invalid(format!("spdeploy config depth exceeds {MAX_DEPTH}"));
-    }
-    if active.iter().any(|path| path == relative_path) {
-        return invalid("spdeploy config cycle detected");
     }
     if required.contains(relative_path) {
         return Ok(());
@@ -230,69 +206,50 @@ fn collect_required(
     })?;
     let value = parse_yaml(relative_path, source)?;
     required.insert(relative_path.to_string());
-    active.push(relative_path.to_string());
     for child in deploy_children(&value, relative_path)? {
-        collect_required(&child, sources, depth + 1, active, required)?;
+        collect_required(&child, sources, depth + 1, required)?;
     }
-    active.pop();
     Ok(())
 }
 
-fn collect_menu_operations(
-    relative_path: &str,
+fn collect_root_operations(
     sources: &BTreeMap<&str, &str>,
-    depth: usize,
-    breadcrumbs: &[String],
-    active: &mut Vec<String>,
     operations: &mut Vec<SpdeployOperation>,
 ) -> AppResult<()> {
-    if depth > MAX_DEPTH {
-        return invalid(format!("spdeploy submenu depth exceeds {MAX_DEPTH}"));
-    }
-    if active.iter().any(|path| path == relative_path) {
-        return invalid("spdeploy submenu cycle detected");
-    }
-    let source = sources.get(relative_path).ok_or_else(|| {
+    let source = sources.get(SPDEPLOY_CONFIG_FILE).ok_or_else(|| {
         AppError::InvalidConfig(format!(
-            "trusted spdeploy source '{relative_path}' is missing"
+            "trusted spdeploy source '{SPDEPLOY_CONFIG_FILE}' is missing"
         ))
     })?;
-    let value = parse_yaml(relative_path, source)?;
-    let listed = operation_mapping(&value)?;
-    active.push(relative_path.to_string());
-    for (name, operation) in listed {
+    let value = parse_yaml(SPDEPLOY_CONFIG_FILE, source)?;
+    for (name, operation) in operation_mapping(&value)? {
         validate_text(name, "operation name", MAX_NAME_BYTES)?;
         let operation = operation.as_mapping().ok_or_else(|| {
             AppError::InvalidConfig("spdeploy operation must be an object".into())
         })?;
-        let description = optional_string(
-            operation.get("description"),
-            "operation description",
-            MAX_DESCRIPTION_BYTES,
-        )?;
         let stages = operation
             .get("stage")
             .and_then(Value::as_sequence)
             .ok_or_else(|| {
                 AppError::InvalidConfig(format!("spdeploy operation '{name}' has no stages array"))
             })?;
-        if let Some(child) = submenu_path(stages, relative_path)? {
-            let mut nested = breadcrumbs.to_vec();
-            nested.push(name.clone());
-            collect_menu_operations(&child, sources, depth + 1, &nested, active, operations)?;
-        } else {
-            if operations.len() >= MAX_OPERATIONS {
-                return invalid(format!("spdeploy operation count exceeds {MAX_OPERATIONS}"));
-            }
-            operations.push(SpdeployOperation {
-                name: name.clone(),
-                breadcrumbs: breadcrumbs.to_vec(),
-                description,
-                config_relative_path: relative_path.to_string(),
-            });
+        if is_submenu(stages)? {
+            continue;
         }
+        if operations.len() >= MAX_OPERATIONS {
+            return invalid(format!("spdeploy operation count exceeds {MAX_OPERATIONS}"));
+        }
+        operations.push(SpdeployOperation {
+            name: name.clone(),
+            breadcrumbs: Vec::new(),
+            description: optional_string(
+                operation.get("description"),
+                "operation description",
+                MAX_DESCRIPTION_BYTES,
+            )?,
+            config_relative_path: SPDEPLOY_CONFIG_FILE.to_string(),
+        });
     }
-    active.pop();
     Ok(())
 }
 
@@ -308,6 +265,9 @@ fn deploy_children(value: &Value, declaring_path: &str) -> AppResult<Vec<String>
             .ok_or_else(|| {
                 AppError::InvalidConfig("spdeploy operation has no stages array".into())
             })?;
+        if is_submenu(stages)? {
+            continue;
+        }
         collect_stage_children(stages, declaring_path, &mut children)?;
     }
     children.sort();
@@ -348,21 +308,15 @@ fn collect_stage_children(
     Ok(())
 }
 
-fn submenu_path(stages: &[Value], declaring_path: &str) -> AppResult<Option<String>> {
+fn is_submenu(stages: &[Value]) -> AppResult<bool> {
     if stages.len() != 1 {
-        return Ok(None);
+        return Ok(false);
     }
     let Some(stage) = stages[0].as_mapping() else {
         return invalid("spdeploy stage must be an object");
     };
-    if stage.get("type").and_then(Value::as_str) != Some("deploy")
-        || stage.get("operation").is_some_and(|value| !value.is_null())
-    {
-        return Ok(None);
-    }
-    let path = required_string(stage.get("path"), "submenu path", MAX_PATH_BYTES)?;
-    reject_dynamic_path(&path)?;
-    Ok(Some(resolve_relative_config(declaring_path, &path)?))
+    Ok(stage.get("type").and_then(Value::as_str) == Some("deploy")
+        && !stage.get("operation").is_some_and(|value| !value.is_null()))
 }
 
 fn reject_dynamic_path(path: &str) -> AppResult<()> {
@@ -573,7 +527,7 @@ mod tests {
     #[test]
     fn changed_nested_source_invalidates_graph() {
         let temp = TempDir::new();
-        fs::write(temp.0.join("deploy.yml"), "name: root\noperation:\n  child:\n    stage:\n      - type: deploy\n        path: child.yml\n").unwrap();
+        fs::write(temp.0.join("deploy.yml"), "name: root\noperation:\n  child:\n    stage:\n      - type: deploy\n        path: child.yml\n        operation: deploy\n").unwrap();
         fs::write(
             temp.0.join("child.yml"),
             "name: child\noperation:\n  deploy:\n    stage: []\n",
@@ -593,7 +547,7 @@ mod tests {
     fn symlinked_nested_source_is_rejected() {
         use std::os::unix::fs::symlink;
         let temp = TempDir::new();
-        fs::write(temp.0.join("deploy.yml"), "name: root\noperation:\n  child:\n    stage:\n      - type: deploy\n        path: child.yml\n").unwrap();
+        fs::write(temp.0.join("deploy.yml"), "name: root\noperation:\n  child:\n    stage:\n      - type: deploy\n        path: child.yml\n        operation: deploy\n").unwrap();
         fs::write(
             temp.0.join("actual.yml"),
             "name: child\noperation:\n  deploy:\n    stage: []\n",
@@ -601,5 +555,83 @@ mod tests {
         .unwrap();
         symlink(temp.0.join("actual.yml"), temp.0.join("child.yml")).unwrap();
         assert!(load_spdeploy_graph(&temp.0).is_err());
+    }
+
+    #[test]
+    fn same_file_operation_calls_are_not_config_cycles() {
+        let temp = TempDir::new();
+        fs::write(
+            temp.0.join("deploy.yml"),
+            "name: project\noperation:\n  deploy:\n    stage:\n      - type: deploy\n        path: deploy.yml\n        operation: env\n      - type: deploy\n        path: deploy.yml\n        operation: compose\n  env:\n    stage:\n      - type: script\n        path: env.sh\n  compose:\n    stage:\n      - type: script\n        path: compose.sh\n",
+        )
+        .unwrap();
+        let graph = load_spdeploy_graph(&temp.0).unwrap().unwrap();
+        assert_eq!(
+            graph
+                .sources
+                .iter()
+                .map(|source| source.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["deploy.yml"]
+        );
+        assert_eq!(
+            graph
+                .operations
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["deploy", "env", "compose"]
+        );
+        trust_spdeploy_graph(&graph).unwrap();
+    }
+
+    #[test]
+    fn mutual_operation_calls_across_files_are_not_config_cycles() {
+        let temp = TempDir::new();
+        fs::write(
+            temp.0.join("deploy.yml"),
+            "name: root\noperation:\n  call_child:\n    stage:\n      - type: deploy\n        path: child.yml\n        operation: work\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.0.join("child.yml"),
+            "name: child\noperation:\n  work:\n    stage:\n      - type: script\n        path: work.sh\n  call_parent:\n    stage:\n      - type: deploy\n        path: deploy.yml\n        operation: call_child\n",
+        )
+        .unwrap();
+        let graph = load_spdeploy_graph(&temp.0).unwrap().unwrap();
+        assert_eq!(
+            graph
+                .sources
+                .iter()
+                .map(|source| source.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["child.yml", "deploy.yml"]
+        );
+        trust_spdeploy_graph(&graph).unwrap();
+    }
+
+    #[test]
+    fn submenu_only_configs_are_not_listed_or_collected() {
+        let temp = TempDir::new();
+        fs::write(
+            temp.0.join("deploy.yml"),
+            "name: root\noperation:\n  down:\n    stage:\n      - type: deploy\n        path: child.yml\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.0.join("child.yml"),
+            "name: child\noperation:\n  up:\n    stage:\n      - type: deploy\n        path: deploy.yml\n",
+        )
+        .unwrap();
+        let graph = load_spdeploy_graph(&temp.0).unwrap().unwrap();
+        assert!(graph.operations.is_empty());
+        assert_eq!(
+            graph
+                .sources
+                .iter()
+                .map(|source| source.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["deploy.yml"]
+        );
     }
 }

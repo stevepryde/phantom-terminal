@@ -118,8 +118,8 @@ pub struct SpdeploySection {
     pub project_name: String,
     pub trust: SpdeployTrustState,
     pub operations: Vec<SpdeployOperation>,
-    /// Sorted root-relative full transitive config graph and exact bounded
-    /// source used to derive operations and compare persisted trust.
+    /// Sorted root-relative config graph reachable from current-directory
+    /// non-submenu operations, used to compare persisted trust.
     pub config_sources: Vec<TrustedSpdeploySource>,
 }
 
@@ -332,6 +332,9 @@ pub fn discover_spdeploy_with_trust(
     match load_spdeploy_graph(cwd) {
         Ok(None) => None,
         Ok(Some(graph)) => {
+            if graph.operations.is_empty() {
+                return None;
+            }
             let trusted = trusted_projects
                 .iter()
                 .any(|project| project.matches_graph(&graph));
@@ -635,11 +638,11 @@ operation:
     }
 
     #[test]
-    fn recursively_flattens_submenu_operations() {
+    fn submenu_operations_are_omitted_from_the_current_directory() {
         let temp = TestDir::new();
         fs::write(
             temp.path().join(DEPLOY_FILE),
-            "name: Root\noperation:\n  service:\n    stage:\n      - type: deploy\n        path: child.yml\n",
+            "name: Root\noperation:\n  service:\n    stage:\n      - type: deploy\n        path: child.yml\n  ship:\n    description: Ship it\n    stage:\n      - type: script\n        path: ship.sh\n",
         )
         .unwrap();
         fs::write(
@@ -653,9 +656,27 @@ operation:
             panic!("expected spdeploy section");
         };
         assert_eq!(section.operations.len(), 1);
-        assert_eq!(section.operations[0].breadcrumbs, ["service"]);
-        assert!(section.operations[0].config_path.ends_with("child.yml"));
-        assert_eq!(section.config_sources.len(), 2);
+        assert_eq!(section.operations[0].name, "ship");
+        assert!(section.operations[0].breadcrumbs.is_empty());
+        assert!(section.operations[0].config_path.ends_with(DEPLOY_FILE));
+        assert_eq!(section.config_sources.len(), 1);
+    }
+
+    #[test]
+    fn submenu_only_directory_produces_no_section() {
+        let temp = TestDir::new();
+        fs::write(
+            temp.path().join(DEPLOY_FILE),
+            "name: Root\noperation:\n  service:\n    stage:\n      - type: deploy\n        path: child.yml\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("child.yml"),
+            "name: Child\noperation:\n  release:\n    stage:\n      - type: script\n        path: release.sh\n",
+        )
+        .unwrap();
+
+        assert_eq!(discover_spdeploy(temp.path()), None);
     }
 
     #[test]
@@ -804,7 +825,35 @@ operation:
     }
 
     #[test]
-    fn rejects_submenus_that_escape_the_active_directory() {
+    fn rejects_leaf_deploy_paths_that_escape_the_active_directory() {
+        let temp = TestDir::new();
+        let outside = TestDir::new();
+        fs::write(
+            outside.path().join("child.yml"),
+            "name: Child\noperation:\n  release:\n    stage: []\n",
+        )
+        .unwrap();
+        let relative = format!(
+            "../{}/child.yml",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        fs::write(
+            temp.path().join(DEPLOY_FILE),
+            format!(
+                "name: Root\noperation:\n  outside:\n    stage:\n      - type: deploy\n        path: {relative}\n        operation: release\n"
+            ),
+        )
+        .unwrap();
+
+        let section = discover_spdeploy(temp.path()).unwrap();
+        let ContextSectionContent::Error { message } = section.content else {
+            panic!("expected error section");
+        };
+        assert!(message.contains("outside the project root"), "{message}");
+    }
+
+    #[test]
+    fn escaping_submenu_is_ignored() {
         let temp = TestDir::new();
         let outside = TestDir::new();
         fs::write(outside.path().join("child.yml"), "child").unwrap();
@@ -820,10 +869,6 @@ operation:
         )
         .unwrap();
 
-        let section = discover_spdeploy(temp.path()).unwrap();
-        let ContextSectionContent::Error { message } = section.content else {
-            panic!("expected error section");
-        };
-        assert!(message.contains("outside the project root"));
+        assert_eq!(discover_spdeploy(temp.path()), None);
     }
 }

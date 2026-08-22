@@ -27,13 +27,18 @@ validated-execution posture.
 - **CTX-007 (confirmed):** Settings must include Context Actions controls for
   globally enabling the feature and independently enabling built-in plugins.
 - **CTX-008 (confirmed):** A built-in spdeploy plugin must detect `deploy.yml`
-  in the exact active directory and keep its operations inert until the user
-  reviews and trusts the canonical root plus exact bounded source of the full
-  statically reachable typed deploy-config graph. Any source-graph change
-  invalidates trust. The visible terminal tab must retain spdeploy's TTY UI,
-  including colors and compact scrolling output; Phantom must select the
-  operation with structured `--config`/`--operation` arguments but must not pass
-  `--no-ui` or `--yes`. Discovery must not require or invoke the spdeploy CLI.
+  in the exact active directory and list only that file's non-submenu
+  operations — the same leaves `spdeploy --list-operations` would show without
+  trailing-slash submenu entries. Nested `deploy.yml` menus are not flattened
+  into the parent; a directory whose current file is only submenus has no
+  Deploy section. Keep those operations inert until the user reviews and
+  trusts the canonical root plus exact bounded source of the current file and
+  any configs statically reachable from its non-submenu operations. Any
+  source-graph change invalidates trust. The visible terminal tab must retain
+  spdeploy's TTY UI, including colors and compact scrolling output; Phantom
+  must select the operation with structured `--config`/`--operation` arguments
+  but must not pass `--no-ui` or `--yes`. Discovery must not require or invoke
+  the spdeploy CLI.
 - **CTX-009 (confirmed):** Both trust review and approved action surfaces must
   remain non-modal. Terminal input must continue unless the user is directly
   interacting with a contextual control.
@@ -102,9 +107,8 @@ validated-execution posture.
   project/directory-name, Details row, or `Operation` field label. It starts
   directly with the dropdown. Each selectable dropdown leaf displays `name:
   description`, falling back to `name` when no description exists.
-  Nested submenu breadcrumbs appear as non-selectable group headings. Dispatch
-  still uses the validated operation name and exact declaring config, including
-  when different submenu files declare operations with the same name.
+  Dispatch uses the validated operation name and the current directory's
+  `deploy.yml`.
 - **CTX-027 (correctness):** Errors and other global notices render in egui's
   topmost layer after every panel, sidebar, palette, and popup. Contextual UI
   must never obscure an error.
@@ -180,11 +184,12 @@ a shell command string. Omitting `run` opens the default validated shell.
   trust.
 - **AC-CTX-D:** Collapse the panel and each section, restart, and observe the
   same states. Disabled plugins remain undiscovered and hidden.
-- **AC-CTX-E:** A `deploy.yml` fixture first presents every operation for an
-  explicit trust decision. After trust, selecting one launches fixed spdeploy
-  argv without `--no-ui` or `--yes`, preserves the interactive TTY presentation,
-  and does not bypass spdeploy confirmations. A root or transitive source change
-  disables launch until the new graph is reviewed and trusted.
+- **AC-CTX-E:** A `deploy.yml` fixture first presents every current-directory
+  non-submenu operation for an explicit trust decision and does not list nested
+  submenu files. After trust, selecting one launches fixed spdeploy argv
+  without `--no-ui` or `--yes`, preserves the interactive TTY presentation,
+  and does not bypass spdeploy confirmations. A root or transitive source
+  change disables launch until the new graph is reviewed and trusted.
 - **AC-CTX-F:** Malformed, oversized, traversing, symlink-escaping, unknown-key,
   or unsupported-version manifests produce a bounded local error and no launch.
 - **AC-CTX-G:** Typing into the terminal while an idle contextual panel is
