@@ -39,7 +39,7 @@ pub use error::{AppError, AppResult};
 pub use launch::{LaunchContext, LaunchState};
 pub use pty::{resolve_program, LaunchOpts, PtyManager, PtySink, SpawnOpts, StartupCommand};
 pub use session::{
-    SessionStore, TabRecord, MAX_TAB_CWD_LEN, MAX_TAB_ID_LEN, MAX_TAB_PROFILE_ID_LEN,
-    MAX_TAB_TITLE_LEN,
+    RememberedTabsLock, SessionStore, TabRecord, MAX_TAB_CWD_LEN, MAX_TAB_ID_LEN,
+    MAX_TAB_PROFILE_ID_LEN, MAX_TAB_TITLE_LEN,
 };
 pub use spawn::{default_home_dir, resolve_launch_opts};

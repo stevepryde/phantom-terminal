@@ -11,6 +11,8 @@ for the areas it owns:
   skill and its local installer.
 - [`scrollback-search.md`](scrollback-search.md) owns interactive in-memory
   terminal find behavior and its compact overlay.
+- [`session-persistence.md`](session-persistence.md) owns remembered-tab
+  behavior across multiple app instances.
 - [`architecture.md`](architecture.md) records the relevant system boundaries.
 
 Status labels in these documents distinguish confirmed user requirements from

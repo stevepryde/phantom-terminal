@@ -4292,9 +4292,17 @@ fn truncate_to_chars(value: &str, max_bytes: usize) -> String {
     out
 }
 
-/// Run the app under a winit event loop (the production entry point).
-pub fn run() -> phantom_core::AppResult<()> {
-    let launch = phantom_core::LaunchState::from_env()?.context();
+struct PreparedPersistence {
+    _remembered_tabs_lock: Option<phantom_core::RememberedTabsLock>,
+    store: Option<SessionStore>,
+    config: AppConfig,
+}
+
+fn prepare_persistence(launch: &LaunchContext) -> phantom_core::AppResult<PreparedPersistence> {
+    let remembered_tabs_lock = launch
+        .remember_tabs
+        .then(phantom_core::RememberedTabsLock::acquire)
+        .transpose()?;
     let store = SessionStore::open()
         .map_err(|e| eprintln!("session store unavailable ({e}); not persisting"))
         .ok();
@@ -4302,6 +4310,29 @@ pub fn run() -> phantom_core::AppResult<()> {
         .as_ref()
         .and_then(|s| s.load_config().ok())
         .unwrap_or_default();
+    Ok(PreparedPersistence {
+        _remembered_tabs_lock: remembered_tabs_lock,
+        store,
+        config,
+    })
+}
+
+/// Run the app under a winit event loop (the production entry point).
+pub fn run() -> phantom_core::AppResult<()> {
+    let launch = phantom_core::LaunchState::from_env()?.context();
+    let PreparedPersistence {
+        _remembered_tabs_lock,
+        store,
+        config,
+    } = prepare_persistence(&launch)?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PHANTOM_TEST_STARTUP_READY").as_deref() == Some(std::ffi::OsStr::new("1"))
+    {
+        use std::io::Write;
+
+        println!("PHANTOM_STARTUP_READY");
+        std::io::stdout().flush()?;
+    }
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()

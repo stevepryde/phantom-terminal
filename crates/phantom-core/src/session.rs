@@ -17,6 +17,7 @@ pub const MAX_TAB_ID_LEN: usize = 128;
 pub const MAX_TAB_TITLE_LEN: usize = 256;
 pub const MAX_TAB_CWD_LEN: usize = 4096;
 pub const MAX_TAB_PROFILE_ID_LEN: usize = 128;
+const REMEMBERED_TABS_LOCK_FILE: &str = "remembered-tabs.lock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabRecord {
@@ -56,6 +57,117 @@ impl TabRecord {
             validate_no_nul("tab shell profile id", profile_id)?;
         }
         Ok(())
+    }
+}
+
+/// Process-lifetime ownership of the remembered tab set.
+///
+/// The operating system releases the advisory lock when this handle is
+/// dropped or the process exits, including after a crash. The lock file uses
+/// the session store's descriptor-relative path and permission checks.
+#[derive(Debug)]
+pub struct RememberedTabsLock {
+    #[cfg(any(unix, windows))]
+    _file: std::fs::File,
+}
+
+impl RememberedTabsLock {
+    pub fn acquire() -> AppResult<Self> {
+        Self::acquire_at(&db_path()?)
+    }
+
+    #[cfg(unix)]
+    fn acquire_at(database_path: &std::path::Path) -> AppResult<Self> {
+        use std::os::fd::AsRawFd;
+
+        let (directory, _) = walk_store_parent(database_path, true)?;
+        let lock_path = database_path.with_file_name(REMEMBERED_TABS_LOCK_FILE);
+        let file = open_or_create_regular_file(
+            &directory,
+            std::ffi::OsStr::new(REMEMBERED_TABS_LOCK_FILE),
+            &lock_path,
+        )?;
+        ensure_regular_file(&file, &lock_path, "remembered-tabs lock")?;
+        ensure_exact_owner_mode(&file, &lock_path, 0o600, "remembered-tabs lock")?;
+
+        // LOCK_NB keeps a second launch bounded. This descriptor is opened
+        // CLOEXEC, so neither spawned shells nor child tools inherit ownership.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(AppError::Other(
+                    "another normal Phantom instance already owns remembered tab state".to_string(),
+                ));
+            }
+            return Err(AppError::Other(format!(
+                "could not lock remembered tab state at {}: {error}",
+                lock_path.display()
+            )));
+        }
+
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(windows)]
+    fn acquire_at(database_path: &std::path::Path) -> AppResult<Self> {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+        prepare_secure_store(database_path)?;
+        let lock_path = database_path.with_file_name(REMEMBERED_TABS_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // Cooperative instances may open the file, but omitting delete
+            // sharing prevents replacement from splitting lock ownership.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&lock_path)
+            .map_err(|error| {
+                AppError::Other(format!(
+                    "could not open remembered tab lock at {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            AppError::Other(format!(
+                "could not inspect remembered tab lock at {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(AppError::Other(format!(
+                "refusing to use remembered-tabs lock {}: not a regular non-reparse file",
+                lock_path.display()
+            )));
+        }
+
+        // Rust opens File handles as non-inheritable. The OS releases this
+        // whole-file lock when the handle closes, including after a crash.
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(TryLockError::WouldBlock) => Err(AppError::Other(
+                "another normal Phantom instance already owns remembered tab state".to_string(),
+            )),
+            Err(TryLockError::Error(error)) => Err(AppError::Other(format!(
+                "could not lock remembered tab state at {}: {error}",
+                lock_path.display()
+            ))),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn acquire_at(_database_path: &std::path::Path) -> AppResult<Self> {
+        Err(AppError::Other(
+            "remembered tab ownership is unsupported on this platform".to_string(),
+        ))
     }
 }
 
@@ -415,7 +527,7 @@ struct SecureStoreGuard {
 #[cfg(unix)]
 fn prepare_secure_store(path: &std::path::Path) -> AppResult<SecureStoreGuard> {
     let (directory, database_name) = walk_store_parent(path, true)?;
-    let database = open_or_create_db_file(&directory, &database_name, path)?;
+    let database = open_or_create_regular_file(&directory, &database_name, path)?;
     ensure_regular_file(&database, path, "session store database")?;
     ensure_exact_owner_mode(&database, path, 0o600, "session store database")?;
 
@@ -706,7 +818,7 @@ fn probe_error(path: &std::path::Path, error: &std::io::Error) -> AppError {
 }
 
 #[cfg(unix)]
-fn open_or_create_db_file(
+fn open_or_create_regular_file(
     directory: &std::fs::File,
     name: &std::ffi::OsStr,
     path: &std::path::Path,
@@ -1315,10 +1427,10 @@ mod tests {
 
     /// Unique per-test scratch directory (no tempfile dependency), removed on
     /// drop.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct ScratchDir(PathBuf);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl ScratchDir {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir()
@@ -1335,7 +1447,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Drop for ScratchDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -1386,6 +1498,140 @@ mod tests {
                 assert_eq!(mode_of(&sidecar), 0o600, "{}", sidecar.display());
             }
         }
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn remembered_tabs_lock_excludes_secondary_and_releases_without_state_changes() {
+        let scratch = ScratchDir::new("remembered-lock");
+        let db = scratch.path().join("data").join("phantom.db");
+        #[cfg(unix)]
+        let lock_path = db.with_file_name(REMEMBERED_TABS_LOCK_FILE);
+
+        let owner = RememberedTabsLock::acquire_at(&db).unwrap();
+        let primary_store = SessionStore::open_at(&db).unwrap();
+        primary_store
+            .save_tabs(&[tab("remembered", "/safe", true)])
+            .unwrap();
+
+        assert!(run_remembered_lock_child(&db, true).success());
+
+        // An ephemeral secondary may open the store for configuration, but it
+        // performs no remembered-tab mutation.
+        let ephemeral_store = SessionStore::open_at(&db).unwrap();
+        assert_eq!(ephemeral_store.load_tabs().unwrap().len(), 1);
+        drop(ephemeral_store);
+
+        let remembered = primary_store.load_tabs().unwrap();
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].title, "remembered");
+        assert_eq!(remembered[0].cwd, "/safe");
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_of(db.parent().unwrap()), 0o700);
+            assert_eq!(mode_of(&lock_path), 0o600);
+        }
+
+        drop(owner);
+        assert!(run_remembered_lock_child(&db, false).success());
+        let reacquired = RememberedTabsLock::acquire_at(&db).unwrap();
+        assert_eq!(primary_store.load_tabs().unwrap().len(), 1);
+        drop(reacquired);
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn remembered_tabs_lock_child() {
+        let Some(db) = std::env::var_os("PHANTOM_TEST_REMEMBERED_LOCK_DB").map(PathBuf::from)
+        else {
+            return;
+        };
+        let expect_locked = std::env::var_os("PHANTOM_TEST_EXPECT_LOCKED").is_some();
+        let result = RememberedTabsLock::acquire_at(&db);
+        if expect_locked {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("another normal Phantom instance"),
+                "{error}"
+            );
+        } else {
+            let _owner = result.unwrap();
+            if std::env::var_os("PHANTOM_TEST_HOLD_LOCK").is_some() {
+                use std::io::{Read, Write};
+
+                println!("PHANTOM_LOCK_READY");
+                std::io::stdout().flush().unwrap();
+                let _ = std::io::stdin().read(&mut [0_u8]);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn remembered_tabs_lock_is_released_after_owner_process_is_killed() {
+        use std::io::BufRead;
+        use std::process::Stdio;
+
+        let scratch = ScratchDir::new("remembered-lock-killed-owner");
+        let db = scratch.path().join("data").join("phantom.db");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("session::tests::remembered_tabs_lock_child")
+            .arg("--nocapture")
+            .env("PHANTOM_TEST_REMEMBERED_LOCK_DB", &db)
+            .env("PHANTOM_TEST_HOLD_LOCK", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(output.read_line(&mut line).unwrap(), 0);
+            if line.contains("PHANTOM_LOCK_READY") {
+                break;
+            }
+        }
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _reacquired = RememberedTabsLock::acquire_at(&db).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    fn run_remembered_lock_child(
+        db: &std::path::Path,
+        expect_locked: bool,
+    ) -> std::process::ExitStatus {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("session::tests::remembered_tabs_lock_child")
+            .env("PHANTOM_TEST_REMEMBERED_LOCK_DB", db);
+        if expect_locked {
+            command.env("PHANTOM_TEST_EXPECT_LOCKED", "1");
+        } else {
+            command.env_remove("PHANTOM_TEST_EXPECT_LOCKED");
+        }
+        command.status().unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remembered_tabs_lock_rejects_symlink() {
+        let scratch = ScratchDir::new("remembered-lock-symlink");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let target = scratch.path().join("elsewhere.lock");
+        std::fs::File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, data.join(REMEMBERED_TABS_LOCK_FILE)).unwrap();
+
+        let error = RememberedTabsLock::acquire_at(&data.join("phantom.db")).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
     }
 
     #[test]
