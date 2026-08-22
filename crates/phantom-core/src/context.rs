@@ -768,22 +768,7 @@ fn validate_env_key(key: &str) -> AppResult<()> {
     {
         return invalid(format!("invalid context task environment key '{key}'"));
     }
-    let upper = key.to_ascii_uppercase();
-    let reserved = matches!(
-        upper.as_str(),
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "LOGNAME"
-            | "SHELL"
-            | "TERM"
-            | "COLORTERM"
-            | "TERM_PROGRAM"
-            | "TERM_PROGRAM_VERSION"
-            | "CLICOLOR"
-            | "LSCOLORS"
-    ) || crate::pty::is_loader_env_name(&upper);
-    if reserved {
+    if crate::pty::is_reserved_task_env_key(key) {
         return invalid(format!(
             "context task may not override reserved environment variable '{key}'"
         ));
@@ -903,6 +888,21 @@ tabs:
         assert!(
             parse_context_manifest(&VALID.replace("RUST_LOG", "DYLD_INSERT_LIBRARIES")).is_err()
         );
+        for key in [
+            "PYTHONPATH",
+            "PERL5LIB",
+            "NODE_OPTIONS",
+            "RUBYOPT",
+            "BASH_ENV",
+            "ZDOTDIR",
+            "ENV",
+            "GIT_CONFIG_GLOBAL",
+        ] {
+            assert!(
+                parse_context_manifest(&VALID.replace("RUST_LOG", key)).is_err(),
+                "manifest accepted reserved environment key {key}"
+            );
+        }
     }
 
     #[test]

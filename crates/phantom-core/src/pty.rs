@@ -35,6 +35,26 @@ const MAX_STARTUP_PROGRAM_LEN: usize = 4096;
 const MAX_STARTUP_ARGS: usize = 128;
 const MAX_STARTUP_ARG_LEN: usize = 4096;
 const STARTUP_EXEC_SCRIPT: &str = "exec /usr/bin/env -- \"$@\"";
+const RESERVED_TASK_ENV_KEYS: &[&str] = &[
+    "BASH_ENV",
+    "CLICOLOR",
+    "COLORTERM",
+    "ENV",
+    "HOME",
+    "LOGNAME",
+    "LSCOLORS",
+    "NODE_OPTIONS",
+    "PATH",
+    "PERL5LIB",
+    "PYTHONPATH",
+    "RUBYOPT",
+    "SHELL",
+    "TERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "USER",
+    "ZDOTDIR",
+];
 
 /// Consumer of a PTY session's output.
 ///
@@ -663,13 +683,23 @@ fn is_inherited_loader_env_key(key: &OsStr) -> bool {
         .is_some_and(|key| is_loader_env_name(&key.to_ascii_uppercase()))
 }
 
-pub(crate) fn is_loader_env_name(key: &str) -> bool {
+fn is_loader_env_name(key: &str) -> bool {
     key.starts_with("LD_")
         || key.starts_with("DYLD_")
         || matches!(
             key,
             "LIBPATH" | "SHLIB_PATH" | "_RLD_LIST" | "LDR_PRELOAD" | "LDR_PRELOAD64"
         )
+}
+
+/// One authority for environment additions from reviewed contextual tasks.
+/// These names can replace process identity/capabilities or redirect code and
+/// configuration loaded by the launched program.
+pub(crate) fn is_reserved_task_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    RESERVED_TASK_ENV_KEYS.contains(&upper.as_str())
+        || upper.starts_with("GIT_")
+        || is_loader_env_name(&upper)
 }
 
 fn startup_shell_args(startup: StartupCommand) -> Vec<String> {
@@ -736,22 +766,7 @@ pub(crate) fn validate_launch_env(env: &BTreeMap<String, String>) -> AppResult<(
                 "invalid launch environment key '{key}'"
             )));
         }
-        let upper = key.to_ascii_uppercase();
-        let reserved = matches!(
-            upper.as_str(),
-            "PATH"
-                | "HOME"
-                | "USER"
-                | "LOGNAME"
-                | "SHELL"
-                | "TERM"
-                | "COLORTERM"
-                | "TERM_PROGRAM"
-                | "TERM_PROGRAM_VERSION"
-                | "CLICOLOR"
-                | "LSCOLORS"
-        ) || is_loader_env_name(&upper);
-        if reserved {
+        if is_reserved_task_env_key(key) {
             return Err(AppError::InvalidConfig(format!(
                 "launch environment may not override reserved variable '{key}'"
             )));
@@ -1227,6 +1242,24 @@ mod tests {
 
         let loader = BTreeMap::from([("LIBPATH".to_string(), "/tmp".to_string())]);
         assert!(validate_launch_env(&loader).is_err());
+
+        for key in [
+            "PYTHONPATH",
+            "PERL5LIB",
+            "NODE_OPTIONS",
+            "RUBYOPT",
+            "BASH_ENV",
+            "ZDOTDIR",
+            "ENV",
+            "GIT_CONFIG_GLOBAL",
+            "pythonpath",
+        ] {
+            let interpreter = BTreeMap::from([(key.to_string(), "/tmp".to_string())]);
+            assert!(
+                validate_launch_env(&interpreter).is_err(),
+                "final boundary accepted reserved environment key {key}"
+            );
+        }
 
         let control = BTreeMap::from([("RUST_LOG".to_string(), "info\nPATH=/tmp".to_string())]);
         assert!(validate_launch_env(&control).is_err());
