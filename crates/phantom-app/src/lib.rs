@@ -2721,7 +2721,12 @@ impl App {
         } else {
             bytes.extend_from_slice(text.as_bytes());
         }
-        let _ = self.pty.write(pty_id, &bytes);
+        // The whole paste (markers included) is queued atomically; on failure
+        // nothing was delivered, so tell the user instead of dropping it.
+        if let Err(error) = self.pty.write(pty_id, &bytes) {
+            self.show_notice(format!("Could not paste: {error}"));
+            return;
+        }
         if text.contains('\n') || text.contains('\r') {
             self.arm_cwd_polling(CWD_POLL_WINDOW);
         }

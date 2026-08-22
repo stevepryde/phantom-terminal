@@ -15,14 +15,17 @@ use crate::error::{AppError, AppResult};
 
 const MAX_LIVE_PTY_SESSIONS: usize = 256;
 
-/// Input is forwarded to a per-session writer thread in chunks of this size
-/// through a queue of [`WRITE_QUEUE_CHUNKS`] entries, bounding buffered input
-/// to ~1 MB per session. PTY master writes block when the child stops reading
-/// (suspended job, `Ctrl+S` flow control), so they must never run on the UI
-/// thread; when the queue fills, [`PtyManager::write`] fails instead of
-/// blocking.
-const WRITE_CHUNK_BYTES: usize = 4096;
-const WRITE_QUEUE_CHUNKS: usize = 256;
+/// Input is forwarded to a per-session writer thread as one owned message per
+/// logical input operation (a keystroke, an IME commit, a whole bracketed
+/// paste). Each operation is accepted or rejected atomically: it is capped at
+/// [`MAX_INPUT_BYTES`], and total buffered input per session is bounded by the
+/// same byte budget plus a [`WRITE_QUEUE_MESSAGES`] message cap. PTY master
+/// writes block when the child stops reading (suspended job, `Ctrl+S` flow
+/// control), so they must never run on the UI thread; when either bound is
+/// hit, [`PtyManager::write`] fails instead of blocking, and nothing from the
+/// rejected operation is enqueued.
+const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const WRITE_QUEUE_MESSAGES: usize = 256;
 const MAX_LAUNCH_ENV_VARS: usize = 128;
 const MAX_LAUNCH_ENV_KEY_LEN: usize = 128;
 const MAX_LAUNCH_ENV_VALUE_LEN: usize = 16 * 1024;
@@ -83,9 +86,75 @@ pub struct LaunchOpts {
 
 struct PtySession {
     master: Box<dyn MasterPty + Send>,
-    write_tx: SyncSender<Vec<u8>>,
+    writer_queue: WriterQueue,
     child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
+}
+
+/// Sending half of a session's writer-thread queue.
+///
+/// Each [`enqueue`](WriterQueue::enqueue) call carries one logical input
+/// operation as a single owned message, so a bracketed paste's begin marker,
+/// content, and end marker are accepted or rejected together — the queue never
+/// holds a partial operation. `queued_bytes` tracks bytes buffered in the
+/// channel (and the message currently being written) so total buffered input
+/// stays within [`MAX_INPUT_BYTES`] even though messages vary in size; the
+/// writer thread releases the budget after each blocking `write_all`.
+#[derive(Clone)]
+struct WriterQueue {
+    tx: SyncSender<Vec<u8>>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl WriterQueue {
+    /// Queue one logical input operation, accepting or rejecting it whole.
+    fn enqueue(&self, data: &[u8]) -> AppResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data.len() > MAX_INPUT_BYTES {
+            return Err(AppError::Pty(format!(
+                "input of {} bytes exceeds the {MAX_INPUT_BYTES}-byte limit",
+                data.len()
+            )));
+        }
+        if !self.reserve(data.len()) {
+            return Err(AppError::Pty("terminal is not accepting input".to_string()));
+        }
+        self.tx.try_send(data.to_vec()).map_err(|error| {
+            // Nothing was enqueued; release the byte reservation.
+            self.queued_bytes.fetch_sub(data.len(), Ordering::AcqRel);
+            match error {
+                TrySendError::Full(_) => {
+                    AppError::Pty("terminal is not accepting input".to_string())
+                }
+                TrySendError::Disconnected(_) => AppError::Pty("no such pty".to_string()),
+            }
+        })
+    }
+
+    /// Atomically reserve `len` bytes of the buffered-input budget; `false`
+    /// when the whole operation does not fit.
+    fn reserve(&self, len: usize) -> bool {
+        let mut current = self.queued_bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(len) else {
+                return false;
+            };
+            if next > MAX_INPUT_BYTES {
+                return false;
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -231,16 +300,21 @@ impl PtyManager {
         // all writes happen here, off the UI thread. The thread exits when the
         // session (and with it `write_tx`) is dropped, or when a write fails
         // (EIO after the child dies).
-        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_CHUNKS);
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_MESSAGES);
+        let writer_queue = WriterQueue {
+            tx: write_tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        let queued_bytes = Arc::clone(&writer_queue.queued_bytes);
         if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-writer-{id}"))
             .spawn(move || {
                 while let Ok(data) = write_rx.recv() {
-                    if writer
-                        .write_all(&data)
-                        .and_then(|_| writer.flush())
-                        .is_err()
-                    {
+                    let result = writer.write_all(&data).and_then(|_| writer.flush());
+                    // Release the budget only after the blocking write, so
+                    // buffered plus in-flight input stays within the bound.
+                    queued_bytes.fetch_sub(data.len(), Ordering::AcqRel);
+                    if result.is_err() {
                         break;
                     }
                 }
@@ -257,7 +331,7 @@ impl PtyManager {
             id,
             PtySession {
                 master: pair.master,
-                write_tx,
+                writer_queue,
                 child,
                 pid,
             },
@@ -318,24 +392,19 @@ impl PtyManager {
         Ok(id)
     }
 
-    /// Queue `data` for the session's writer thread. Fails fast instead of
-    /// blocking when the child has stopped reading input and the queue is full.
+    /// Queue `data` — one logical input operation — for the session's writer
+    /// thread. The operation is accepted or rejected whole: on error nothing
+    /// was enqueued, so the caller may safely retry or drop it. Fails fast
+    /// instead of blocking when the child has stopped reading input and the
+    /// queue is full.
     pub fn write(&self, id: u32, data: &[u8]) -> AppResult<()> {
-        let tx = self
+        let queue = self
             .lock()
             .get(&id)
             .ok_or_else(|| AppError::Pty("no such pty".to_string()))?
-            .write_tx
+            .writer_queue
             .clone();
-        for chunk in data.chunks(WRITE_CHUNK_BYTES) {
-            tx.try_send(chunk.to_vec()).map_err(|e| match e {
-                TrySendError::Full(_) => {
-                    AppError::Pty("terminal is not accepting input".to_string())
-                }
-                TrySendError::Disconnected(_) => AppError::Pty("no such pty".to_string()),
-            })?;
-        }
-        Ok(())
+        queue.enqueue(data)
     }
 
     pub fn resize(&self, id: u32, rows: u16, cols: u16) -> AppResult<()> {
@@ -1101,6 +1170,96 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert!(reaped, "child {pid} was not reaped after sink detach");
+    }
+
+    fn writer_queue(capacity: usize) -> (WriterQueue, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        (
+            WriterQueue {
+                tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+            rx,
+        )
+    }
+
+    fn bracketed_paste() -> Vec<u8> {
+        b"\x1b[200~echo pasted\x1b[201~".to_vec()
+    }
+
+    #[test]
+    fn accepted_bracketed_paste_is_one_message() {
+        let (queue, rx) = writer_queue(4);
+        let paste = bracketed_paste();
+
+        queue.enqueue(&paste).unwrap();
+
+        // Begin marker, content, and end marker arrive as a single message.
+        assert_eq!(rx.try_recv().unwrap(), paste);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn saturated_message_queue_rejects_bracketed_paste_whole() {
+        let (queue, rx) = writer_queue(1);
+        queue.enqueue(b"x").unwrap(); // occupy the only message slot
+
+        let paste = bracketed_paste();
+        let error = queue.enqueue(&paste).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "pty error: terminal is not accepting input"
+        );
+
+        // No paste bytes leaked into the queue — in particular no dangling
+        // begin marker — and the failed attempt released its byte reservation.
+        assert_eq!(queue.queued_bytes.load(Ordering::Acquire), 1);
+        assert_eq!(rx.try_recv().unwrap(), b"x".to_vec());
+        assert!(rx.try_recv().is_err());
+
+        // Once the queue drains, the same paste is accepted whole.
+        queue.enqueue(&paste).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), paste);
+    }
+
+    #[test]
+    fn exhausted_byte_budget_rejects_bracketed_paste_whole() {
+        let (queue, rx) = writer_queue(4);
+        let paste = bracketed_paste();
+        let filler = vec![b'a'; MAX_INPUT_BYTES - paste.len() + 1];
+        queue.enqueue(&filler).unwrap();
+
+        let error = queue.enqueue(&paste).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "pty error: terminal is not accepting input"
+        );
+
+        // Only the filler is buffered; the rejected paste reserved nothing.
+        assert_eq!(queue.queued_bytes.load(Ordering::Acquire), filler.len());
+        assert_eq!(rx.try_recv().unwrap().len(), filler.len());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn oversized_input_is_rejected_before_enqueue() {
+        let (queue, rx) = writer_queue(4);
+        let oversized = vec![b'a'; MAX_INPUT_BYTES + 1];
+
+        assert!(queue.enqueue(&oversized).is_err());
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(queue.queued_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn empty_input_is_accepted_without_enqueueing() {
+        let (queue, rx) = writer_queue(4);
+
+        queue.enqueue(b"").unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(queue.queued_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]
