@@ -508,6 +508,15 @@ def validate_graph(metadata):
         blocked.add(f"unreviewed workspace package set: {sorted(workspace_names)}")
 
     resolved_names = {packages_by_id[package_id]["name"] for package_id in nodes_by_id}
+    for package_id in nodes_by_id:
+        if package_id in workspace_ids:
+            continue
+        package = packages_by_id[package_id]
+        if package["source"] not in {None, CRATES_IO}:
+            blocked.add(
+                f"unreviewed package source: {package['name']} {package['version']} "
+                f"({package['source']})"
+            )
     for name in sorted(resolved_names & PROTOCOL_CLIENTS):
         blocked.add(f"resolved network client: {name}")
     exception_names = {exception[0] for exception in ACCESSKIT_EXCEPTIONS}

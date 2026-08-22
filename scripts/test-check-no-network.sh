@@ -172,6 +172,29 @@ expect_failure "$unknown" 'unreviewed direct dependency identity: phantom-core -
 unknown_output=$(run_gate "$unknown" 2>&1 || true)
 grep -q 'repository package is outside workspace: innocent-wrapper' <<<"$unknown_output"
 
+echo "==> non-crates.io package sources fail even with an approved identity"
+git_source="$scratch/git-source"
+git_dependency="$scratch/dependencies/directories-git"
+new_fixture "$git_source"
+new_dependency "$git_dependency" directories 6.0.0
+git -C "$git_dependency" init -q
+git -C "$git_dependency" add Cargo.toml src/lib.rs
+git -C "$git_dependency" -c user.name=fixture -c user.email=fixture@example.invalid \
+  commit -qm fixture
+printf '%s\n' \
+  '[package]' \
+  'name = "phantom-core"' \
+  'version = "0.1.0"' \
+  'edition = "2021"' \
+  '' \
+  '[dependencies]' \
+  "directories = { git = \"file://$git_dependency\" }" \
+  >"$git_source/crates/app/Cargo.toml"
+# This fetches only the fixture's local file:// repository into Cargo's cache.
+cargo generate-lockfile --manifest-path "$git_source/Cargo.toml"
+cargo check --offline --manifest-path "$git_source/Cargo.toml" >/dev/null 2>&1
+expect_failure "$git_source" 'unreviewed package source: directories 6.0.0'
+
 echo "==> unauthorized transitive socket transport fails"
 transitive="$scratch/transitive"
 wrapper="$scratch/dependencies/directories-wrapper"
