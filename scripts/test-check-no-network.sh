@@ -133,6 +133,19 @@ printf '%s\n' 'pub fn bind() { let _ = std::net::UdpSocket::bind("127.0.0.1:0");
 cargo generate-lockfile --offline --manifest-path "$outside/Cargo.toml"
 expect_failure "$outside" 'direct socket API:'
 
+echo "==> harmless mixed grouped imports pass and compile"
+mixed_imports="$scratch/mixed-imports"
+new_fixture "$mixed_imports"
+printf '%s\n' \
+  'use std::{fs::{self, File}, net::SocketAddr};' \
+  'pub fn local_only() {' \
+  '    let _ = fs::metadata(".");' \
+  '    let _ = core::mem::size_of::<(File, SocketAddr)>();' \
+  '}' >"$mixed_imports/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$mixed_imports/Cargo.toml"
+cargo check --offline --manifest-path "$mixed_imports/Cargo.toml" >/dev/null 2>&1
+run_gate "$mixed_imports"
+
 for client in reqwest minreq; do
   echo "==> renamed $client dependency fails"
   renamed="$scratch/renamed-$client"
@@ -358,6 +371,21 @@ cargo generate-lockfile --offline --manifest-path "$grouped_net_self/Cargo.toml"
 cargo check --offline --manifest-path "$grouped_net_self/Cargo.toml" >/dev/null 2>&1
 expect_failure "$grouped_net_self" 'direct socket API:'
 
+echo "==> ambient net tokens cannot hide a later std::net authority"
+mixed_net_authority="$scratch/mixed-net-authority"
+new_fixture "$mixed_net_authority"
+printf '%s\n' \
+  'mod foo { pub mod net { pub struct Thing; } }' \
+  'use {foo::net::Thing, std::net as transport};' \
+  'use transport::TcpStream as Stream;' \
+  'pub fn dial() {' \
+  '    let _ = core::mem::size_of::<Thing>();' \
+  '    let _ = Stream::connect("127.0.0.1:9");' \
+  '}' >"$mixed_net_authority/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$mixed_net_authority/Cargo.toml"
+cargo check --offline --manifest-path "$mixed_net_authority/Cargo.toml" >/dev/null 2>&1
+expect_failure "$mixed_net_authority" 'direct socket API:'
+
 echo "==> libc module aliases fail"
 libc_module_alias="$scratch/libc-module-alias"
 new_fixture "$libc_module_alias"
@@ -478,6 +506,25 @@ printf '%s\n' \
 cargo generate-lockfile --offline --manifest-path "$renamed_libc/Cargo.toml"
 cargo check --offline --manifest-path "$renamed_libc/Cargo.toml" >/dev/null 2>&1
 expect_failure "$renamed_libc" 'unreviewed direct dependency identity:'
+
+echo "==> ambient libc tokens cannot hide a later libc authority"
+mixed_libc_authority="$scratch/mixed-libc-authority"
+new_fixture "$mixed_libc_authority"
+printf '%s\n' '' '[dependencies]' \
+  'libc = { path = "../../../dependencies/compile-libc" }' \
+  >>"$mixed_libc_authority/crates/app/Cargo.toml"
+printf '%s\n' \
+  'extern crate libc;' \
+  'mod foo { pub mod libc { pub struct Thing; } }' \
+  'use {foo::libc::Thing, libc as native};' \
+  'use native::socket as open_socket;' \
+  'pub fn raw() {' \
+  '    let _ = core::mem::size_of::<Thing>();' \
+  '    let _ = open_socket;' \
+  '}' >"$mixed_libc_authority/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$mixed_libc_authority/Cargo.toml"
+cargo check --offline --manifest-path "$mixed_libc_authority/Cargo.toml" >/dev/null 2>&1
+expect_failure "$mixed_libc_authority" 'direct socket API:'
 
 echo "==> libc syscall socket authority fails and compiles"
 syscall_fixture="$scratch/libc-syscall"

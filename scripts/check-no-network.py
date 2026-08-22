@@ -298,6 +298,87 @@ def find_sequence(values, sequence):
     return None
 
 
+def expand_use_tree(values):
+    """Expand a Rust use tree into (canonical path, alias, glob, self-leaf)."""
+    leaves = []
+
+    def emit(path, alias=None, glob=False):
+        path = list(path)
+        self_leaf = bool(path and path[-1] == "self")
+        if self_leaf:
+            path.pop()
+        while path and path[0] in {"crate", "self", "super"}:
+            path.pop(0)
+        leaves.append((tuple(path), alias, glob, self_leaf))
+
+    def parse_group(position, base, closing):
+        while position < len(values):
+            if closing and values[position] == "}":
+                return position + 1
+            if values[position] == ",":
+                position += 1
+                continue
+            position = parse_item(position, base)
+            if position < len(values) and values[position] == ",":
+                position += 1
+            elif closing and position < len(values) and values[position] == "}":
+                return position + 1
+            elif position < len(values):
+                raise ValueError("malformed use tree")
+        if closing:
+            raise ValueError("unterminated use group")
+        return position
+
+    def parse_item(position, base):
+        path = list(base)
+        need_segment = True
+        if position < len(values) and values[position] == "::":
+            position += 1
+        while position < len(values):
+            token = values[position]
+            if token == "{":
+                return parse_group(position + 1, tuple(path), True)
+            if token == "*":
+                if not need_segment:
+                    raise ValueError("malformed glob import")
+                emit(path, glob=True)
+                return position + 1
+            if token == "as":
+                if not path or position + 1 >= len(values):
+                    raise ValueError("malformed use alias")
+                alias = values[position + 1]
+                if not IDENTIFIER_RE.fullmatch(alias):
+                    raise ValueError("malformed use alias")
+                emit(path, alias=alias)
+                return position + 2
+            if token in {",", "}"}:
+                if need_segment:
+                    raise ValueError("incomplete use path")
+                emit(path)
+                return position
+            if not need_segment or not IDENTIFIER_RE.fullmatch(token):
+                raise ValueError("malformed use path")
+            path.append(token)
+            position += 1
+            need_segment = False
+            if position < len(values) and values[position] == "::":
+                position += 1
+                need_segment = True
+            elif position < len(values) and values[position] == "{":
+                continue
+            elif position < len(values) and values[position] not in {"as", ",", "}"}:
+                raise ValueError("malformed use separator")
+        if need_segment:
+            raise ValueError("incomplete use path")
+        emit(path)
+        return position
+
+    end = parse_group(0, (), False)
+    if end != len(values):
+        raise ValueError("trailing use tokens")
+    return leaves
+
+
 def source_violation(tokens, approved_custom_macros):
     values = [value for value, _ in tokens]
 
@@ -382,49 +463,27 @@ def source_violation(tokens, approved_custom_macros):
             elif values[end] == ";" and depth == 0:
                 break
             end += 1
-        use_tree = values[index + 1 : end]
-        if "include" in use_tree:
+        try:
+            use_leaves = expand_use_tree(values[index + 1 : end])
+        except ValueError:
             return index
-        if any(
-            use_tree[position] == "as" and use_tree[position + 1] in BUILTIN_MACROS
-            for position in range(len(use_tree) - 1)
-        ):
-            return index
-        for root in {"std", "core"}:
-            root_aliases = [
-                (root, "as"),
-                (root, "::", "*"),
-                (root, "::", "{", "self", "as"),
-            ]
-            if any(find_sequence(use_tree, alias) is not None for alias in root_aliases):
+        for path, alias, glob, self_leaf in use_leaves:
+            if path and path[-1] in {"asm", "global_asm", "include"}:
                 return index
-            root_index = use_tree.index(root) if root in use_tree else None
-            if root_index is not None and (
-                root_index + 1 == len(use_tree)
-                or use_tree[root_index + 1] in {",", "}"}
-            ):
+            if alias in BUILTIN_MACROS:
                 return index
-        if "libc" in use_tree:
-            libc_index = use_tree.index("libc")
-            aliases_libc = (
-                "*" in use_tree
-                or any(symbol in use_tree for symbol in SOCKET_FUNCTIONS)
-                or sequence_at(use_tree, libc_index, ("libc", "as"))
-                or find_sequence(use_tree, ("self", "as")) is not None
-            )
-            if aliases_libc:
+            if path in {("std",), ("core",)} and (alias or glob or self_leaf):
                 return index
-        if "std" in use_tree and "net" in use_tree:
-            net_index = use_tree.index("net")
-            imports_net_module = (
-                net_index + 1 == len(use_tree)
-                or use_tree[net_index + 1] != "::"
-            )
+            if path == ("libc",) and (alias or glob or self_leaf):
+                return index
+            if len(path) > 1 and path[0] == "libc" and path[1] in SOCKET_FUNCTIONS:
+                return index
+            if path == ("std", "net"):
+                return index
             if (
-                imports_net_module
-                or "*" in use_tree
-                or "self" in use_tree
-                or any(socket_type in use_tree for socket_type in SOCKET_TYPES)
+                len(path) > 2
+                and path[:2] == ("std", "net")
+                and (path[2] in SOCKET_TYPES or glob)
             ):
                 return index
 
