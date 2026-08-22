@@ -34,7 +34,7 @@ pub use context::{
 };
 pub use error::{AppError, AppResult};
 pub use launch::{LaunchContext, LaunchState};
-pub use pty::{LaunchOpts, PtyManager, PtySink, SpawnOpts, StartupCommand};
+pub use pty::{resolve_program, LaunchOpts, PtyManager, PtySink, SpawnOpts, StartupCommand};
 pub use session::{
     SessionStore, TabRecord, MAX_TAB_CWD_LEN, MAX_TAB_ID_LEN, MAX_TAB_PROFILE_ID_LEN,
     MAX_TAB_RECORDS, MAX_TAB_TITLE_LEN,

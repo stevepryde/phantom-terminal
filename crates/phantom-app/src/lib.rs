@@ -52,9 +52,9 @@ use gpu::{GpuContext, PresentStatus};
 use keybindings::{Action, Keymap};
 use palette::{PaletteAction, PaletteOutcome, PaletteState};
 use phantom_core::{
-    default_home_dir, resolve_launch_opts, resolve_trusted_task, trust_context_manifest, AppConfig,
-    LaunchContext, LaunchOpts, PtyManager, PtySink, SessionStore, StartupCommand, TabRecord,
-    WindowSize, MAX_TAB_TITLE_LEN,
+    default_home_dir, resolve_launch_opts, resolve_program, resolve_trusted_task,
+    trust_context_manifest, AppConfig, LaunchContext, LaunchOpts, PtyManager, PtySink,
+    SessionStore, StartupCommand, TabRecord, WindowSize, MAX_TAB_TITLE_LEN,
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
@@ -1849,6 +1849,15 @@ impl App {
     }
 
     fn run_spdeploy_context_action(&mut self, config_path: PathBuf, operation: String) {
+        self.run_spdeploy_context_action_with_resolver(config_path, operation, resolve_program);
+    }
+
+    fn run_spdeploy_context_action_with_resolver(
+        &mut self,
+        config_path: PathBuf,
+        operation: String,
+        resolver: impl FnOnce(&str) -> phantom_core::AppResult<String>,
+    ) {
         let active_cwd = match self
             .tabs
             .get(self.active)
@@ -1896,7 +1905,13 @@ impl App {
             return;
         }
         let config_path = canonical_config.expect("validated canonical spdeploy config");
-        let startup = spdeploy_startup_command(&config_path, &operation);
+        let startup = match spdeploy_startup_command(&config_path, &operation, resolver) {
+            Ok(startup) => startup,
+            Err(error) => {
+                self.show_notice(format!("Could not resolve spdeploy: {error}"));
+                return;
+            }
+        };
         self.spawn_new_tab(NewTabRequest {
             profile_id: None,
             cwd: config_path
@@ -3446,9 +3461,19 @@ fn frequent_command_input(command: &str) -> Vec<u8> {
     input
 }
 
-fn spdeploy_startup_command(config_path: &Path, operation: &str) -> StartupCommand {
-    StartupCommand {
-        program: "spdeploy".to_string(),
+fn spdeploy_startup_command(
+    config_path: &Path,
+    operation: &str,
+    resolver: impl FnOnce(&str) -> phantom_core::AppResult<String>,
+) -> phantom_core::AppResult<StartupCommand> {
+    let program = resolver("spdeploy")?;
+    if !Path::new(&program).is_absolute() {
+        return Err(phantom_core::AppError::InvalidConfig(
+            "resolved spdeploy program is not an absolute path".to_string(),
+        ));
+    }
+    Ok(StartupCommand {
+        program,
         args: vec![
             "--config".to_string(),
             config_path.to_string_lossy().into_owned(),
@@ -3456,7 +3481,7 @@ fn spdeploy_startup_command(config_path: &Path, operation: &str) -> StartupComma
             operation.to_string(),
         ],
         env: Default::default(),
-    }
+    })
 }
 
 fn looks_like_shell_prompt(prefix: &str) -> bool {
@@ -4649,15 +4674,88 @@ mod tests {
 
     #[test]
     fn sidebar_spdeploy_uses_the_interactive_tty_ui() {
-        let startup = spdeploy_startup_command(Path::new("/project/deploy.yml"), "deploy");
+        let startup =
+            spdeploy_startup_command(Path::new("/project/deploy.yml"), "deploy", |program| {
+                assert_eq!(program, "spdeploy");
+                Ok("/trusted/bin/spdeploy".to_string())
+            })
+            .unwrap();
 
-        assert_eq!(startup.program, "spdeploy");
+        assert_eq!(startup.program, "/trusted/bin/spdeploy");
+        assert!(Path::new(&startup.program).is_absolute());
         assert_eq!(
             startup.args,
             ["--config", "/project/deploy.yml", "--operation", "deploy"]
         );
         assert!(!startup.args.iter().any(|arg| arg == "--no-ui"));
         assert!(!startup.args.iter().any(|arg| arg == "--yes"));
+    }
+
+    #[test]
+    fn sidebar_spdeploy_rejects_a_non_absolute_resolver_result() {
+        let error = spdeploy_startup_command(Path::new("/project/deploy.yml"), "deploy", |_| {
+            Ok("spdeploy".to_string())
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid config: resolved spdeploy program is not an absolute path"
+        );
+    }
+
+    #[test]
+    fn sidebar_spdeploy_resolution_failure_is_noticed_without_opening_a_tab() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+        let temp = std::env::temp_dir().join(format!(
+            "phantom-spdeploy-resolution-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(
+            temp.join("deploy.yml"),
+            "name: Test\noperation:\n  deploy:\n    stage:\n      - type: script\n        path: ship.sh\n",
+        )
+        .unwrap();
+        let root = temp.canonicalize().unwrap();
+        let section = context_actions::discover_spdeploy(&root).unwrap();
+        let context_actions::ContextSectionContent::Spdeploy(spdeploy) = &section.content else {
+            panic!("expected spdeploy section");
+        };
+        let config_path = spdeploy.operations[0].config_path.clone();
+
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            root.to_string_lossy().into_owned(),
+            None,
+        ));
+        app.context_snapshot = ContextSnapshot {
+            cwd: root,
+            sections: vec![section],
+        };
+
+        app.run_spdeploy_context_action_with_resolver(config_path, "deploy".to_string(), |_| {
+            Err(phantom_core::AppError::Pty(
+                "program 'spdeploy' was not found in the normalized PATH".to_string(),
+            ))
+        });
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(
+            app.notice_text(),
+            Some(
+                "Could not resolve spdeploy: pty error: program 'spdeploy' was not found in the normalized PATH"
+            )
+        );
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
