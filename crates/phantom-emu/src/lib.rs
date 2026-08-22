@@ -14,6 +14,8 @@
 mod alacritty_core;
 pub mod keys;
 
+use std::rc::Rc;
+
 pub use alacritty_core::AlacrittyCore;
 pub use keys::{encode_key, encode_mouse_legacy, encode_mouse_sgr, Key, Modifiers};
 
@@ -30,7 +32,11 @@ pub trait VtCore {
     fn size(&self) -> (u16, u16);
 
     /// Snapshot the visible viewport for rendering.
-    fn snapshot(&self) -> Snapshot;
+    ///
+    /// Implementations may cache this immutable view. Cloning the returned
+    /// [`Rc`] is intentionally cheap so incidental redraws do not need to walk
+    /// or allocate the terminal grid again.
+    fn snapshot(&self) -> Rc<Snapshot>;
 
     /// The text on the cursor's row strictly left of the cursor, or `None`
     /// when the cursor is hidden. Reads the cursor's actual grid row (not a
