@@ -4095,7 +4095,8 @@ fn truncate_to_chars(value: &str, max_bytes: usize) -> String {
 }
 
 /// Run the app under a winit event loop (the production entry point).
-pub fn run() {
+pub fn run() -> phantom_core::AppResult<()> {
+    let launch = phantom_core::LaunchState::from_env()?.context();
     let store = SessionStore::open()
         .map_err(|e| eprintln!("session store unavailable ({e}); not persisting"))
         .ok();
@@ -4103,7 +4104,6 @@ pub fn run() {
         .as_ref()
         .and_then(|s| s.load_config().ok())
         .unwrap_or_default();
-    let launch = phantom_core::LaunchState::from_env().context();
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
@@ -4118,6 +4118,7 @@ pub fn run() {
     app.pending_pty_events = Some(pending);
     app.event_loop_proxy = Some(proxy);
     event_loop.run_app(&mut app).expect("event loop error");
+    Ok(())
 }
 
 #[cfg(test)]

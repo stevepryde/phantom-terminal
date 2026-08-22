@@ -4,7 +4,12 @@
 fn main() {
     match phantom_app::cli::dispatch_from_env() {
         Ok(true) => {}
-        Ok(false) => phantom_app::run(),
+        Ok(false) => {
+            if let Err(error) = phantom_app::run() {
+                eprintln!("phantom: {error}");
+                std::process::exit(1);
+            }
+        }
         Err(error) => {
             eprintln!("phantom: {error}");
             std::process::exit(error.exit_code());
