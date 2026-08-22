@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 # Enforces Phantom Terminal's "no outbound network" posture across the Rust
 # workspace.
-#
-# We cannot assert the whole dependency tree is HTTP-client-free (the native app
-# links no network stack but pulls a large GPU/text tree). Instead we assert the
-# thing we actually control: none of our own crates adds an HTTP-client /
-# websocket dependency. The native app has no webview, CSP, or capability surface
-# to police — removing those is exactly why the check is now this short.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
-fail=0
+script_dir=$(cd "$(dirname "$0")" && pwd)
+repo_root=${PHANTOM_NO_NETWORK_ROOT:-"$(cd "$script_dir/.." && pwd)"}
+cd "$repo_root"
 
-echo "==> Checking workspace crate manifests for HTTP-client dependencies"
-http_re='^[[:space:]]*(reqwest|hyper|hyper-util|h2|isahc|ureq|surf|curl|attohttpc|tungstenite|tokio-tungstenite|websocket|awc)[[:space:]]*='
-manifests=$(ls crates/*/Cargo.toml 2>/dev/null || true)
-if [ -n "${manifests// /}" ] && grep -nEi "$http_re" $manifests; then
-  echo "  ✗ A direct HTTP-client dependency was added to a workspace crate." >&2
+fail=0
+metadata_file=$(mktemp "${TMPDIR:-/tmp}/phantom-cargo-metadata.XXXXXX")
+trap 'rm -f "$metadata_file"' EXIT
+
+echo "==> Checking the locked Cargo resolve graph for network-capable packages"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  ✗ python3 is required to inspect cargo metadata safely." >&2
+  exit 1
+fi
+if ! cargo metadata --locked --format-version 1 >"$metadata_file"; then
+  echo "  ✗ cargo metadata --locked failed." >&2
+  exit 1
+fi
+
+if ! python3 "$script_dir/check-no-network.py" "$metadata_file"; then
   fail=1
 else
   echo "  ✓ none"

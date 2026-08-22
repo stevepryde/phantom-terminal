@@ -183,6 +183,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo build --workspace --locked
 cargo test --workspace --locked
 bash scripts/check-no-network.sh
+bash scripts/test-check-no-network.sh
 ```
 
 ## License
