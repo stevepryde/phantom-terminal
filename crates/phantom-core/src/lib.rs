@@ -25,7 +25,9 @@ pub mod spdeploy;
 pub const MAX_TABS: usize = 128;
 
 pub use bounded_file::{read_bounded_regular_file, BoundedReadError};
-pub use config::{AppConfig, Keybinding, ShellProfile, Theme, WindowSize, UI_THEMES};
+pub use config::{
+    AppConfig, Keybinding, KeybindingAction, ShellProfile, Theme, WindowSize, UI_THEMES,
+};
 pub use context::{
     load_context_manifest, load_context_manifest_source, parse_context_manifest,
     resolve_trusted_task, trust_context_manifest, validate_context_manifest, ContextActionsConfig,
@@ -43,7 +45,7 @@ pub use launch::{LaunchContext, LaunchState};
 pub use pty::{resolve_program, LaunchOpts, PtyManager, PtySink, SpawnOpts, StartupCommand};
 pub use session::{
     RememberedTabsLock, SessionStore, TabRecord, MAX_TAB_CWD_LEN, MAX_TAB_ID_LEN,
-    MAX_TAB_PROFILE_ID_LEN, MAX_TAB_TITLE_LEN,
+    MAX_TAB_PROFILE_ID_LEN, MAX_TAB_TIMESTAMP_LEN, MAX_TAB_TITLE_LEN,
 };
 pub use spawn::{default_home_dir, resolve_launch_opts};
 pub use spdeploy::{

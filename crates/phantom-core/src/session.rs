@@ -20,6 +20,7 @@ pub const MAX_TAB_ID_LEN: usize = 128;
 pub const MAX_TAB_TITLE_LEN: usize = 256;
 pub const MAX_TAB_CWD_LEN: usize = 4096;
 pub const MAX_TAB_PROFILE_ID_LEN: usize = 128;
+pub const MAX_TAB_TIMESTAMP_LEN: usize = 64;
 const REMEMBERED_TABS_LOCK_FILE: &str = "remembered-tabs.lock";
 const MAX_APP_CONFIG_BYTES: usize = MAX_SERIALIZED_APP_CONFIG_BYTES;
 
@@ -52,6 +53,16 @@ impl TabRecord {
             self.shell_profile_id.as_deref(),
             MAX_TAB_PROFILE_ID_LEN,
         )?;
+        validate_optional_len(
+            "tab created timestamp",
+            self.created_at.as_deref(),
+            MAX_TAB_TIMESTAMP_LEN,
+        )?;
+        validate_optional_len(
+            "tab updated timestamp",
+            self.updated_at.as_deref(),
+            MAX_TAB_TIMESTAMP_LEN,
+        )?;
         validate_no_nul("tab title", &self.title)?;
         validate_no_nul("tab cwd", &self.cwd)?;
         if let Some(id) = &self.id {
@@ -59,6 +70,12 @@ impl TabRecord {
         }
         if let Some(profile_id) = &self.shell_profile_id {
             validate_no_nul("tab shell profile id", profile_id)?;
+        }
+        if let Some(created_at) = &self.created_at {
+            validate_no_nul("tab created timestamp", created_at)?;
+        }
+        if let Some(updated_at) = &self.updated_at {
+            validate_no_nul("tab updated timestamp", updated_at)?;
         }
         Ok(())
     }
@@ -1386,6 +1403,21 @@ mod tests {
         let oversized = tab(&"x".repeat(MAX_TAB_TITLE_LEN + 1), "/known", true);
 
         assert!(store.save_tabs(&[oversized]).is_err());
+    }
+
+    #[test]
+    fn tab_timestamps_are_bounded_and_nul_free() {
+        let mut record = tab("known", "/known", true);
+        record.created_at = Some("x".repeat(MAX_TAB_TIMESTAMP_LEN));
+        record.updated_at = Some("x".repeat(MAX_TAB_TIMESTAMP_LEN));
+        record.validate().unwrap();
+
+        record.created_at = Some("x".repeat(MAX_TAB_TIMESTAMP_LEN + 1));
+        assert!(record.validate().is_err());
+
+        record.created_at = None;
+        record.updated_at = Some("2026-08-22T12:34:56Z\0suffix".to_string());
+        assert!(record.validate().is_err());
     }
 
     #[test]
