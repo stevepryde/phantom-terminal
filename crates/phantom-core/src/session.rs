@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
 use rusqlite::Connection;
+#[cfg(unix)]
+use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
@@ -64,19 +66,29 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn open() -> AppResult<Self> {
-        let path = db_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            set_mode(parent, 0o700);
-        }
-        let conn = Connection::open(&path)?;
-        restrict_db_permissions(&path);
+        Self::open_at(&db_path()?)
+    }
+
+    /// Open (creating if needed) the store at `path`, refusing to proceed
+    /// unless owner-only at-rest protection is actually in place: a `0700`
+    /// directory holding a `0600` regular-file database, both owned by the
+    /// current user, with no symlinks anywhere in the final components. On
+    /// failure the caller gets an error and no store — the app then runs
+    /// without persistence rather than writing session data somewhere an
+    /// attacker could read or redirect.
+    fn open_at(path: &std::path::Path) -> AppResult<Self> {
+        let secure_store = prepare_secure_store(path)?;
+        let conn = open_secure_connection(path, &secure_store)?;
         // Two running instances share this WAL database; without a busy
         // timeout a concurrent write returns SQLITE_BUSY immediately and the
         // save fails with a user-visible notice.
         conn.busy_timeout(std::time::Duration::from_millis(2000))?;
         migrate(&conn)?;
-        restrict_db_permissions(&path);
+        // SQLite creates the WAL/SHM sidecars next to the database with the
+        // database's own 0600 mode, but re-verify so a loose sidecar left by
+        // an earlier build cannot linger inside the store directory.
+        verify_sidecars(path, &secure_store)?;
+        verify_store_identity(path, &secure_store)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -385,28 +397,590 @@ fn db_path() -> AppResult<PathBuf> {
     Ok(dirs.data_dir().join("phantom.db"))
 }
 
-/// Best-effort `chmod` for the session store's files and dir. Failures are
-/// ignored: the store still works without the tightened mode, and the parent
-/// `0700` dir already gates access. No-op on non-unix targets.
+/// Handles retained until SQLite has opened and migrated the same verified
+/// store. The Unix SQLite API accepts a path rather than an existing fd, so
+/// callers re-check path identities after opening; root and same-euid
+/// processes remain outside this boundary because they can replace and
+/// restore path components between any two checks.
 #[cfg(unix)]
-fn set_mode(path: &std::path::Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mut perms = meta.permissions();
-        perms.set_mode(mode);
-        let _ = std::fs::set_permissions(path, perms);
-    }
+struct SecureStoreGuard {
+    directory: std::fs::File,
+    database: std::fs::File,
+    database_name: std::ffi::OsString,
+}
+
+/// Establish the store's at-rest protection before SQLite touches the path.
+/// Every directory component is traversed relative to an already verified
+/// descriptor with `O_NOFOLLOW`, so intermediate symlinks are never followed.
+#[cfg(unix)]
+fn prepare_secure_store(path: &std::path::Path) -> AppResult<SecureStoreGuard> {
+    let (directory, database_name) = walk_store_parent(path, true)?;
+    let database = open_or_create_db_file(&directory, &database_name, path)?;
+    ensure_regular_file(&database, path, "session store database")?;
+    ensure_exact_owner_mode(&database, path, 0o600, "session store database")?;
+
+    let guard = SecureStoreGuard {
+        directory,
+        database,
+        database_name,
+    };
+    verify_sidecars(path, &guard)?;
+    Ok(guard)
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &std::path::Path, _mode: u32) {}
-
-fn restrict_db_permissions(path: &std::path::Path) {
-    set_mode(path, 0o600);
-    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        set_mode(&path.with_file_name(format!("{name}-wal")), 0o600);
-        set_mode(&path.with_file_name(format!("{name}-shm")), 0o600);
+fn prepare_secure_store(path: &std::path::Path) -> AppResult<()> {
+    // Phantom Terminal ships on macOS and Linux only; on other targets fall
+    // back to the platform's default ACLs, as before this hardening.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_secure_connection(
+    path: &std::path::Path,
+    guard: &SecureStoreGuard,
+) -> AppResult<Connection> {
+    let conn =
+        Connection::open_with_flags(path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+    verify_store_identity(path, guard)?;
+    Ok(conn)
+}
+
+#[cfg(not(unix))]
+fn open_secure_connection(path: &std::path::Path, _guard: &()) -> AppResult<Connection> {
+    Ok(Connection::open(path)?)
+}
+
+/// Verify the WAL/SHM sidecars (when present) relative to the retained private
+/// directory, tightening loose modes and refusing symlinks or special files.
+#[cfg(unix)]
+fn verify_sidecars(path: &std::path::Path, guard: &SecureStoreGuard) -> AppResult<()> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    for suffix in [b"-wal".as_slice(), b"-shm".as_slice()] {
+        let mut name = guard.database_name.as_bytes().to_vec();
+        name.extend_from_slice(suffix);
+        let name = std::ffi::OsString::from_vec(name);
+        let sidecar = path.with_file_name(&name);
+        let file = match open_file_at(&guard.directory, &name, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(probe_error(&sidecar, &error)),
+        };
+        ensure_regular_file(&file, &sidecar, "session store sidecar")?;
+        ensure_exact_owner_mode(&file, &sidecar, 0o600, "session store sidecar")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_sidecars(_path: &std::path::Path, _guard: &()) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_store_identity(path: &std::path::Path, guard: &SecureStoreGuard) -> AppResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let (directory, database_name) = walk_store_parent(path, false)?;
+    let expected_dir = guard
+        .directory
+        .metadata()
+        .map_err(|error| probe_error(path, &error))?;
+    let actual_dir = directory
+        .metadata()
+        .map_err(|error| probe_error(path, &error))?;
+    if expected_dir.dev() != actual_dir.dev() || expected_dir.ino() != actual_dir.ino() {
+        return Err(AppError::Other(format!(
+            "refusing to use session store {}: directory changed while opening",
+            path.display()
+        )));
+    }
+    if database_name != guard.database_name {
+        return Err(AppError::Other(format!(
+            "refusing to use session store {}: database name changed while opening",
+            path.display()
+        )));
+    }
+
+    let database = open_file_at(&directory, &database_name, false)
+        .map_err(|error| probe_error(path, &error))?;
+    ensure_regular_file(&database, path, "session store database")?;
+    ensure_exact_owner_mode(&database, path, 0o600, "session store database")?;
+    let expected_db = guard
+        .database
+        .metadata()
+        .map_err(|error| probe_error(path, &error))?;
+    let actual_db = database
+        .metadata()
+        .map_err(|error| probe_error(path, &error))?;
+    if expected_db.dev() != actual_db.dev() || expected_db.ino() != actual_db.ino() {
+        return Err(AppError::Other(format!(
+            "refusing to use session store {}: database changed while opening",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_store_identity(_path: &std::path::Path, _guard: &()) -> AppResult<()> {
+    Ok(())
+}
+
+/// Walk to the database's parent from `/`, retaining only directory handles
+/// and refusing every symlink. Controlling ancestors must be owned by root or
+/// the effective user and must not be group/other-writable. The root-owned
+/// sticky-directory exception admits conventional `/tmp`: its sticky bit
+/// prevents other users from replacing an entry owned by this user, and any
+/// pre-planted foreign-owned child is rejected on the next iteration.
+#[cfg(unix)]
+fn walk_store_parent(
+    path: &std::path::Path,
+    create_missing: bool,
+) -> AppResult<(std::fs::File, std::ffi::OsString)> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(AppError::Other(format!(
+            "session store path {} must be absolute",
+            path.display()
+        )));
+    }
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(AppError::Other(format!(
+            "session store path {} has no filesystem root",
+            path.display()
+        )));
+    }
+    let mut names = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => names.push(name.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::Other(format!(
+                    "session store path {} contains an unsafe component",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let database_name = names.pop().ok_or_else(|| {
+        AppError::Other(format!(
+            "session store path {} has no database file name",
+            path.display()
+        ))
+    })?;
+    let mut directory = open_root_directory()?;
+    let mut traversed = PathBuf::from("/");
+    validate_controlling_directory(&directory, &traversed)?;
+
+    let final_index = names.len().checked_sub(1);
+    for (index, name) in names.into_iter().enumerate() {
+        traversed.push(&name);
+        let next = match open_directory_at(&directory, &name) {
+            Ok(next) => next,
+            Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                match create_directory_at(&directory, &name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(probe_error(&traversed, &error)),
+                }
+                open_directory_at(&directory, &name)
+                    .map_err(|error| probe_error(&traversed, &error))?
+            }
+            Err(error) => return Err(probe_error(&traversed, &error)),
+        };
+        if Some(index) == final_index {
+            ensure_exact_owner_mode(&next, &traversed, 0o700, "session store directory")?;
+        } else {
+            validate_controlling_directory(&next, &traversed)?;
+        }
+        directory = next;
+    }
+
+    // A database directly below `/` would make the root directory the store
+    // directory, which cannot satisfy the current user's ownership invariant.
+    if final_index.is_none() {
+        ensure_exact_owner_mode(&directory, &traversed, 0o700, "session store directory")?;
+    }
+    Ok((directory, database_name))
+}
+
+#[cfg(unix)]
+fn open_root_directory() -> AppResult<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(|error| probe_error(std::path::Path::new("/"), &error))
+}
+
+#[cfg(unix)]
+fn component_cstring(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+#[cfg(unix)]
+fn open_directory_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = component_cstring(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn create_directory_at(parent: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let name = component_cstring(name)?;
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn open_file_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    create_new: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = component_cstring(name)?;
+    let mut flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    if create_new {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    }
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn probe_error(path: &std::path::Path, error: &std::io::Error) -> AppError {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return AppError::Other(format!(
+            "refusing to use session store path {}: it is a symlink",
+            path.display()
+        ));
+    }
+    if error.raw_os_error() == Some(libc::ENOTDIR) {
+        return AppError::Other(format!(
+            "refusing to use session store path {}: a component is a symlink or not a directory",
+            path.display()
+        ));
+    }
+    AppError::Other(format!(
+        "could not open session store path {}: {error}",
+        path.display()
+    ))
+}
+
+#[cfg(unix)]
+fn open_or_create_db_file(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &std::path::Path,
+) -> AppResult<std::fs::File> {
+    let opened = match open_file_at(directory, name, false) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match open_file_at(directory, name, true) {
+                Ok(file) => Ok(file),
+                // Another app instance may win creation; adopt its inode only
+                // after the same handle-based verification.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    open_file_at(directory, name, false)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    opened.map_err(|error| probe_error(path, &error))
+}
+
+#[cfg(target_os = "macos")]
+mod mac_acl {
+    use std::ffi::{c_int, c_void};
+    use std::os::fd::{AsRawFd, RawFd};
+
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+
+    unsafe extern "C" {
+        fn acl_free(object: *mut c_void) -> c_int;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
+        fn acl_get_tag_type(entry: *mut c_void, tag_type: *mut c_int) -> c_int;
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: c_int, acl: *mut c_void, acl_type: c_int) -> c_int;
+    }
+
+    struct Acl(*mut c_void);
+
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            let _ = unsafe { acl_free(self.0) };
+        }
+    }
+
+    fn load(fd: RawFd) -> std::io::Result<Option<Acl>> {
+        let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
+        if !acl.is_null() {
+            return Ok(Some(Acl(acl)));
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOENT)
+        ) {
+            // A filesystem with no ACL support cannot grant access beyond its
+            // Unix mode bits.
+            return Ok(None);
+        }
+        Err(error)
+    }
+
+    fn inspect(fd: RawFd) -> std::io::Result<(bool, bool)> {
+        let Some(acl) = load(fd)? else {
+            return Ok((false, false));
+        };
+        let mut entry = std::ptr::null_mut();
+        let mut entry_id = ACL_FIRST_ENTRY;
+        let mut any = false;
+        let mut allowing = false;
+        loop {
+            let result = unsafe { acl_get_entry(acl.0, entry_id, &mut entry) };
+            if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+                break;
+            }
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            any = true;
+            let mut tag_type = 0;
+            if unsafe { acl_get_tag_type(entry, &mut tag_type) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            allowing |= tag_type == ACL_EXTENDED_ALLOW;
+            entry_id = ACL_NEXT_ENTRY;
+        }
+        Ok((any, allowing))
+    }
+
+    pub(super) fn reject_allowing(
+        file: &std::fs::File,
+        path: &std::path::Path,
+    ) -> crate::error::AppResult<()> {
+        let (_, allowing) = inspect(file.as_raw_fd()).map_err(|error| {
+            crate::error::AppError::Other(format!(
+                "could not inspect ACL of session store ancestor {}: {error}",
+                path.display()
+            ))
+        })?;
+        if allowing {
+            return Err(crate::error::AppError::Other(format!(
+                "refusing to use session store ancestor {}: an extended ACL grants additional access",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn clear(
+        file: &std::fs::File,
+        path: &std::path::Path,
+        what: &str,
+    ) -> crate::error::AppResult<()> {
+        let (any, _) = inspect(file.as_raw_fd()).map_err(|error| {
+            crate::error::AppError::Other(format!(
+                "could not inspect ACL of {what} {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !any {
+            return Ok(());
+        }
+
+        let empty = unsafe { acl_init(0) };
+        if empty.is_null() {
+            return Err(crate::error::AppError::Other(format!(
+                "could not allocate an empty ACL for {what} {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let empty = Acl(empty);
+        if unsafe { acl_set_fd_np(file.as_raw_fd(), empty.0, ACL_TYPE_EXTENDED) } != 0 {
+            return Err(crate::error::AppError::Other(format!(
+                "could not remove ACL from {what} {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let (remaining, _) = inspect(file.as_raw_fd()).map_err(|error| {
+            crate::error::AppError::Other(format!(
+                "could not verify ACL of {what} {}: {error}",
+                path.display()
+            ))
+        })?;
+        if remaining {
+            return Err(crate::error::AppError::Other(format!(
+                "refusing to use {what} {}: extended ACL entries could not be removed",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_entries(file: &std::fs::File) -> std::io::Result<bool> {
+        inspect(file.as_raw_fd()).map(|(any, _)| any)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reject_permissive_ancestor_acl(file: &std::fs::File, path: &std::path::Path) -> AppResult<()> {
+    mac_acl::reject_allowing(file, path)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn reject_permissive_ancestor_acl(_file: &std::fs::File, _path: &std::path::Path) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_extended_acl(file: &std::fs::File, path: &std::path::Path, what: &str) -> AppResult<()> {
+    mac_acl::clear(file, path, what)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn clear_extended_acl(
+    _file: &std::fs::File,
+    _path: &std::path::Path,
+    _what: &str,
+) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_controlling_directory(file: &std::fs::File, path: &std::path::Path) -> AppResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = file.metadata().map_err(|error| probe_error(path, &error))?;
+    if !meta.file_type().is_dir() {
+        return Err(AppError::Other(format!(
+            "refusing to use session store ancestor {}: not a directory",
+            path.display()
+        )));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Err(AppError::Other(format!(
+            "refusing to use session store ancestor {}: owned by uid {}, not root or effective uid {euid}",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    let mode = meta.mode() & 0o7777;
+    let root_sticky = meta.uid() == 0 && mode & 0o1000 != 0;
+    if mode & 0o022 != 0 && !root_sticky {
+        return Err(AppError::Other(format!(
+            "refusing to use session store ancestor {}: unsafe permissions {mode:04o}",
+            path.display()
+        )));
+    }
+    reject_permissive_ancestor_acl(file, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_regular_file(file: &std::fs::File, path: &std::path::Path, what: &str) -> AppResult<()> {
+    let meta = file.metadata().map_err(|error| probe_error(path, &error))?;
+    if !meta.file_type().is_file() {
+        return Err(AppError::Other(format!(
+            "refusing to use {what} {}: not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Require an already no-follow-opened handle to be owned by the effective
+/// user with the exact requested mode, tightening it through `fchmod` and
+/// rejecting any special bits that remain.
+#[cfg(unix)]
+fn ensure_exact_owner_mode(
+    file: &std::fs::File,
+    path: &std::path::Path,
+    want: u32,
+    what: &str,
+) -> AppResult<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = file.metadata().map_err(|error| probe_error(path, &error))?;
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(AppError::Other(format!(
+            "refusing to use {what} {}: owned by uid {} but this process runs as uid {euid}",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    let mut mode = meta.mode() & 0o7777;
+    if mode != want && unsafe { libc::fchmod(file.as_raw_fd(), want as libc::mode_t) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(AppError::Other(format!(
+            "could not restrict permissions of {what} {}: {error}",
+            path.display()
+        )));
+    }
+    clear_extended_acl(file, path, what)?;
+    mode = file
+        .metadata()
+        .map_err(|error| probe_error(path, &error))?
+        .mode()
+        & 0o7777;
+    if mode != want {
+        return Err(AppError::Other(format!(
+            "refusing to use {what} {}: mode {mode:04o} could not be restricted to {want:04o}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -712,6 +1286,310 @@ mod tests {
             )
             .unwrap();
         assert_eq!(backup_count, 1);
+    }
+
+    /// Unique per-test scratch directory (no tempfile dependency), removed on
+    /// drop.
+    #[cfg(unix)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(unix)]
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("phantom-session-test-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // macOS exposes /var as a symlink to /private/var; tests exercise
+            // store-local symlinks, not that system-level compatibility alias.
+            Self(dir.canonicalize().unwrap())
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn add_everyone_allow_acl(path: &std::path::Path) {
+        let status = std::process::Command::new("chmod")
+            .arg("+a")
+            .arg("everyone allow read,write,execute,delete")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_creates_private_dir_and_db() {
+        let scratch = ScratchDir::new("create");
+        let db = scratch.path().join("data").join("phantom.db");
+
+        let store = SessionStore::open_at(&db).unwrap();
+        store.save_tabs(&[tab("one", "/a", true)]).unwrap();
+        assert_eq!(store.load_tabs().unwrap().len(), 1);
+
+        assert_eq!(mode_of(db.parent().unwrap()), 0o700);
+        assert_eq!(mode_of(&db), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = scratch
+                .path()
+                .join("data")
+                .join(format!("phantom.db{suffix}"));
+            if sidecar.exists() {
+                assert_eq!(mode_of(&sidecar), 0o600, "{}", sidecar.display());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_tightens_loose_existing_modes() {
+        let scratch = ScratchDir::new("tighten");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o755);
+        let db = data.join("phantom.db");
+        std::fs::File::create(&db).unwrap();
+        chmod(&db, 0o644);
+        let wal = data.join("phantom.db-wal");
+        std::fs::File::create(&wal).unwrap();
+        chmod(&wal, 0o664);
+
+        // Keep the store alive: SQLite removes the WAL sidecar when the last
+        // connection closes, and this test asserts on its tightened mode.
+        let _store = SessionStore::open_at(&db).unwrap();
+
+        assert_eq!(mode_of(&data), 0o700);
+        assert_eq!(mode_of(&db), 0o600);
+        assert_eq!(mode_of(&wal), 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_symlinked_db() {
+        let scratch = ScratchDir::new("symlink-db");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let target = scratch.path().join("elsewhere.db");
+        std::fs::File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, data.join("phantom.db")).unwrap();
+
+        let error = SessionStore::open_at(&data.join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_symlinked_store_dir() {
+        let scratch = ScratchDir::new("symlink-dir");
+        let real = scratch.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        chmod(&real, 0o700);
+        let data = scratch.path().join("data");
+        std::os::unix::fs::symlink(&real, &data).unwrap();
+
+        let error = SessionStore::open_at(&data.join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_symlinked_intermediate_directory() {
+        let scratch = ScratchDir::new("symlink-intermediate");
+        let real = scratch.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = SessionStore::open_at(&link.join("data").join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!real.join("data").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_writable_controlling_ancestor() {
+        let scratch = ScratchDir::new("unsafe-ancestor");
+        let unsafe_dir = scratch.path().join("unsafe");
+        std::fs::create_dir(&unsafe_dir).unwrap();
+        chmod(&unsafe_dir, 0o777);
+
+        let error = SessionStore::open_at(&unsafe_dir.join("data").join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unsafe permissions"), "{error}");
+        assert!(!unsafe_dir.join("data").exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn open_at_rejects_permissive_acl_on_controlling_ancestor() {
+        let scratch = ScratchDir::new("unsafe-ancestor-acl");
+        let ancestor = scratch.path().join("ancestor");
+        std::fs::create_dir(&ancestor).unwrap();
+        add_everyone_allow_acl(&ancestor);
+
+        let error = SessionStore::open_at(&ancestor.join("data").join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("extended ACL"), "{error}");
+        assert!(!ancestor.join("data").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_non_regular_db_path() {
+        let scratch = ScratchDir::new("non-regular");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        // A directory where the database file should be.
+        std::fs::create_dir(data.join("phantom.db")).unwrap();
+
+        assert!(SessionStore::open_at(&data.join("phantom.db")).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_symlinked_wal_sidecar() {
+        let scratch = ScratchDir::new("symlink-wal");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let target = scratch.path().join("stolen-wal");
+        std::fs::File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, data.join("phantom.db-wal")).unwrap();
+
+        let error = SessionStore::open_at(&data.join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_symlinked_shm_sidecar() {
+        let scratch = ScratchDir::new("symlink-shm");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let target = scratch.path().join("stolen-shm");
+        std::fs::File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, data.join("phantom.db-shm")).unwrap();
+
+        let error = SessionStore::open_at(&data.join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_non_regular_sidecar() {
+        let scratch = ScratchDir::new("non-regular-sidecar");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        std::fs::create_dir(data.join("phantom.db-wal")).unwrap();
+
+        assert!(SessionStore::open_at(&data.join("phantom.db")).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_clears_special_mode_bits() {
+        let scratch = ScratchDir::new("special-bits");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o1700);
+        let db = data.join("phantom.db");
+        std::fs::File::create(&db).unwrap();
+        chmod(&db, 0o4600);
+
+        let _store = SessionStore::open_at(&db).unwrap();
+
+        assert_eq!(mode_of(&data), 0o700);
+        assert_eq!(mode_of(&db), 0o600);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn open_at_removes_extended_acls_from_store_objects() {
+        let scratch = ScratchDir::new("strip-acl");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let db = data.join("phantom.db");
+        std::fs::File::create(&db).unwrap();
+        chmod(&db, 0o600);
+        add_everyone_allow_acl(&data);
+        add_everyone_allow_acl(&db);
+
+        let _store = SessionStore::open_at(&db).unwrap();
+
+        let directory = std::fs::File::open(&data).unwrap();
+        let database = std::fs::File::open(&db).unwrap();
+        assert!(!mac_acl::has_entries(&directory).unwrap());
+        assert!(!mac_acl::has_entries(&database).unwrap());
+        assert_eq!(mode_of(&data), 0o700);
+        assert_eq!(mode_of(&db), 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn identity_check_rejects_a_different_database_inode() {
+        use std::ffi::OsStr;
+
+        let scratch = ScratchDir::new("identity");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let db = data.join("phantom.db");
+        std::fs::File::create(&db).unwrap();
+        chmod(&db, 0o600);
+        let other = data.join("other.db");
+        std::fs::File::create(&other).unwrap();
+        chmod(&other, 0o600);
+
+        let (directory, database_name) = walk_store_parent(&db, false).unwrap();
+        let other_file = open_file_at(&directory, OsStr::new("other.db"), false).unwrap();
+        let guard = SecureStoreGuard {
+            directory,
+            database: other_file,
+            database_name,
+        };
+
+        let error = verify_store_identity(&db, &guard).unwrap_err();
+        assert!(error.to_string().contains("database changed"), "{error}");
     }
 
     #[test]
