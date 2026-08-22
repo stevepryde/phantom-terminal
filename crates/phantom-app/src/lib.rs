@@ -1914,12 +1914,9 @@ impl App {
                 return;
             }
         }
-        let canonical_config = config_path.canonicalize().ok();
         let valid = listed_section.is_some()
             && self.context_snapshot.cwd == active_cwd
-            && canonical_config
-                .as_ref()
-                .is_some_and(|path| path.starts_with(&active_cwd) && path.is_file())
+            && config_path.starts_with(&active_cwd)
             && !operation.is_empty()
             && operation.len() <= 256
             && !operation.chars().any(char::is_control);
@@ -1928,7 +1925,14 @@ impl App {
             self.schedule_context_discovery();
             return;
         }
-        let config_path = canonical_config.expect("validated canonical spdeploy config");
+        // spdeploy currently accepts only a pathname and resolves every stage
+        // path relative to that config's real parent. Moving the validated
+        // bytes to a private snapshot would change those semantics. The
+        // descriptor-safe verification above rejects symlinks, growth, and
+        // stale bytes, but any actor allowed to mutate the file or one of its
+        // parent directories can still replace it between this check and
+        // spdeploy reopening it. Closing that final gap requires an inherited-
+        // FD/config-bundle interface in spdeploy.
         let startup = match spdeploy_startup_command(&config_path, &operation, resolver) {
             Ok(startup) => startup,
             Err(error) => {

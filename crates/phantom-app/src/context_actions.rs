@@ -5,15 +5,13 @@
 //! operation, or discovery subprocess.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use noyalib::Value;
 use phantom_core::{
-    load_context_manifest_source, parse_context_manifest, trust_context_manifest,
-    ContextActionsConfig, ContextRun, TrustedProject, BUILT_IN_CONTEXT_PLUGIN_IDS,
-    CONTEXT_MANIFEST_FILE, RECENT_DIRECTORIES_PLUGIN_ID,
+    load_context_manifest_source, parse_context_manifest, read_bounded_regular_file,
+    trust_context_manifest, ContextActionsConfig, ContextRun, TrustedProject,
+    BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE, RECENT_DIRECTORIES_PLUGIN_ID,
 };
 
 pub const MANIFEST_PROVIDER_ID: &str = "phantom-manifest";
@@ -319,8 +317,14 @@ fn manifest_error(message: String, source: Option<(PathBuf, String)>) -> Context
 
 pub fn discover_spdeploy(cwd: &Path) -> Option<ContextSection> {
     let candidate = cwd.join(DEPLOY_FILE);
-    if !candidate.is_file() {
-        return None;
+    match candidate.symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(spdeploy_error(format!(
+                "Could not inspect deploy.yml: {error}"
+            )))
+        }
     }
 
     let root = match cwd.canonicalize() {
@@ -331,19 +335,7 @@ pub fn discover_spdeploy(cwd: &Path) -> Option<ContextSection> {
             )))
         }
     };
-    let config_path = match candidate.canonicalize() {
-        Ok(path) if path.starts_with(&root) => path,
-        Ok(_) => {
-            return Some(spdeploy_error(
-                "deploy.yml resolves outside the active directory".to_string(),
-            ))
-        }
-        Err(error) => {
-            return Some(spdeploy_error(format!(
-                "Could not resolve deploy.yml: {error}"
-            )))
-        }
-    };
+    let config_path = root.join(DEPLOY_FILE);
 
     match discover_spdeploy_tree(&root, &config_path) {
         Ok((project_name, operations, config_sources)) => Some(ContextSection {
@@ -492,21 +484,43 @@ fn resolve_child_config(root: &Path, parent: &Path, child: &str) -> Result<PathB
     if child.contains('\0') {
         return Err("spdeploy submenu path contains a NUL byte".to_string());
     }
-    let candidate = parent
-        .parent()
-        .unwrap_or(root)
-        .join(child)
-        .canonicalize()
-        .map_err(|error| format!("Could not resolve spdeploy submenu '{child}': {error}"))?;
+    let child = Path::new(child);
+    let candidate = if child.is_absolute() {
+        child.to_path_buf()
+    } else {
+        parent.parent().unwrap_or(root).join(child)
+    };
+    let candidate = normalize_path(&candidate)?;
     if !candidate.starts_with(root) {
         return Err(format!(
-            "spdeploy submenu '{child}' resolves outside the active directory"
+            "spdeploy submenu '{}' resolves outside the active directory",
+            child.display()
         ));
     }
-    if !candidate.is_file() {
-        return Err(format!("spdeploy submenu '{child}' is not a file"));
-    }
     Ok(candidate)
+}
+
+fn normalize_path(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err("spdeploy config path must be absolute".to_string());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err("spdeploy config path escapes its filesystem root".to_string());
+                }
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    Ok(normalized)
 }
 
 fn stamp_config_source(
@@ -581,15 +595,6 @@ fn verify_config_source(config_path: &Path, sources: &[ConfigSourceStamp]) -> Re
         .iter()
         .find(|stamp| stamp.path == config_path)
         .ok_or_else(|| "spdeploy config source stamp is missing".to_string())?;
-    let canonical = config_path
-        .canonicalize()
-        .map_err(|error| format!("Could not resolve {}: {error}", config_path.display()))?;
-    if canonical != config_path {
-        return Err(format!(
-            "{} no longer resolves to its discovered config",
-            config_path.display()
-        ));
-    }
     let current = read_file_bounded(config_path, stamp.source.len())?;
     if current != stamp.source {
         return Err(format!(
@@ -601,18 +606,8 @@ fn verify_config_source(config_path: &Path, sources: &[ConfigSourceStamp]) -> Re
 }
 
 fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
-    let file =
-        File::open(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-    let mut source = Vec::new();
-    file.take((max_bytes.saturating_add(1)) as u64)
-        .read_to_end(&mut source)
-        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-    if source.len() > max_bytes {
-        return Err(format!(
-            "spdeploy config sources exceed {MAX_CONFIG_SOURCE_BYTES} bytes"
-        ));
-    }
-    Ok(source)
+    read_bounded_regular_file(path, max_bytes)
+        .map_err(|error| format!("Could not securely read {}: {error}", path.display()))
 }
 
 fn required_bounded_string(
@@ -931,6 +926,44 @@ operation:
         assert!(message.contains("Could not parse"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn spdeploy_discovery_rejects_symlinked_config_sources() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new();
+        let outside = TestDir::new();
+        let source = outside.path().join("deploy.yml");
+        fs::write(
+            &source,
+            "name: Project\noperation:\n  deploy:\n    stage:\n      - type: script\n        path: ship.sh\n",
+        )
+        .unwrap();
+        symlink(&source, temp.path().join(DEPLOY_FILE)).unwrap();
+
+        let section = discover_spdeploy(temp.path()).unwrap();
+        let ContextSectionContent::Error { message } = section.content else {
+            panic!("expected error section");
+        };
+        assert!(message.contains("securely read"), "{message}");
+    }
+
+    #[test]
+    fn spdeploy_discovery_rejects_sources_beyond_the_total_limit() {
+        let temp = TestDir::new();
+        fs::write(
+            temp.path().join(DEPLOY_FILE),
+            vec![b'x'; MAX_CONFIG_SOURCE_BYTES + 1],
+        )
+        .unwrap();
+
+        let section = discover_spdeploy(temp.path()).unwrap();
+        let ContextSectionContent::Error { message } = section.content else {
+            panic!("expected error section");
+        };
+        assert!(message.contains("byte limit"), "{message}");
+    }
+
     #[test]
     fn dispatch_verification_rejects_config_changed_after_discovery() {
         let temp = TestDir::new();
@@ -949,6 +982,29 @@ operation:
         fs::write(config_path, "name: changed\noperation: {}\n").unwrap();
         let error = verify_spdeploy_sources(&section).unwrap_err();
         assert!(error.contains("changed since spdeploy discovery"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_verification_rejects_a_source_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new();
+        let config_path = temp.path().join(DEPLOY_FILE);
+        let source = "name: Project\noperation:\n  deploy:\n    stage:\n      - type: script\n        path: ship.sh\n";
+        fs::write(&config_path, source).unwrap();
+        let section = discover_spdeploy(temp.path()).unwrap();
+        let ContextSectionContent::Spdeploy(section) = section.content else {
+            panic!("expected spdeploy section");
+        };
+        fs::remove_file(&config_path).unwrap();
+        let replacement = temp.path().join("replacement.yml");
+        fs::write(&replacement, source).unwrap();
+        symlink(&replacement, &config_path).unwrap();
+
+        let error = verify_spdeploy_sources(&section).unwrap_err();
+
+        assert!(error.contains("securely read"), "{error}");
     }
 
     #[test]

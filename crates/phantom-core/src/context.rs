@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::pty::{LaunchOpts, StartupCommand};
+use crate::read_bounded_regular_file;
 
 pub const CONTEXT_MANIFEST_FILE: &str = ".phantom.yml";
 pub const MANIFEST_PLUGIN_ID: &str = "phantom-manifest";
@@ -408,24 +409,19 @@ impl TrustedContextTab {
 pub fn load_context_manifest_source(root: &Path) -> AppResult<Option<ContextManifestSource>> {
     let root = canonical_directory(root, "context project root")?;
     let path = root.join(CONTEXT_MANIFEST_FILE);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let source = match read_bounded_regular_file(&path, MAX_CONTEXT_MANIFEST_BYTES) {
+        Ok(source) => source,
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => return Ok(None),
+        Err(error) => {
+            return invalid(format!(
+                "could not securely read {}: {error}",
+                path.display()
+            ))
+        }
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return invalid(format!(
-            "{} must be a regular file, not a symlink",
-            path.display()
-        ));
-    }
-    if metadata.len() > MAX_CONTEXT_MANIFEST_BYTES as u64 {
-        return invalid(format!(
-            "{} must be no more than {MAX_CONTEXT_MANIFEST_BYTES} bytes",
-            path.display()
-        ));
-    }
-    let source = fs::read_to_string(&path)?;
+    let source = String::from_utf8(source).map_err(|_| {
+        AppError::InvalidConfig(format!("{} must contain valid UTF-8", path.display()))
+    })?;
     validate_source(&source)?;
     Ok(Some(ContextManifestSource { root, source }))
 }
@@ -811,7 +807,10 @@ fn default_dot() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     const VALID: &str = r#"version: 1
 name: Soulfire
@@ -837,8 +836,11 @@ tabs:
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("phantom-context-{}-{unique}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "phantom-context-{}-{unique}-{}",
+                std::process::id(),
+                NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
             fs::create_dir_all(path.join("soulfire-api")).unwrap();
             Self(path)
         }
@@ -983,6 +985,20 @@ tabs:
         assert_eq!(loaded.root, fs::canonicalize(&dir.0).unwrap());
         assert_eq!(loaded.source, source);
         assert!(load_context_manifest(&dir.0).is_err());
+    }
+
+    #[test]
+    fn manifest_loader_rejects_content_beyond_the_byte_limit() {
+        let dir = TestDir::new();
+        fs::write(
+            dir.0.join(CONTEXT_MANIFEST_FILE),
+            vec![b'x'; MAX_CONTEXT_MANIFEST_BYTES + 1],
+        )
+        .unwrap();
+
+        let error = load_context_manifest_source(&dir.0).unwrap_err();
+
+        assert!(error.to_string().contains("byte limit"), "{error}");
     }
 
     #[cfg(unix)]
