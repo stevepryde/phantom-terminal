@@ -78,6 +78,9 @@ pub(crate) struct ContextUi {
     /// prevents terminal or scroll content beneath the edge from stealing a
     /// resize after the initial press.
     sidebar_resize_active: bool,
+    /// Transfers focus between the launcher and collapse button after the
+    /// control changes identity with the sidebar state.
+    focus_toggle: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,8 +195,14 @@ impl ContextUi {
                 sidebar_frame(alpha, 4)
                     .corner_radius(4)
                     .show(ui, |ui| {
-                        if context_icon_button(ui, true).clicked() {
+                        let launcher = context_icon_button(ui, true);
+                        if self.focus_toggle {
+                            launcher.request_focus();
+                            self.focus_toggle = false;
+                        }
+                        if launcher.clicked() {
                             config.context_actions.panel_collapsed = false;
+                            self.focus_toggle = true;
                             true
                         } else {
                             false
@@ -234,8 +243,34 @@ impl ContextUi {
         );
         let preferred_width = config.context_actions.sidebar_width as f32;
         let mut sidebar_width = preferred_width.clamp(MIN_CONTEXT_SIDEBAR_WIDTH as f32, max_width);
-        let mut width_changed_by_drag = false;
+        let mut width_changed = false;
         let resize_id = Id::new("phantom_context_actions_resize");
+        let accessibility_width = root_ui.input(|input| {
+            use egui::accesskit::{Action, ActionData};
+
+            let increment = input
+                .accesskit_action_requests(resize_id, Action::Increment)
+                .count() as f32;
+            let decrement = input
+                .accesskit_action_requests(resize_id, Action::Decrement)
+                .count() as f32;
+            let set_value = input
+                .accesskit_action_requests(resize_id, Action::SetValue)
+                .find_map(|request| match request.data {
+                    Some(ActionData::NumericValue(value)) => Some(value as f32),
+                    _ => None,
+                });
+            set_value.or_else(|| {
+                let steps = increment - decrement;
+                (steps != 0.0).then_some(sidebar_width + steps * 10.0)
+            })
+        });
+        if let Some(requested_width) = accessibility_width {
+            let requested_width =
+                requested_width.clamp(MIN_CONTEXT_SIDEBAR_WIDTH as f32, max_width);
+            width_changed = (requested_width - sidebar_width).abs() >= 0.5;
+            sidebar_width = requested_width;
+        }
         let initial_resize_rect = sidebar_resize_rect(content_rect, sidebar_width);
         let (pointer_pos, primary_pressed, primary_down) = root_ui.input(|input| {
             (
@@ -254,7 +289,7 @@ impl ContextUi {
                 if let Some(pointer) = pointer_pos {
                     let dragged_width = (content_rect.right() - pointer.x)
                         .clamp(MIN_CONTEXT_SIDEBAR_WIDTH as f32, max_width);
-                    width_changed_by_drag = (dragged_width - sidebar_width).abs() >= 0.5;
+                    width_changed = (dragged_width - sidebar_width).abs() >= 0.5;
                     sidebar_width = dragged_width;
                 }
             } else {
@@ -283,8 +318,14 @@ impl ContextUi {
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     ui.add_space(4.0);
-                    if context_icon_button(ui, false).clicked() {
+                    let collapse = context_icon_button(ui, false);
+                    if self.focus_toggle {
+                        collapse.request_focus();
+                        self.focus_toggle = false;
+                    }
+                    if collapse.clicked() {
                         config.context_actions.panel_collapsed = true;
+                        self.focus_toggle = true;
                         outcome.config_changed = true;
                     }
                 },
@@ -339,6 +380,22 @@ impl ContextUi {
         // Register the handle after panel contents so it wins hit-testing on
         // the shared boundary, including over scrollable section content.
         let resize = root_ui.interact(resize_rect, resize_id, Sense::drag());
+        resize.widget_info(|| {
+            let mut info = egui::WidgetInfo::new(egui::WidgetType::ResizeHandle);
+            info.label = Some("Context sidebar width".to_string());
+            info.value = Some(sidebar_width as f64);
+            info
+        });
+        root_ui.ctx().accesskit_node_builder(resize.id, |node| {
+            use egui::accesskit::Action;
+
+            node.set_min_numeric_value(MIN_CONTEXT_SIDEBAR_WIDTH as f64);
+            node.set_max_numeric_value(max_width as f64);
+            node.set_numeric_value_step(10.0);
+            node.add_action(Action::Decrement);
+            node.add_action(Action::Increment);
+            node.add_action(Action::SetValue);
+        });
         if resize.hovered() || self.sidebar_resize_active {
             root_ui
                 .ctx()
@@ -370,7 +427,7 @@ impl ContextUi {
             MAX_CONTEXT_SIDEBAR_WIDTH as f32,
         ) as u16;
         let mut outcome = panel.inner;
-        if width_changed_by_drag && measured_width != config.context_actions.sidebar_width {
+        if width_changed && measured_width != config.context_actions.sidebar_width {
             config.context_actions.sidebar_width = measured_width;
             outcome.config_changed = true;
         }
@@ -468,12 +525,21 @@ impl ContextUi {
             .operations
             .iter()
             .find(|operation| selected.matches(operation))?;
-        action_row(ui, RUN_SPDEPLOY_LABEL)
-            .clicked()
-            .then(|| ContextRequest::RunSpdeploy {
-                config_path: operation.config_path.clone(),
-                operation: operation.name.clone(),
-            })
+        ui.push_id(
+            (
+                "run_spdeploy",
+                section_id,
+                &operation.config_path,
+                &operation.name,
+            ),
+            |ui| action_row(ui, RUN_SPDEPLOY_LABEL),
+        )
+        .inner
+        .clicked()
+        .then(|| ContextRequest::RunSpdeploy {
+            config_path: operation.config_path.clone(),
+            operation: operation.name.clone(),
+        })
     }
 }
 
@@ -520,6 +586,15 @@ fn draw_section_header(
             Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    header.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::CollapsingHeader,
+            true,
+            section_label(section),
+        )
+    });
+    ui.ctx()
+        .accesskit_node_builder(header.id, |node| node.set_expanded(!collapsed));
     let header_visuals = ui.style().interact(&header);
     if header.hovered() || header.has_focus() {
         ui.painter()
@@ -544,6 +619,9 @@ fn draw_section_header(
                 Sense::click(),
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Edit .phantom.yml")
+        });
         draw_ellipsis_icon(ui, rect, &response);
         response.on_hover_text("Edit .phantom.yml")
     });
@@ -570,7 +648,7 @@ fn section_body<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
 
 /// Full-width fixed-height action row with the shared text inset and hover fill.
 fn action_row(ui: &mut Ui, label: &str) -> egui::Response {
-    full_width_row(ui, Sense::click(), |ui, rect, color| {
+    let response = full_width_row(ui, Sense::click(), |ui, rect, color| {
         ui.painter().text(
             egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -578,7 +656,9 @@ fn action_row(ui: &mut Ui, label: &str) -> egui::Response {
             FontId::proportional(ACTION_TEXT_SIZE),
             color,
         );
-    })
+    });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response
 }
 
 /// Keep the resize gesture on the sidebar side of the divider. The terminal
@@ -654,23 +734,28 @@ fn draw_recent_directories(
             (ui.available_width() - 2.0 * ROW_TEXT_INSET).max(0.0),
         );
         let elided = text != path;
-        let mut response = full_width_row_with_height(
-            ui,
-            DIRECTORY_ROW_HEIGHT,
-            Sense::click(),
-            |ui, rect, color| {
-                ui.painter().text(
-                    egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    text,
-                    FontId::monospace(DIRECTORY_TEXT_SIZE),
-                    color,
-                );
-            },
-        );
+        let mut response = ui
+            .push_id(("recent_directory", &directory.path), |ui| {
+                full_width_row_with_height(
+                    ui,
+                    DIRECTORY_ROW_HEIGHT,
+                    Sense::click(),
+                    |ui, rect, color| {
+                        ui.painter().text(
+                            egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            text,
+                            FontId::monospace(DIRECTORY_TEXT_SIZE),
+                            color,
+                        );
+                    },
+                )
+            })
+            .inner;
         if elided {
             response = response.on_hover_text(&path);
         }
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &path));
         if response.clicked() && request.is_none() {
             let target = directory_target(ui.input(|input| input.modifiers.shift));
             request = Some(ContextRequest::OpenDirectory {
@@ -694,18 +779,23 @@ fn draw_frequent_commands(
             (ui.available_width() - 2.0 * ROW_TEXT_INSET).max(0.0),
         );
         let elided = text != *command;
-        let mut response = full_width_row(ui, Sense::click(), |ui, rect, color| {
-            ui.painter().text(
-                egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                text,
-                FontId::monospace(DIRECTORY_TEXT_SIZE),
-                color,
-            );
-        });
+        let mut response = ui
+            .push_id(("frequent_command", command), |ui| {
+                full_width_row(ui, Sense::click(), |ui, rect, color| {
+                    ui.painter().text(
+                        egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        text,
+                        FontId::monospace(DIRECTORY_TEXT_SIZE),
+                        color,
+                    );
+                })
+            })
+            .inner;
         if elided {
             response = response.on_hover_text(command);
         }
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, command));
         if response.clicked() && request.is_none() {
             request = Some(ContextRequest::RunFrequentCommand {
                 command: command.clone(),
@@ -905,6 +995,14 @@ fn context_icon_button(ui: &mut Ui, open: bool) -> egui::Response {
         Sense::click(),
     );
     let visuals = ui.style().interact(&response);
+    let accessible_label = if open {
+        "Open context actions"
+    } else {
+        "Collapse context actions"
+    };
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_label)
+    });
     ui.painter().rect_filled(rect, 4.0, visuals.weak_bg_fill);
     ui.painter()
         .rect_stroke(rect, 4.0, visuals.bg_stroke, egui::StrokeKind::Inside);
@@ -930,11 +1028,7 @@ fn context_icon_button(ui: &mut Ui, open: bool) -> egui::Response {
             egui::Stroke::new(1.5, color),
         );
     }
-    response.on_hover_text(if open {
-        "Open context actions"
-    } else {
-        "Collapse context actions"
-    })
+    response.on_hover_text(accessible_label)
 }
 
 fn draw_manifest_review(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
@@ -1012,15 +1106,23 @@ fn manifest_task_location(tab: &ManifestTab, root: &Path) -> Option<String> {
 }
 
 fn draw_trusted_manifest(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
-    let mut request =
-        action_row(ui, START_ALL_TASKS_LABEL)
-            .clicked()
-            .then(|| ContextRequest::OpenManifestAll {
-                root: manifest.root.clone(),
-                manifest_source: manifest.manifest_source.clone(),
-            });
+    let mut request = ui
+        .push_id(("manifest_all", &manifest.root), |ui| {
+            action_row(ui, START_ALL_TASKS_LABEL)
+        })
+        .inner
+        .clicked()
+        .then(|| ContextRequest::OpenManifestAll {
+            root: manifest.root.clone(),
+            manifest_source: manifest.manifest_source.clone(),
+        });
     for tab in &manifest.tabs {
-        if action_row(ui, &task_start_label(&tab.title)).clicked() && request.is_none() {
+        let row = ui
+            .push_id(("manifest_tab", &tab.id), |ui| {
+                action_row(ui, &task_start_label(&tab.title))
+            })
+            .inner;
+        if row.clicked() && request.is_none() {
             request = Some(ContextRequest::OpenManifestTab {
                 root: manifest.root.clone(),
                 manifest_source: manifest.manifest_source.clone(),
@@ -1086,6 +1188,12 @@ fn spdeploy_dropdown(
                 }
             }
         });
+    combo.response.widget_info(|| {
+        let mut info = egui::WidgetInfo::new(egui::WidgetType::ComboBox);
+        info.label = Some("Deploy operation".to_string());
+        info.current_text_value = Some(selected_text.clone());
+        info
+    });
     if !selected_fits {
         combo.response.on_hover_text(selected_text);
     }
@@ -1094,7 +1202,10 @@ fn spdeploy_dropdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::{Context, Id};
+    use egui::{
+        accesskit::{Action, Role},
+        Context, Id,
+    };
     use phantom_core::{MANIFEST_PLUGIN_ID, RECENT_DIRECTORIES_PLUGIN_ID, SPDEPLOY_PLUGIN_ID};
 
     use crate::context_actions::{
@@ -1175,6 +1286,73 @@ mod tests {
         assert!(shape_count > 0);
         assert!(!focused);
         assert!(!state.owns_keyboard());
+    }
+
+    #[test]
+    fn expanded_sidebar_exposes_controls_values_and_expanded_state() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let mut config = AppConfig::default();
+        let mut state = ContextUi::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+
+        let output = ctx.run_ui(input, |ui| {
+            state.draw(ui, &mut config, &snapshot(), 42.0, 220);
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Button && node.label() == Some("Collapse context actions")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Button
+                && node.label() == Some("Tasks")
+                && node.is_expanded() == Some(true)
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Splitter
+                && node.label() == Some("Context sidebar width")
+                && node.numeric_value() == Some(260.0)
+                && node.supports_action(Action::Increment)
+                && node.supports_action(Action::Decrement)
+                && node.supports_action(Action::SetValue)
+        }));
+    }
+
+    #[test]
+    fn sidebar_resize_handles_accesskit_increment_actions() {
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        let mut state = ContextUi::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            events: vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: Action::Increment,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    target_node: Id::new("phantom_context_actions_resize").accesskit_id(),
+                    data: None,
+                },
+            )],
+            ..Default::default()
+        };
+
+        let mut outcome = None;
+        let _ = ctx.run_ui(input, |ui| {
+            outcome = Some(state.draw(ui, &mut config, &snapshot(), 42.0, 220));
+        });
+
+        assert_eq!(config.context_actions.sidebar_width, 270);
+        assert!(outcome.unwrap().config_changed);
     }
 
     #[test]

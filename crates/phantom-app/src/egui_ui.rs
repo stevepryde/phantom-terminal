@@ -110,6 +110,7 @@ pub struct UiState {
     settings_draft: Option<AppConfig>,
     profile_editor_index: Option<usize>,
     confirm_profile_delete: bool,
+    settings_focus_requested: bool,
     context_ui: ContextUi,
     find: FindState,
     /// Rects (egui points) of panels drawn translucent this frame, whose
@@ -139,6 +140,7 @@ impl UiState {
             settings_draft: None,
             profile_editor_index: None,
             confirm_profile_delete: false,
+            settings_focus_requested: false,
             context_ui: ContextUi::default(),
             find: FindState::default(),
             blur_regions: Vec::new(),
@@ -156,6 +158,7 @@ impl UiState {
         self.settings_draft = Some(config.clone());
         self.profile_editor_index = None;
         self.confirm_profile_delete = false;
+        self.settings_focus_requested = true;
     }
 
     pub fn toggle_settings(&mut self, config: &AppConfig) {
@@ -173,6 +176,7 @@ impl UiState {
         self.settings_draft = None;
         self.profile_editor_index = None;
         self.confirm_profile_delete = false;
+        self.settings_focus_requested = false;
     }
 
     pub fn settings_open(&self) -> bool {
@@ -256,7 +260,9 @@ impl UiState {
             self.close_panel();
         }
 
-        if self.active_panel == Some(PanelKind::Settings) {
+        // The command palette is modal. Do not leave settings controls in the
+        // accessibility or keyboard focus order behind its dimmed backdrop.
+        if self.active_panel == Some(PanelKind::Settings) && !palette.open {
             let response = Panel::right("phantom_settings_panel")
                 .default_size(PANEL_WIDTH_POINTS)
                 .size_range(PANEL_MIN_WIDTH_POINTS..=PANEL_MAX_WIDTH_POINTS)
@@ -408,7 +414,12 @@ impl UiState {
         ui.set_width(SETTINGS_NAV_WIDTH_POINTS);
         ui.add_space(4.0);
         for tab in SettingsTab::ALL {
-            if settings_tab_button(ui, tab, self.settings_tab == tab).clicked() {
+            let response = settings_tab_button(ui, tab, self.settings_tab == tab);
+            if self.settings_focus_requested && self.settings_tab == tab {
+                response.request_focus();
+                self.settings_focus_requested = false;
+            }
+            if response.clicked() {
                 self.settings_tab = tab;
                 self.profile_editor_index = None;
                 self.confirm_profile_delete = false;
@@ -685,16 +696,17 @@ impl UiState {
         });
 
         section(ui, "Identity");
-        ui.label(label("Name"));
+        let name_label = ui.label(label("Name"));
         changed |= ui
             .add_sized(
                 [ui.available_width(), 32.0],
                 TextEdit::singleline(&mut config.shell_profiles[index].name),
             )
+            .labelled_by(name_label.id)
             .changed();
 
         section(ui, "Launch");
-        ui.label(label("Executable"));
+        let executable_label = ui.label(label("Executable"));
         changed |= ui
             .add_sized(
                 [ui.available_width(), 32.0],
@@ -702,20 +714,35 @@ impl UiState {
                     .font(egui::TextStyle::Monospace)
                     .hint_text("Use the user's $SHELL when empty"),
             )
+            .labelled_by(executable_label.id)
             .changed();
 
         ui.add_space(8.0);
-        ui.label(label("Arguments"));
+        let arguments_label = ui.label(label("Arguments"));
         let mut remove_arg = None;
         for (arg_index, arg) in config.shell_profiles[index].args.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                changed |= ui
-                    .add_sized(
-                        [(ui.available_width() - 72.0).max(40.0), 32.0],
-                        TextEdit::singleline(arg).font(egui::TextStyle::Monospace),
+                let response = ui.add_sized(
+                    [(ui.available_width() - 72.0).max(40.0), 32.0],
+                    TextEdit::singleline(arg).font(egui::TextStyle::Monospace),
+                );
+                let accessible_label = format!("Argument {}", arg_index + 1);
+                response.widget_info(|| {
+                    let mut info =
+                        egui::WidgetInfo::text_edit(true, arg.as_str(), arg.as_str(), "");
+                    info.label = Some(accessible_label.clone());
+                    info
+                });
+                changed |= response.labelled_by(arguments_label.id).changed();
+                let remove = ui.button("Remove");
+                remove.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        format!("Remove argument {}", arg_index + 1),
                     )
-                    .changed();
-                if ui.button("Remove").clicked() {
+                });
+                if remove.clicked() {
                     remove_arg = Some(arg_index);
                 }
             });
@@ -730,7 +757,7 @@ impl UiState {
         }
 
         ui.add_space(8.0);
-        ui.label(label("Working directory"));
+        let cwd_label = ui.label(label("Working directory"));
         let mut cwd = config.shell_profiles[index].cwd.clone().unwrap_or_default();
         if ui
             .add_sized(
@@ -739,6 +766,7 @@ impl UiState {
                     .font(egui::TextStyle::Monospace)
                     .hint_text("Inherit when empty"),
             )
+            .labelled_by(cwd_label.id)
             .changed()
         {
             config.shell_profiles[index].cwd = (!cwd.is_empty()).then_some(cwd);
@@ -784,7 +812,7 @@ impl UiState {
     }
 
     fn font_family_selector(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
-        ui.label(label("Font family"));
+        let label = ui.label(label("Font family"));
         if !self
             .font_families
             .iter()
@@ -802,7 +830,9 @@ impl UiState {
                 for family in &self.font_families {
                     ui.selectable_value(&mut selected, family.clone(), family.as_str());
                 }
-            });
+            })
+            .response
+            .labelled_by(label.id);
 
         if selected == before {
             false
@@ -828,6 +858,14 @@ fn profile_icon_button(
 ) -> egui::Response {
     let label = RichText::new(accessible_label).color(Color32::TRANSPARENT);
     let response = ui.add_sized([28.0, 28.0], Button::new(label));
+    response.widget_info(|| match icon {
+        ProfileIcon::Star { .. } => {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, accessible_label)
+        }
+        ProfileIcon::Edit => {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_label)
+        }
+    });
     let color = if selected || response.hovered() {
         Color32::from_rgb(125, 211, 252)
     } else {
@@ -979,6 +1017,39 @@ impl EguiLayer {
         event: &WindowEvent,
     ) -> egui_winit::EventResponse {
         self.state.on_window_event(window, event)
+    }
+
+    /// Forward events that egui itself must not consume. AccessKit's adapter
+    /// still requires every native window event, including terminal-owned
+    /// keyboard input and redraw notifications.
+    pub fn on_accesskit_window_event(&mut self, window: &Window, event: &WindowEvent) {
+        if let Some(accesskit) = self.state.accesskit.as_mut() {
+            accesskit.process_event(window, event);
+        }
+    }
+
+    pub fn init_accesskit<T>(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window: &Window,
+        event_loop_proxy: winit::event_loop::EventLoopProxy<T>,
+    ) where
+        T: From<egui_winit::accesskit_winit::Event> + Send + 'static,
+    {
+        self.state
+            .init_accesskit(event_loop, window, event_loop_proxy);
+    }
+
+    pub fn enable_accesskit(&self) {
+        self.ctx.enable_accesskit();
+    }
+
+    pub fn disable_accesskit(&self) {
+        self.ctx.disable_accesskit();
+    }
+
+    pub fn on_accesskit_action_request(&mut self, request: egui::accesskit::ActionRequest) {
+        self.state.on_accesskit_action_request(request);
     }
 
     pub fn run_with_context(
@@ -1210,16 +1281,28 @@ fn context_plugin_toggle(
     };
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(name).size(13.0));
-            ui.label(
-                RichText::new(description)
-                    .size(11.0)
-                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
-            );
-        });
+        let name_label = ui
+            .vertical(|ui| {
+                let name_label = ui.label(RichText::new(name).size(13.0));
+                ui.label(
+                    RichText::new(description)
+                        .size(11.0)
+                        .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+                );
+                name_label
+            })
+            .inner;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            changed |= ui.checkbox(&mut plugin.enabled, "Enabled").changed();
+            let enabled = ui.checkbox(&mut plugin.enabled, "Enabled");
+            enabled.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Checkbox,
+                    true,
+                    plugin.enabled,
+                    format!("Enable {name}"),
+                )
+            });
+            changed |= enabled.labelled_by(name_label.id).changed();
             ui.label(
                 RichText::new(format!("Order {}", plugin.order))
                     .size(11.0)
@@ -1242,8 +1325,10 @@ fn slider_u8(
     value: &mut u8,
     range: std::ops::RangeInclusive<u8>,
 ) -> bool {
-    ui.label(label(label_text));
-    ui.add(Slider::new(value, range).show_value(true)).changed()
+    let label = ui.label(label(label_text));
+    ui.add(Slider::new(value, range).show_value(true))
+        .labelled_by(label.id)
+        .changed()
 }
 
 fn slider_u16(
@@ -1252,8 +1337,10 @@ fn slider_u16(
     value: &mut u16,
     range: std::ops::RangeInclusive<u16>,
 ) -> bool {
-    ui.label(label(label_text));
-    ui.add(Slider::new(value, range).show_value(true)).changed()
+    let label = ui.label(label(label_text));
+    ui.add(Slider::new(value, range).show_value(true))
+        .labelled_by(label.id)
+        .changed()
 }
 
 fn slider_u32(
@@ -1262,8 +1349,10 @@ fn slider_u32(
     value: &mut u32,
     range: std::ops::RangeInclusive<u32>,
 ) -> bool {
-    ui.label(label(label_text));
-    ui.add(Slider::new(value, range).show_value(true)).changed()
+    let label = ui.label(label(label_text));
+    ui.add(Slider::new(value, range).show_value(true))
+        .labelled_by(label.id)
+        .changed()
 }
 
 fn slider_f32(
@@ -1272,12 +1361,14 @@ fn slider_f32(
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> bool {
-    ui.label(label(label_text));
-    ui.add(Slider::new(value, range).show_value(true)).changed()
+    let label = ui.label(label(label_text));
+    ui.add(Slider::new(value, range).show_value(true))
+        .labelled_by(label.id)
+        .changed()
 }
 
 fn combo(ui: &mut Ui, label_text: &str, value: &mut String, options: &[&str]) -> bool {
-    ui.label(label(label_text));
+    let label = ui.label(label(label_text));
     let mut changed = false;
     ComboBox::from_id_salt(label_text)
         .selected_text(display_name(value))
@@ -1288,7 +1379,9 @@ fn combo(ui: &mut Ui, label_text: &str, value: &mut String, options: &[&str]) ->
                     .selectable_value(value, (*option).to_string(), display_name(option))
                     .changed();
             }
-        });
+        })
+        .response
+        .labelled_by(label.id);
     changed
 }
 
@@ -1306,12 +1399,19 @@ fn keybindings_editor(ui: &mut Ui, keybindings: &mut [Keybinding]) -> bool {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let accessible_label = format!("{} shortcut", action_label(&keybinding.action));
                 let response = ui.add_sized(
                     egui::vec2(180.0, 28.0),
                     TextEdit::singleline(&mut keybinding.keys)
                         .font(egui::TextStyle::Monospace)
                         .clip_text(false),
                 );
+                response.widget_info(|| {
+                    let mut info =
+                        egui::WidgetInfo::text_edit(true, &keybinding.keys, &keybinding.keys, "");
+                    info.label = Some(accessible_label.clone());
+                    info
+                });
                 changed |= response.changed();
                 if parse_combo(&keybinding.keys).is_none() {
                     ui.colored_label(Color32::from_rgb(248, 113, 113), "Invalid");
@@ -1412,13 +1512,24 @@ fn command_palette_overlay(
                     );
                     ui.add_space(8.0);
 
-                    let mut query = palette.query().to_string();
+                    let previous_query = palette.query().to_string();
+                    let mut query = previous_query.clone();
                     let response = ui.add_sized(
                         egui::vec2(ui.available_width(), 34.0),
                         TextEdit::singleline(&mut query)
                             .hint_text("Run command")
                             .font(egui::TextStyle::Monospace),
                     );
+                    response.widget_info(|| {
+                        let mut info = egui::WidgetInfo::text_edit(
+                            true,
+                            &previous_query,
+                            &query,
+                            "Run command",
+                        );
+                        info.label = Some("Command search".to_string());
+                        info
+                    });
                     if palette.take_focus_request() {
                         response.request_focus();
                     }
@@ -1437,10 +1548,13 @@ fn command_palette_overlay(
                         return;
                     }
                     for row in rows {
-                        let text = RichText::new(row.label).size(13.0);
+                        let text = RichText::new(&row.label).size(13.0);
                         let button = Button::selectable(row.selected, text)
                             .min_size(egui::vec2(ui.available_width(), 32.0));
-                        if ui.add(button).clicked() {
+                        let clicked = ui
+                            .push_id(("palette_result", &row.id), |ui| ui.add(button).clicked())
+                            .inner;
+                        if clicked {
                             action = palette.execute_filtered(row.filtered_index);
                         }
                     }
@@ -1541,14 +1655,24 @@ fn color_row(ui: &mut Ui, name: &str, value: &mut String, alpha: bool) -> bool {
         ui.set_min_height(32.0);
         ui.label(label(name));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if alpha {
-                ui.color_edit_button_srgba_unmultiplied(&mut color);
+            let response = if alpha {
+                ui.color_edit_button_srgba_unmultiplied(&mut color)
             } else {
                 let mut rgb = [color[0], color[1], color[2]];
-                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                let response = ui.color_edit_button_srgb(&mut rgb);
+                if response.changed() {
                     color = [rgb[0], rgb[1], rgb[2], 255];
                 }
-            }
+                response
+            };
+            let accessible_value = format_color(color, alpha);
+            response.widget_info(|| {
+                let mut info = egui::WidgetInfo::new(egui::WidgetType::ColorButton);
+                info.enabled = ui.is_enabled();
+                info.label = Some(name.to_string());
+                info.current_text_value = Some(accessible_value.clone());
+                info
+            });
             ui.monospace(value.as_str());
         });
     });
@@ -1599,6 +1723,7 @@ fn display_name(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::palette::PaletteState;
+    use egui::accesskit::{Role, Toggled};
 
     #[test]
     fn window_resize_keeps_invalid_settings_draft_geometry_current() {
@@ -1661,6 +1786,148 @@ mod tests {
             .iter()
             .map(|s| red_stroke_count(&s.shape))
             .sum()
+    }
+
+    fn test_raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn settings_accesskit_update(tab: SettingsTab) -> egui::accesskit::TreeUpdate {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let mut config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+        state.settings_tab = tab;
+
+        ctx.run_ui(test_raw_input(), |ui| {
+            state.draw(
+                ui,
+                &mut config,
+                &mut palette,
+                UiFrameContext {
+                    snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    frequent_commands: &[],
+                    top_inset_points: 0.0,
+                    terminal_left_points: 0.0,
+                    terminal_right_points: 1280.0,
+                    global_notice: None,
+                },
+            );
+        })
+        .platform_output
+        .accesskit_update
+        .unwrap()
+    }
+
+    #[test]
+    fn settings_expose_selected_tabs_and_labelled_slider_values() {
+        let update = settings_accesskit_update(SettingsTab::Appearance);
+
+        let appearance = update.nodes.iter().find(|(_, node)| {
+            node.role() == Role::Button
+                && node.label() == Some("Appearance")
+                && node.toggled() == Some(Toggled::True)
+        });
+        assert!(appearance.is_some());
+        assert_eq!(update.focus, appearance.unwrap().0);
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Slider
+                && node.numeric_value().is_some()
+                && !node.labelled_by().is_empty()
+        }));
+    }
+
+    #[test]
+    fn context_plugin_toggles_have_distinct_names() {
+        let update = settings_accesskit_update(SettingsTab::ContextActions);
+
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::CheckBox && node.label() == Some("Enable Recent directories")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::CheckBox && node.label() == Some("Enable Frequent commands")
+        }));
+    }
+
+    #[test]
+    fn colour_wells_expose_their_current_hex_value() {
+        let update = settings_accesskit_update(SettingsTab::Colours);
+
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::ColorWell
+                && node.label() == Some("Background")
+                && node.value() == Some("#0b0b0e")
+        }));
+    }
+
+    #[test]
+    fn command_palette_exposes_query_value_and_selected_result() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        palette.open(&config);
+
+        let output = ctx.run_ui(test_raw_input(), |_ui| {
+            command_palette_overlay(&ctx, &mut palette, 220, None);
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::TextInput
+                && node.label() == Some("Command search")
+                && node.value() == Some("")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Button
+                && node.label() == Some("New Tab")
+                && node.toggled() == Some(Toggled::True)
+        }));
+    }
+
+    #[test]
+    fn command_palette_hides_settings_from_the_accessibility_tree() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let mut config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        palette.open(&config);
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+
+        let output = ctx.run_ui(test_raw_input(), |ui| {
+            state.draw(
+                ui,
+                &mut config,
+                &mut palette,
+                UiFrameContext {
+                    snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    frequent_commands: &[],
+                    top_inset_points: 0.0,
+                    terminal_left_points: 0.0,
+                    terminal_right_points: 1280.0,
+                    global_notice: None,
+                },
+            );
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        assert!(update
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("Command search")));
+        assert!(!update
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("Appearance")));
     }
 
     #[test]

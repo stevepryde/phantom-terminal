@@ -98,6 +98,7 @@ impl PaletteState {
             .take(MAX_ROWS)
             .map(|(filtered_index, &command_index)| PaletteRow {
                 filtered_index,
+                id: self.commands[command_index].action.stable_id(),
                 label: self.commands[command_index].label.clone(),
                 selected: filtered_index == self.selected,
             })
@@ -174,8 +175,22 @@ impl PaletteState {
 
 pub struct PaletteRow {
     pub filtered_index: usize,
+    pub id: String,
     pub label: String,
     pub selected: bool,
+}
+
+impl PaletteAction {
+    fn stable_id(&self) -> String {
+        match self {
+            Self::NewTab => "new_tab".to_string(),
+            Self::CloseTab => "close_tab".to_string(),
+            Self::RenameTab => "rename_tab".to_string(),
+            Self::OpenSettings => "open_settings".to_string(),
+            Self::NewTabWithProfile(id) => format!("new_tab_profile:{id}"),
+            Self::SetUiTheme(theme) => format!("set_ui_theme:{theme}"),
+        }
+    }
 }
 
 fn build_commands(config: &AppConfig) -> Vec<Command> {
@@ -274,5 +289,25 @@ mod tests {
         let consecutive = fuzzy_score("tab", "Tab").unwrap();
         let gapped = fuzzy_score("tab", "T a b").unwrap();
         assert!(consecutive > gapped);
+    }
+
+    #[test]
+    fn duplicate_profile_names_have_distinct_row_ids() {
+        let mut config = AppConfig::default();
+        config.shell_profiles.push(phantom_core::ShellProfile {
+            id: "second".to_string(),
+            name: config.shell_profiles[0].name.clone(),
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+        });
+        let mut palette = PaletteState::default();
+        palette.open(&config);
+        palette.set_query("New Tab: Default Shell".to_string());
+
+        let rows = palette.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, rows[1].label);
+        assert_ne!(rows[0].id, rows[1].id);
     }
 }

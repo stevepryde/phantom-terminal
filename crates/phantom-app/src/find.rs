@@ -78,6 +78,9 @@ impl FindState {
     pub fn open(&mut self, selection_available: bool) {
         self.open = true;
         self.selection_available = selection_available;
+        if !selection_available {
+            self.options.selection_only = false;
+        }
         self.results = FindResultSummary::default();
         self.request_focus();
     }
@@ -196,6 +199,7 @@ impl FindState {
             ))
             .corner_radius(4)
             .inner_margin(Margin::symmetric(6, 0));
+        let previous_query = self.query.clone();
         let edit = input_frame.show(ui, |ui| {
             ui.set_width(query_width);
             TextEdit::singleline(&mut self.query)
@@ -207,6 +211,25 @@ impl FindState {
                 .show(ui)
         });
         let mut edit = edit.inner;
+        edit.response.widget_info(|| {
+            let mut info = egui::WidgetInfo::text_edit(
+                true,
+                &previous_query,
+                &self.query,
+                "Find in scrollback",
+            );
+            info.label = Some("Find query".to_string());
+            info
+        });
+        ui.ctx().accesskit_node_builder(edit.response.id, |node| {
+            // This query is always editable. Clear stale disabled state from
+            // another control's disabled scope before adding validation data.
+            node.clear_disabled();
+            if let Some(error) = invalid_tooltip.as_deref() {
+                node.set_invalid(egui::accesskit::Invalid::True);
+                node.set_description(error);
+            }
+        });
         if self.focus_requested {
             edit.response.request_focus();
             self.focus_requested = false;
@@ -261,7 +284,7 @@ impl FindState {
             &mut self.options.selection_only,
             OptionIcon::Selection,
             selection_tooltip,
-            true,
+            self.selection_available,
         );
         if outcome.query_or_options_changed {
             self.results = FindResultSummary::default();
@@ -344,9 +367,11 @@ fn option_button(
     enabled: bool,
 ) -> bool {
     let response = ui
-        .add_sized(
-            egui::vec2(CONTROL_SIZE, CONTROL_SIZE),
-            Button::new("").selected(*selected),
+        .add_enabled(
+            enabled,
+            Button::new("")
+                .selected(*selected)
+                .min_size(egui::vec2(CONTROL_SIZE, CONTROL_SIZE)),
         )
         .on_hover_text(tooltip);
     response.widget_info(|| {
@@ -480,6 +505,7 @@ fn navigation_button(ui: &mut Ui, direction: FindNavigation, enabled: bool) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::accesskit::Role;
 
     #[test]
     fn reopening_preserves_ephemeral_query_and_options_but_resets_results() {
@@ -536,6 +562,19 @@ mod tests {
     }
 
     #[test]
+    fn reopening_without_a_selection_clears_selection_only_scope() {
+        let mut state = FindState::default();
+        state.open(true);
+        state.options.selection_only = true;
+        state.close();
+
+        state.open(false);
+
+        assert!(!state.options.selection_only);
+        assert!(!state.selection_available);
+    }
+
+    #[test]
     fn bar_stays_left_of_context_boundary_and_below_terminal_top() {
         let terminal = egui::Rect::from_min_max(egui::pos2(144.0, 42.0), egui::pos2(1200.0, 800.0));
         let layout = find_bar_layout(terminal, 900.0);
@@ -583,5 +622,50 @@ mod tests {
                 assert!(painted.right() <= terminal.right() + 1.0);
             }
         }
+    }
+
+    #[test]
+    fn find_bar_exposes_query_and_disabled_selection_scope() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let terminal = egui::Rect::from_min_max(egui::pos2(20.0, 32.0), egui::pos2(1000.0, 700.0));
+        let mut state = FindState::default();
+        state.open(false);
+        state.query = "[".to_string();
+        state.set_results(FindResultSummary {
+            error: Some(FindError::InvalidRegex(
+                "unclosed character class".to_string(),
+            )),
+            ..Default::default()
+        });
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 768.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |_ui| {
+                state.draw(&ctx, terminal, terminal.right(), 220);
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::TextInput
+                && node.label() == Some("Find query")
+                && node.value() == Some("[")
+                && !node.is_disabled()
+                && node.invalid() == Some(egui::accesskit::Invalid::True)
+                && node.description() == Some("unclosed character class")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Button
+                && node.label()
+                    == Some("Selection only (no selection was captured when Find opened)")
+                && node.is_disabled()
+        }));
     }
 }
