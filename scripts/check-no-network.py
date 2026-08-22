@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate Phantom's locked dependency graph and Rust socket authorities."""
 
+import hashlib
 import json
 import os
 import re
@@ -114,15 +115,33 @@ APPROVED_FEATURES = {
     },
 }
 
-TOKEN_RE = re.compile(r"r#[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|::|->|=>|[^\s]")
-IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+TOKEN_RE = re.compile(r"r#[^\W\d]\w*|[^\W\d]\w*|::|->|=>|[^\s]")
+IDENTIFIER_RE = re.compile(r"[^\W\d]\w*")
 SOCKET_TYPES = {"TcpStream", "TcpListener", "UdpSocket", "ToSocketAddrs"}
 SOCKET_FUNCTIONS = {"socket", "connect", "bind", "syscall", "dlopen", "dlsym"}
-ALLOWED_MACROS = {
+BUILTIN_MACROS = {
     "assert", "assert_eq", "assert_ne", "cfg", "env", "eprintln", "format",
-    "harness_or_skip", "include_bytes", "include_str", "json", "macro_rules",
-    "matches", "panic", "params", "print", "println", "vec", "vertex_attr_array",
-    "write",
+    "include_bytes", "include_str", "json", "matches", "panic", "params", "print",
+    "println", "vec", "vertex_attr_array", "write",
+}
+
+APPROVED_CUSTOM_MACRO_FILES = {
+    "crates/phantom-gfx/tests/headless.rs": (
+        "194bf25be61f92c20873cf26e90660e1269cbf42efa2f167048d8d05b6229b74",
+        {"harness_or_skip"},
+    ),
+}
+
+APPROVED_REPO_PACKAGES = {
+    ("wayland-scanner", "0.31.10"): (
+        "vendor/wayland-scanner/Cargo.toml",
+        "0198a708d4093f85eebfe9c6356402b4670c42e4dc16d1df1f8773c77fbeb1b2",
+        {
+            "bitflags", "debug_assert", "failed", "format_ident",
+            "generate_client_code", "generate_interfaces", "print", "quote",
+            "reference", "unimplemented", "unreachable",
+        },
+    ),
 }
 
 
@@ -194,13 +213,43 @@ def strip_comments_and_literals(source):
                     result[offset] = " "
             continue
 
-        char_literal = re.match(r"(?:b)?'(?:\\.|[^\\'\n])'", source[i:])
-        if char_literal:
-            end = i + char_literal.end()
-            for offset in range(i, end):
-                result[offset] = " "
-            i = end
-            continue
+        quote = i + 1 if source.startswith("b'", i) else i
+        if quote < length and source[quote] == "'":
+            content = quote + 1
+            end_content = content
+            if content < length and source[content] == "\\":
+                end_content = content + 2
+                if source.startswith(("\\u{", "\\U{"), content):
+                    brace = source.find("}", content + 3)
+                    if brace < 0:
+                        raise ValueError(f"unterminated character literal at byte {i}")
+                    end_content = brace + 1
+                elif source.startswith("\\x", content):
+                    end_content = content + 4
+            elif content < length and source[content] not in "'\n":
+                end_content = content + 1
+
+            if end_content < length and source[end_content] == "'":
+                end = end_content + 1
+                for offset in range(i, end):
+                    result[offset] = " "
+                i = end
+                continue
+
+            # An apostrophe followed by an identifier is a lifetime or label.
+            # A lifetime in expression-assignment position followed by `;` is
+            # instead an unterminated character literal and must fail closed.
+            if quote == i:
+                lifetime = re.match(r"'(?:[^\W\d]\w*|_)", source[i:])
+                if lifetime:
+                    end = i + lifetime.end()
+                    previous = source[:i].rstrip()
+                    following = source[end:].lstrip()
+                    if previous.endswith("=") and following.startswith(";"):
+                        raise ValueError(f"unterminated character literal at byte {i}")
+                    i = end
+                    continue
+            raise ValueError(f"unterminated character literal at byte {i}")
         i += 1
     return "".join(result)
 
@@ -226,7 +275,7 @@ def find_sequence(values, sequence):
     return None
 
 
-def source_violation(tokens):
+def source_violation(tokens, approved_custom_macros):
     values = [value for value, _ in tokens]
 
     delimiters = {"(": ")", "[": "]", "{": "}"}
@@ -244,12 +293,18 @@ def source_violation(tokens):
         return stack[-1][1]
 
     for index in range(len(values) - 2):
+        if values[index : index + 2] != ["macro_rules", "!"]:
+            continue
+        if values[index + 2] not in approved_custom_macros:
+            return index
+
+    for index in range(len(values) - 2):
         if values[index + 1] != "!" or values[index + 2] not in {"(", "[", "{"}:
             continue
         macro_name = values[index]
         if not IDENTIFIER_RE.fullmatch(macro_name) or macro_name in {"if", "while"}:
             continue
-        if macro_name not in ALLOWED_MACROS:
+        if macro_name not in BUILTIN_MACROS and macro_name not in approved_custom_macros:
             return index
 
     for index in range(len(values) - 1):
@@ -310,6 +365,11 @@ def source_violation(tokens):
         use_tree = values[index + 1 : end]
         if "include" in use_tree:
             return index
+        if any(
+            use_tree[position] == "as" and use_tree[position + 1] in BUILTIN_MACROS
+            for position in range(len(use_tree) - 1)
+        ):
+            return index
         for root in {"std", "core"}:
             root_aliases = [
                 (root, "as"),
@@ -343,6 +403,7 @@ def source_violation(tokens):
             if (
                 imports_net_module
                 or "*" in use_tree
+                or find_sequence(use_tree, ("self", "as")) is not None
                 or any(socket_type in use_tree for socket_type in SOCKET_TYPES)
             ):
                 return index
@@ -354,10 +415,9 @@ def source_violation(tokens):
     for index, value in enumerate(values):
         if value != "extern":
             continue
-        try:
-            start = values.index("{", index + 1)
-        except ValueError:
+        if index + 1 >= len(values) or values[index + 1] != "{":
             continue
+        start = index + 1
         depth = 1
         end = start + 1
         while end < len(values) and depth:
@@ -387,6 +447,34 @@ def reachable(nodes_by_id, start, target):
 
 def identity(package):
     return package["name"], package["version"], package["source"]
+
+
+def tree_digest(root):
+    files = []
+
+    def raise_walk_error(error):
+        raise error
+
+    for current, directories, filenames in os.walk(
+        root, onerror=raise_walk_error, followlinks=False
+    ):
+        current_path = Path(current)
+        for directory in directories:
+            if (current_path / directory).is_symlink():
+                raise OSError(f"symlinked directory in reviewed package: {directory}")
+        for filename in filenames:
+            file_path = current_path / filename
+            if file_path.is_symlink():
+                raise OSError(f"symlinked file in reviewed package: {file_path}")
+            files.append(file_path)
+
+    digest = hashlib.sha256()
+    for file_path in sorted(files):
+        digest.update(str(file_path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def validate_graph(metadata):
@@ -504,6 +592,8 @@ def validate_sources(metadata):
     packages_by_id = {package["id"]: package for package in metadata["packages"]}
     blocked = set()
     source_files = set()
+    repo_macro_roots = []
+    workspace_root = Path(metadata["workspace_root"]).resolve()
 
     def collect_sources(root):
         if not root.is_dir():
@@ -552,19 +642,65 @@ def validate_sources(metadata):
         for root in roots:
             collect_sources(root)
 
+    workspace_ids = set(metadata["workspace_members"])
+    for package in metadata["packages"]:
+        if package["id"] in workspace_ids or package["source"] is not None:
+            continue
+        manifest_path = Path(package["manifest_path"])
+        try:
+            resolved_manifest = manifest_path.resolve(strict=True)
+            relative_manifest = str(resolved_manifest.relative_to(workspace_root))
+        except (OSError, ValueError):
+            continue
+        approved = APPROVED_REPO_PACKAGES.get((package["name"], package["version"]))
+        if approved is None or relative_manifest != approved[0]:
+            blocked.add(
+                f"unreviewed repository package: {package['name']} {package['version']} "
+                f"at {relative_manifest}"
+            )
+            continue
+        package_root = resolved_manifest.parent
+        try:
+            actual_digest = tree_digest(package_root)
+        except OSError as error:
+            blocked.add(f"could not hash repository package {package_root}: {error}")
+            continue
+        if actual_digest != approved[1]:
+            blocked.add(f"repository package source changed: {relative_manifest}")
+        repo_macro_roots.append((package_root, approved[2]))
+        collect_sources(package_root)
+
     for source_file in sorted(source_files):
         try:
             source = source_file.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
             blocked.add(f"could not read Rust source {source_file}: {error}")
             continue
+        approved_custom_macros = set()
+        try:
+            relative_source = str(source_file.resolve(strict=True).relative_to(workspace_root))
+        except (OSError, ValueError):
+            relative_source = None
+        if relative_source in APPROVED_CUSTOM_MACRO_FILES:
+            expected_digest, macro_names = APPROVED_CUSTOM_MACRO_FILES[relative_source]
+            if hashlib.sha256(source.encode("utf-8")).hexdigest() != expected_digest:
+                blocked.add(f"reviewed custom macro source changed: {source_file}")
+            else:
+                approved_custom_macros.update(macro_names)
+        for repo_root, macro_names in repo_macro_roots:
+            try:
+                source_file.resolve(strict=True).relative_to(repo_root)
+            except (OSError, ValueError):
+                continue
+            approved_custom_macros.update(macro_names)
+
         try:
             code = strip_comments_and_literals(source)
         except ValueError as error:
             blocked.add(f"could not parse Rust source {source_file}: {error}")
             continue
         tokens = rust_tokens(code)
-        violation = source_violation(tokens)
+        violation = source_violation(tokens, approved_custom_macros)
         if violation is not None:
             offset = tokens[violation][1]
             line = code.count("\n", 0, offset) + 1

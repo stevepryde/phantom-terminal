@@ -291,6 +291,19 @@ cargo generate-lockfile --offline --manifest-path "$root_alias/Cargo.toml"
 cargo check --offline --manifest-path "$root_alias/Cargo.toml" >/dev/null 2>&1
 expect_failure "$root_alias" 'direct socket API:'
 
+echo "==> nested std::net module aliases fail and compile"
+nested_net_alias="$scratch/nested-net-alias"
+new_fixture "$nested_net_alias"
+printf '%s\n' \
+  'use std::net::{self as transport};' \
+  'use transport::TcpStream as Stream;' \
+  'pub fn connect() {' \
+  '    let _ = Stream::connect("127.0.0.1:9");' \
+  '}' >"$nested_net_alias/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$nested_net_alias/Cargo.toml"
+cargo check --offline --manifest-path "$nested_net_alias/Cargo.toml" >/dev/null 2>&1
+expect_failure "$nested_net_alias" 'direct socket API:'
+
 echo "==> libc module aliases fail"
 libc_module_alias="$scratch/libc-module-alias"
 new_fixture "$libc_module_alias"
@@ -460,6 +473,54 @@ for macro_case in unknown-macro inline-assembly; do
   expect_failure "$macro_fixture" 'direct socket API:'
 done
 
+echo "==> macro definitions, authority aliases, and Unicode macros fail and compile"
+for macro_case in shadow-format aliased-assembly unicode-macro; do
+  macro_fixture="$scratch/$macro_case"
+  new_fixture "$macro_fixture"
+  case "$macro_case" in
+    shadow-format)
+      # The single-quoted values are literal Rust macro metavariables.
+      # shellcheck disable=SC2016
+      printf '%s\n' \
+        'macro_rules! format {' \
+        '    ($root:ident, $module:ident, $kind:ident) => {' \
+        '        $root::$module::$kind::connect("127.0.0.1:9")' \
+        '    };' \
+        '}' \
+        'pub fn connect() { let _ = format!(std, net, TcpStream); }' \
+        >"$macro_fixture/crates/app/src/lib.rs"
+      ;;
+    aliased-assembly)
+      printf '%s\n' \
+        'use core::arch::asm as format;' \
+        'pub unsafe fn machine_code() { unsafe { format!("nop") }; }' \
+        >"$macro_fixture/crates/app/src/lib.rs"
+      ;;
+    unicode-macro)
+      printf '%s\n' \
+        'macro_rules! réseau { () => { 1 }; }' \
+        'pub fn value() -> i32 { réseau!() }' \
+        >"$macro_fixture/crates/app/src/lib.rs"
+      ;;
+  esac
+  cargo generate-lockfile --offline --manifest-path "$macro_fixture/Cargo.toml"
+  cargo check --offline --manifest-path "$macro_fixture/Cargo.toml" >/dev/null 2>&1
+  expect_failure "$macro_fixture" 'direct socket API:'
+done
+
+echo "==> harmless extern blocks do not capture later function bodies"
+harmless_extern="$scratch/harmless-extern"
+new_fixture "$harmless_extern"
+printf '%s\n' \
+  'unsafe extern "C" { fn harmless(); }' \
+  'pub fn connect() {' \
+  '    let callback = || 1;' \
+  '    let _ = callback();' \
+  '}' >"$harmless_extern/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$harmless_extern/Cargo.toml"
+cargo check --offline --manifest-path "$harmless_extern/Cargo.toml" >/dev/null 2>&1
+run_gate "$harmless_extern"
+
 echo "==> proc macros and out-of-package targets fail and compile"
 proc_macro_fixture="$scratch/proc-macro"
 new_fixture "$proc_macro_fixture"
@@ -489,6 +550,13 @@ new_fixture "$malformed"
 printf '%s\n' '/* unterminated' >"$malformed/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$malformed/Cargo.toml"
 expect_failure "$malformed" 'could not parse Rust source'
+
+unterminated_char="$scratch/unterminated-char"
+new_fixture "$unterminated_char"
+printf '%s\n' "pub fn malformed() { let value = 'x; }" \
+  >"$unterminated_char/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$unterminated_char/Cargo.toml"
+expect_failure "$unterminated_char" 'unterminated character literal'
 
 echo "==> grouped and aliased libc socket imports fail"
 libc_alias="$scratch/libc-alias"
