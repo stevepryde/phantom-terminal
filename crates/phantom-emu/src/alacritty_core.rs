@@ -128,9 +128,10 @@ fn term_config(scrollback_lines: u32, default_cursor: CursorShape) -> Config {
 
 impl VtCore for AlacrittyCore {
     fn advance(&mut self, bytes: &[u8]) {
-        // Output can rotate or reflow absolute grid coordinates. The app will
-        // recompute live search results after advancing the terminal.
-        self.active_search_match = None;
+        // Keep the last active range painted while the app coalesces streamed
+        // output into its debounced search refresh. The refresh replaces this
+        // potentially rotated range shortly; clearing it here makes the active
+        // highlight blink off between every pair of PTY chunks.
         self.parser.advance(&mut self.term, bytes);
     }
 
@@ -1091,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn active_search_match_highlight_is_separate_and_scrolls_into_view() {
+    fn active_search_match_highlight_is_separate_and_stable_during_streaming_output() {
         let mut term = core(2, 20, 100);
         term.advance(b"selected\r\nline1\r\nline2\r\nline3\r\ntarget");
         let target = term
@@ -1113,8 +1114,13 @@ mod tests {
         assert!(!term.snapshot().cells.iter().any(|cell| cell.search_match));
 
         term.set_active_search_match(Some(target));
-        term.advance(b"x");
-        assert!(!term.snapshot().cells.iter().any(|cell| cell.search_match));
+        for chunk in [b"x".as_slice(), b"y", b"z"] {
+            term.advance(chunk);
+            let snapshot = term.snapshot();
+            assert!(snapshot.cells.iter().any(|cell| cell.search_match));
+            assert!(snapshot.cells.iter().any(|cell| cell.selected));
+            assert_eq!(term.selection_range(), Some(captured));
+        }
     }
 
     #[test]

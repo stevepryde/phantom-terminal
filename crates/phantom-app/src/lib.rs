@@ -4432,6 +4432,52 @@ mod tests {
     }
 
     #[test]
+    fn streaming_pty_output_keeps_active_find_highlight_until_debounced_refresh() {
+        let mut app = test_app();
+        let mut tab = Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        );
+        tab.advance_pty(b"target");
+        let target = tab
+            .core
+            .search_scrollback("target", SearchOptions::default(), None)
+            .unwrap()
+            .matches[0];
+        tab.core.selection_start(0, 0, SelSide::Left);
+        tab.core.selection_update(0, 5, SelSide::Right);
+        let selection = tab.core.selection_range();
+        tab.core.set_active_search_match(Some(target));
+        app.tabs.push(tab);
+        app.ui.open_find(true);
+        app.find_matches = vec![target];
+
+        for bytes in [b" one".as_slice(), b" two", b" three"] {
+            app.on_pty_event(AppEvent::PtyBytes {
+                tab: 0,
+                bytes: bytes.to_vec(),
+            });
+            let snapshot = app.tabs[0].core.snapshot();
+            assert!(snapshot.cells.iter().any(|cell| cell.search_match));
+            assert!(snapshot.cells.iter().any(|cell| cell.selected));
+            assert_eq!(app.tabs[0].core.selection_range(), selection);
+            assert_eq!(app.find_matches, vec![target]);
+            assert!(app.find_refresh_deadline.is_some());
+        }
+
+        app.refresh_find();
+        let snapshot = app.tabs[0].core.snapshot();
+        assert!(!snapshot.cells.iter().any(|cell| cell.search_match));
+        assert!(snapshot.cells.iter().any(|cell| cell.selected));
+        assert_eq!(app.tabs[0].core.selection_range(), selection);
+        assert!(app.find_matches.is_empty());
+        assert!(app.find_refresh_deadline.is_none());
+    }
+
+    #[test]
     fn reordering_a_tab_runs_the_same_cleanup_as_switching() {
         let mut app = test_app();
         for id in 0..2 {
