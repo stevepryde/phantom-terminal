@@ -38,6 +38,8 @@ const HOVER_FADE_SECONDS: f32 = 0.14;
 const HOVER_EPSILON: f32 = 0.01;
 const TAB_ACTIVE_EDGE_W: f32 = 2.0;
 const TAB_SEPARATOR_W: f32 = 1.0;
+const DROP_INDICATOR_W: f32 = 3.0;
+const DRAG_SOURCE_FRAME_W: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -798,7 +800,7 @@ pub fn draw_tab_bar(
             } else {
                 animations.close(i)
             };
-            draw_close_button(r, queue, close, colors, close_hover);
+            draw_close_button(r, queue, close, colors, close_hover, layout.scale_factor);
             tabs.push(TabHit {
                 index: i,
                 rect: visible,
@@ -819,7 +821,14 @@ pub fn draw_tab_bar(
         if let Some(rect) = ephemeral_indicator {
             draw_ephemeral_indicator(r, rect, colors);
         }
-        draw_settings_button(r, settings, colors, settings_open, animations.settings());
+        draw_settings_button(
+            r,
+            settings,
+            colors,
+            settings_open,
+            animations.settings(),
+            layout.scale_factor,
+        );
         draw_window_controls(r, queue, window_controls.as_slice(), colors, animations);
         let hits = TabBarHits {
             tabs,
@@ -837,6 +846,7 @@ pub fn draw_tab_bar(
             colors,
             layout.horizontal,
             drag_indicator.and_then(|drag| drag.drop_index),
+            layout.scale_factor,
         );
         hits
     } else {
@@ -933,7 +943,7 @@ pub fn draw_tab_bar(
             } else {
                 animations.close(i)
             };
-            draw_close_button(r, queue, close, colors, close_hover);
+            draw_close_button(r, queue, close, colors, close_hover, layout.scale_factor);
             tabs.push(TabHit {
                 index: i,
                 rect: visible,
@@ -959,7 +969,14 @@ pub fn draw_tab_bar(
             if let Some(rect) = ephemeral_indicator {
                 draw_ephemeral_indicator(r, rect, colors);
             }
-            draw_settings_button(r, settings, colors, settings_open, animations.settings());
+            draw_settings_button(
+                r,
+                settings,
+                colors,
+                settings_open,
+                animations.settings(),
+                layout.scale_factor,
+            );
         }
         let hits = TabBarHits {
             tabs,
@@ -977,6 +994,7 @@ pub fn draw_tab_bar(
             colors,
             layout.horizontal,
             drag_indicator.and_then(|drag| drag.drop_index),
+            layout.scale_factor,
         );
         hits
     }
@@ -1129,6 +1147,7 @@ fn draw_drop_indicator(
     colors: &ChromeColors,
     horizontal: bool,
     indicator: Option<usize>,
+    scale_factor: f32,
 ) {
     let Some(index) = indicator else {
         return;
@@ -1142,20 +1161,36 @@ fn draw_drop_indicator(
     } else {
         hits.tabs[index].rect
     };
+    let indicator = drop_indicator_rect(rect, index == hits.tabs.len(), horizontal, scale_factor);
+    r.fill_rect(
+        indicator.x,
+        indicator.y,
+        indicator.w,
+        indicator.h,
+        colors.accent,
+    );
+}
+
+fn drop_indicator_rect(rect: Rect, after: bool, horizontal: bool, scale_factor: f32) -> Rect {
+    let width = DROP_INDICATOR_W * scale_factor;
     if horizontal {
-        let x = if index == hits.tabs.len() {
-            rect.x + rect.w
-        } else {
-            rect.x
-        };
-        r.fill_rect(x - 1.5, rect.y + 5.0, 3.0, rect.h - 10.0, colors.accent);
+        let x = if after { rect.x + rect.w } else { rect.x };
+        let inset = 5.0 * scale_factor;
+        Rect {
+            x: x - width * 0.5,
+            y: rect.y + inset,
+            w: width,
+            h: rect.h - inset * 2.0,
+        }
     } else {
-        let y = if index == hits.tabs.len() {
-            rect.y + rect.h
-        } else {
-            rect.y
-        };
-        r.fill_rect(rect.x + 6.0, y - 1.5, rect.w - 12.0, 3.0, colors.accent);
+        let y = if after { rect.y + rect.h } else { rect.y };
+        let inset = 6.0 * scale_factor;
+        Rect {
+            x: rect.x + inset,
+            y: y - width * 0.5,
+            w: rect.w - inset * 2.0,
+            h: width,
+        }
     }
 }
 
@@ -1407,6 +1442,7 @@ fn draw_titlebar_controls(
         colors,
         state.settings_open,
         state.settings_hover,
+        layout.scale_factor,
     );
     if !cfg!(target_os = "macos") {
         return;
@@ -1476,24 +1512,14 @@ fn draw_settings_button(
     colors: &ChromeColors,
     active: bool,
     hover: f32,
+    scale_factor: f32,
 ) {
     let hover = hover.clamp(0.0, 1.0);
     draw_chrome_hover_fill(r, rect, colors, hover);
     if active {
-        r.fill_rect(
-            rect.x + 4.0,
-            rect.y + 4.0,
-            rect.w - 8.0,
-            rect.h - 8.0,
-            colors.active_bg,
-        );
-        r.fill_rect(
-            rect.x + rect.w - 2.0,
-            rect.y + 6.0,
-            2.0,
-            rect.h - 12.0,
-            colors.accent,
-        );
+        let [fill, accent] = settings_active_rects(rect, scale_factor);
+        r.fill_rect(fill.x, fill.y, fill.w, fill.h, colors.active_bg);
+        r.fill_rect(accent.x, accent.y, accent.w, accent.h, colors.accent);
     }
     let icon_size = (rect.w.min(rect.h) * 0.58).max(16.0);
     let base_icon = if active { colors.text } else { colors.dim_text };
@@ -1505,7 +1531,28 @@ fn draw_settings_button(
         icon_size,
         icon_size,
         color,
+        scale_factor,
     );
+}
+
+fn settings_active_rects(rect: Rect, scale_factor: f32) -> [Rect; 2] {
+    let fill_inset = 4.0 * scale_factor;
+    let accent_inset = 6.0 * scale_factor;
+    let accent_w = 2.0 * scale_factor;
+    [
+        Rect {
+            x: rect.x + fill_inset,
+            y: rect.y + fill_inset,
+            w: rect.w - fill_inset * 2.0,
+            h: rect.h - fill_inset * 2.0,
+        },
+        Rect {
+            x: rect.x + rect.w - accent_w,
+            y: rect.y + accent_inset,
+            w: accent_w,
+            h: rect.h - accent_inset * 2.0,
+        },
+    ]
 }
 
 fn draw_chrome_hover_fill(r: &mut Renderer, rect: Rect, colors: &ChromeColors, hover: f32) {
@@ -1548,24 +1595,45 @@ fn draw_ephemeral_indicator(r: &mut Renderer, rect: Rect, colors: &ChromeColors)
     );
 }
 
-fn draw_settings_icon(r: &mut Renderer, x: f32, y: f32, w: f32, h: f32, color: [u8; 4]) {
+fn draw_settings_icon(
+    r: &mut Renderer,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [u8; 4],
+    scale_factor: f32,
+) {
+    for [line, knob] in settings_icon_rects(x, y, w, h, scale_factor) {
+        r.fill_rect(line.x, line.y, line.w, line.h, color);
+        r.fill_rect(knob.x, knob.y, knob.w, knob.h, color);
+    }
+}
+
+fn settings_icon_rects(x: f32, y: f32, w: f32, h: f32, scale_factor: f32) -> [[Rect; 2]; 3] {
     let line_w = (w * 0.9).max(12.0);
-    let line_h = 2.0;
-    let knob = 4.0;
+    let line_h = 2.0 * scale_factor;
+    let knob = 4.0 * scale_factor;
     let left = x + (w - line_w) * 0.5;
     let top = y + h * 0.28;
     let gap = h * 0.22;
-    for (row, knob_offset) in [(0.0, 0.22), (1.0, 0.68), (2.0, 0.42)] {
+    [(0.0, 0.22), (1.0, 0.68), (2.0, 0.42)].map(|(row, knob_offset)| {
         let line_y = top + row * gap;
-        r.fill_rect(left, line_y, line_w, line_h, color);
-        r.fill_rect(
-            left + line_w * knob_offset - knob * 0.5,
-            line_y - 1.0,
-            knob,
-            knob,
-            color,
-        );
-    }
+        [
+            Rect {
+                x: left,
+                y: line_y,
+                w: line_w,
+                h: line_h,
+            },
+            Rect {
+                x: left + line_w * knob_offset - knob * 0.5,
+                y: line_y - scale_factor,
+                w: knob,
+                h: knob,
+            },
+        ]
+    })
 }
 
 fn draw_close_button(
@@ -1574,15 +1642,16 @@ fn draw_close_button(
     rect: Rect,
     colors: &ChromeColors,
     hover: f32,
+    scale_factor: f32,
 ) {
     let hover = hover.clamp(0.0, 1.0);
     if hover > 0.0 {
-        let size = rect.w.min(rect.h) - 4.0;
+        let hover_rect = close_hover_rect(rect, scale_factor);
         r.fill_rect(
-            rect.x + (rect.w - size) * 0.5,
-            rect.y + (rect.h - size) * 0.5,
-            size,
-            size,
+            hover_rect.x,
+            hover_rect.y,
+            hover_rect.w,
+            hover_rect.h,
             with_alpha(colors.accent, (32.0 * hover) as u8),
         );
     }
@@ -1594,6 +1663,16 @@ fn draw_close_button(
         "\u{00d7}",
         mix(colors.dim_text, colors.accent, hover),
     );
+}
+
+fn close_hover_rect(rect: Rect, scale_factor: f32) -> Rect {
+    let size = rect.w.min(rect.h) - 4.0 * scale_factor;
+    Rect {
+        x: rect.x + (rect.w - size) * 0.5,
+        y: rect.y + (rect.h - size) * 0.5,
+        w: size,
+        h: size,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1633,7 +1712,7 @@ fn draw_tab_label(
         );
     }
     if dragging {
-        draw_drag_source(r, rect, colors);
+        draw_drag_source(r, rect, colors, scale_factor);
     }
     if active {
         let indicator = active_tab_indicator_rect(rect, horizontal, scale_factor);
@@ -1704,7 +1783,7 @@ fn tab_separator_rect(rect: Rect, horizontal: bool, scale_factor: f32) -> Rect {
     }
 }
 
-fn draw_drag_source(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
+fn draw_drag_source(r: &mut Renderer, rect: Rect, colors: &ChromeColors, scale_factor: f32) {
     r.fill_rect(
         rect.x,
         rect.y,
@@ -1712,22 +1791,43 @@ fn draw_drag_source(r: &mut Renderer, rect: Rect, colors: &ChromeColors) {
         rect.h,
         with_alpha(colors.accent, 28),
     );
-    r.fill_rect(rect.x, rect.y, rect.w, 2.0, with_alpha(colors.accent, 170));
-    r.fill_rect(
-        rect.x,
-        rect.y + rect.h - 2.0,
-        rect.w,
-        2.0,
-        with_alpha(colors.accent, 170),
-    );
-    r.fill_rect(rect.x, rect.y, 2.0, rect.h, with_alpha(colors.accent, 130));
-    r.fill_rect(
-        rect.x + rect.w - 2.0,
-        rect.y,
-        2.0,
-        rect.h,
-        with_alpha(colors.accent, 130),
-    );
+    let [top, bottom, left, right] = drag_source_frame_rects(rect, scale_factor);
+    for edge in [top, bottom] {
+        r.fill_rect(
+            edge.x,
+            edge.y,
+            edge.w,
+            edge.h,
+            with_alpha(colors.accent, 170),
+        );
+    }
+    for edge in [left, right] {
+        r.fill_rect(
+            edge.x,
+            edge.y,
+            edge.w,
+            edge.h,
+            with_alpha(colors.accent, 130),
+        );
+    }
+}
+
+fn drag_source_frame_rects(rect: Rect, scale_factor: f32) -> [Rect; 4] {
+    let width = DRAG_SOURCE_FRAME_W * scale_factor;
+    [
+        Rect { h: width, ..rect },
+        Rect {
+            y: rect.y + rect.h - width,
+            h: width,
+            ..rect
+        },
+        Rect { w: width, ..rect },
+        Rect {
+            x: rect.x + rect.w - width,
+            w: width,
+            ..rect
+        },
+    ]
 }
 
 fn r_cell_h(r: &Renderer) -> f32 {
@@ -1944,6 +2044,68 @@ mod tests {
                 h: 2.0,
             }
         );
+    }
+
+    #[test]
+    fn remaining_chrome_details_keep_their_logical_size_at_two_x() {
+        let scaled = |rect: Rect| Rect {
+            x: rect.x * 2.0,
+            y: rect.y * 2.0,
+            w: rect.w * 2.0,
+            h: rect.h * 2.0,
+        };
+        let rect = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 32.0,
+        };
+        let rect_2x = scaled(rect);
+
+        let horizontal_drop = drop_indicator_rect(rect, false, true, 1.0);
+        assert_eq!(horizontal_drop.w, 3.0);
+        assert_eq!(horizontal_drop.y - rect.y, 5.0);
+        let vertical_drop = drop_indicator_rect(rect, false, false, 1.0);
+        assert_eq!(vertical_drop.h, 3.0);
+        assert_eq!(vertical_drop.x - rect.x, 6.0);
+
+        for horizontal in [true, false] {
+            for after in [false, true] {
+                assert_eq!(
+                    drop_indicator_rect(rect_2x, after, horizontal, 2.0),
+                    scaled(drop_indicator_rect(rect, after, horizontal, 1.0))
+                );
+            }
+        }
+
+        assert_eq!(
+            settings_active_rects(rect_2x, 2.0),
+            settings_active_rects(rect, 1.0).map(scaled)
+        );
+        let [active_fill, active_accent] = settings_active_rects(rect, 1.0);
+        assert_eq!(active_fill.x - rect.x, 4.0);
+        assert_eq!(active_accent.w, 2.0);
+        assert_eq!(active_accent.y - rect.y, 6.0);
+
+        let icon_1x = settings_icon_rects(4.0, 6.0, 20.0, 20.0, 1.0);
+        assert!(icon_1x
+            .iter()
+            .all(|[line, knob]| line.h == 2.0 && knob.w == 4.0 && knob.h == 4.0));
+        assert_eq!(
+            settings_icon_rects(8.0, 12.0, 40.0, 40.0, 2.0),
+            icon_1x.map(|row| row.map(scaled))
+        );
+        let close_rect = Rect { w: 16.0, ..rect };
+        let close_rect_2x = scaled(close_rect);
+        assert_eq!(close_hover_rect(close_rect, 1.0).x - close_rect.x, 2.0);
+        assert_eq!(
+            close_hover_rect(close_rect_2x, 2.0),
+            scaled(close_hover_rect(close_rect, 1.0))
+        );
+        let frame_1x = drag_source_frame_rects(rect, 1.0);
+        assert_eq!(frame_1x[0].h, 2.0);
+        assert_eq!(frame_1x[2].w, 2.0);
+        assert_eq!(drag_source_frame_rects(rect_2x, 2.0), frame_1x.map(scaled));
     }
 
     #[test]
