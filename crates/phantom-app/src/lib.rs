@@ -759,7 +759,9 @@ impl App {
                     }
                 }
                 if let Some((pty_id, out)) = response {
-                    let _ = self.pty.write(pty_id, &out);
+                    if let Err(error) = self.pty.write_reply(pty_id, &out) {
+                        self.show_notice(format!("Could not reply to terminal query: {error}"));
+                    }
                 }
                 if active_tab {
                     // Debounced rather than refreshed inline: a full-history
@@ -1975,14 +1977,21 @@ impl App {
         }
         self.reset_blink();
         let at_shell_prompt = self.active_tab_at_shell_prompt();
+        let Some(pty_id) = self.tabs.get(self.active).map(|tab| tab.pty_id) else {
+            self.preedit.clear();
+            self.request_redraw();
+            return;
+        };
+        if !self.write_terminal_input(pty_id, text.as_bytes(), "Could not send text") {
+            self.preedit.clear();
+            self.request_redraw();
+            return;
+        }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.core.scroll(-1_000_000);
             tab.core.selection_clear();
             tab.frequent_commands.prepare_line(at_shell_prompt);
             tab.frequent_commands.observe_text(text);
-        }
-        if let Some(tab) = self.tabs.get(self.active) {
-            let _ = self.pty.write(tab.pty_id, text.as_bytes());
         }
         if text.contains('\n') || text.contains('\r') {
             self.arm_cwd_polling(CWD_POLL_WINDOW);
@@ -2064,6 +2073,12 @@ impl App {
         if !bytes.is_empty() {
             self.reset_blink();
             let at_shell_prompt = self.active_tab_at_shell_prompt();
+            let Some(pty_id) = self.tabs.get(self.active).map(|tab| tab.pty_id) else {
+                return;
+            };
+            if !self.write_terminal_input(pty_id, &bytes, "Could not send key") {
+                return;
+            }
             if let Some(t) = self.tabs.get_mut(self.active) {
                 // Typing snaps to the bottom and clears any selection.
                 t.core.scroll(-1_000_000);
@@ -2079,9 +2094,6 @@ impl App {
                         t.frequent_commands.observe_text(text);
                     }
                 }
-            }
-            if let Some(t) = self.tabs.get(self.active) {
-                let _ = self.pty.write(t.pty_id, &bytes);
             }
             if key == Key::Enter || bytes.contains(&b'\n') || bytes.contains(&b'\r') {
                 self.arm_cwd_polling(CWD_POLL_WINDOW);
@@ -2682,7 +2694,7 @@ impl App {
         } else {
             encode_mouse_legacy(3 + (button & !3), col as u16, row as u16)
         };
-        let _ = self.pty.write(pty_id, &bytes);
+        self.write_terminal_input(pty_id, &bytes, "Could not send mouse input");
     }
 
     fn copy_selection(&mut self) {
@@ -2704,12 +2716,10 @@ impl App {
             return;
         };
         let at_shell_prompt = self.active_tab_at_shell_prompt();
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
         let pty_id = tab.pty_id;
-        tab.frequent_commands.prepare_line(at_shell_prompt);
-        tab.frequent_commands.observe_text(&text);
         let mut bytes = Vec::new();
         if tab.core.bracketed_paste() {
             // Strip the end marker so pasted content can't break out of the
@@ -2723,9 +2733,12 @@ impl App {
         }
         // The whole paste (markers included) is queued atomically; on failure
         // nothing was delivered, so tell the user instead of dropping it.
-        if let Err(error) = self.pty.write(pty_id, &bytes) {
-            self.show_notice(format!("Could not paste: {error}"));
+        if !self.write_terminal_input(pty_id, &bytes, "Could not paste") {
             return;
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.frequent_commands.prepare_line(at_shell_prompt);
+            tab.frequent_commands.observe_text(&text);
         }
         if text.contains('\n') || text.contains('\r') {
             self.arm_cwd_polling(CWD_POLL_WINDOW);
@@ -2742,6 +2755,16 @@ impl App {
             return false;
         };
         looks_like_shell_prompt(&prefix)
+    }
+
+    fn write_terminal_input(&mut self, pty_id: u32, bytes: &[u8], failure: &str) -> bool {
+        match self.pty.write(pty_id, bytes) {
+            Ok(()) => true,
+            Err(error) => {
+                self.show_notice(format!("{failure}: {error}"));
+                false
+            }
+        }
     }
 
     /// Detect a copy/paste shortcut: Cmd+C/V on macOS, Ctrl+Shift+C/V elsewhere
@@ -4036,6 +4059,57 @@ mod tests {
     }
 
     #[test]
+    fn failed_key_and_ime_input_are_shown_in_the_global_notice() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+
+        app.handle_input(AppInput::Key {
+            key: Key::Char('x'),
+            text: Some("x".to_string()),
+            mods: Mods::default(),
+        });
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some("Could not send key: pty error: no such pty")
+        );
+
+        app.handle_input(AppInput::ImeCommit("composed".to_string()));
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some("Could not send text: pty error: no such pty")
+        );
+        assert!(app.preedit.is_empty());
+    }
+
+    #[test]
+    fn failed_terminal_query_reply_is_shown_in_the_global_notice() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 0,
+            bytes: b"\x1b[6n".to_vec(),
+        });
+
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some("Could not reply to terminal query: pty error: no such pty")
+        );
+    }
+
+    #[test]
     fn pty_output_debounces_find_refresh_and_skips_a_hidden_bar() {
         let mut app = test_app();
         app.tabs.push(Tab::new(
@@ -4701,7 +4775,7 @@ mod tests {
     }
 
     #[test]
-    fn cwd_polling_is_armed_by_command_submission_only() {
+    fn rejected_command_submission_does_not_arm_cwd_polling() {
         let mut app = test_app();
         app.tabs.push(Tab::new(
             0,
@@ -4726,8 +4800,8 @@ mod tests {
             mods: Mods::default(),
         });
 
-        assert!(app.cwd_deadline.is_some());
-        assert!(app.cwd_poll_until.is_some());
+        assert_eq!(app.cwd_deadline, None);
+        assert_eq!(app.cwd_poll_until, None);
     }
 
     #[test]
