@@ -284,7 +284,12 @@ impl UiState {
     ) -> UiOutcome {
         let mut outcome = UiOutcome::default();
         self.context_ui.begin_frame();
-        self.context_sidebar_width_px = 0.0;
+        // Modal overlays suppress sidebar widgets, but they must not release
+        // the persistent sidebar's terminal reservation and resize the PTY
+        // behind the overlay. Explicit collapse/disable still releases it.
+        if !config.context_actions.enabled || config.context_actions.panel_collapsed {
+            self.context_sidebar_width_px = 0.0;
+        }
         self.blur_regions.clear();
         let alpha = panel_alpha(config.panel_opacity);
         let transparent = config.panel_opacity < 100;
@@ -1967,6 +1972,29 @@ mod tests {
         }
     }
 
+    fn run_ui_frame(
+        ctx: &Context,
+        state: &mut UiState,
+        config: &mut AppConfig,
+        palette: &mut PaletteState,
+    ) {
+        let _ = ctx.run_ui(test_raw_input(), |ui| {
+            state.draw(
+                ui,
+                config,
+                palette,
+                UiFrameContext {
+                    snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    frequent_commands: &[],
+                    top_inset_points: 0.0,
+                    terminal_left_points: 0.0,
+                    terminal_right_points: 1280.0,
+                    global_notice: None,
+                },
+            );
+        });
+    }
+
     fn settings_accesskit_update(tab: SettingsTab) -> egui::accesskit::TreeUpdate {
         let ctx = Context::default();
         ctx.enable_accesskit();
@@ -2101,6 +2129,31 @@ mod tests {
             .nodes
             .iter()
             .any(|(_, node)| node.label() == Some("Appearance")));
+    }
+
+    #[test]
+    fn context_sidebar_reservation_survives_settings_and_palette_overlays() {
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        let mut state = UiState::new(&config);
+
+        run_ui_frame(&ctx, &mut state, &mut config, &mut palette);
+        let expanded_width = state.terminal_right_inset_px();
+        assert!(expanded_width > 0.0);
+
+        state.open_settings(&config);
+        run_ui_frame(&ctx, &mut state, &mut config, &mut palette);
+        assert_eq!(state.terminal_right_inset_px(), expanded_width);
+
+        assert!(state.close_panel());
+        palette.open(&config);
+        run_ui_frame(&ctx, &mut state, &mut config, &mut palette);
+        assert_eq!(state.terminal_right_inset_px(), expanded_width);
+
+        config.context_actions.panel_collapsed = true;
+        run_ui_frame(&ctx, &mut state, &mut config, &mut palette);
+        assert_eq!(state.terminal_right_inset_px(), 0.0);
     }
 
     #[test]
