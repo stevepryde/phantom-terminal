@@ -286,7 +286,7 @@ fn explicit_cwd_launch_skips_remembered_tabs() {
             record("two", "two", &cwd, 1, true),
         ])
         .unwrap();
-    let app = app_with_store_and_launch(
+    let mut app = app_with_store_and_launch(
         store,
         LaunchContext {
             cwd: Some(cwd),
@@ -296,6 +296,14 @@ fn explicit_cwd_launch_skips_remembered_tabs() {
 
     assert_eq!(app.tab_count(), 1);
     assert_eq!(app.active_index(), 0);
+
+    app.handle_input(AppInput::CloseRequested);
+    let remembered = app.remembered_tabs_for_tests().expect("remembered tabs");
+    let ids: Vec<_> = remembered
+        .iter()
+        .map(|tab| tab.id.as_deref().unwrap())
+        .collect();
+    assert_eq!(ids, ["one", "two"]);
 }
 
 #[test]
