@@ -26,6 +26,8 @@ const MAX_LIVE_PTY_SESSIONS: usize = 256;
 /// rejected operation is enqueued.
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const WRITE_QUEUE_MESSAGES: usize = 256;
+const MAX_REPLY_BYTES: usize = 64 * 1024;
+const WRITE_REPLY_QUEUE_MESSAGES: usize = 16;
 const MAX_LAUNCH_ENV_VARS: usize = 128;
 const MAX_LAUNCH_ENV_KEY_LEN: usize = 128;
 const MAX_LAUNCH_ENV_VALUE_LEN: usize = 16 * 1024;
@@ -99,11 +101,21 @@ struct PtySession {
 /// holds a partial operation. `queued_bytes` tracks bytes buffered in the
 /// channel (and the message currently being written) so total buffered input
 /// stays within [`MAX_INPUT_BYTES`] even though messages vary in size; the
-/// writer thread releases the budget after each blocking `write_all`.
+/// writer thread releases the budget after each blocking `write_all`. Protocol
+/// replies have a smaller independent budget so bulk user input cannot consume
+/// all capacity needed for a terminal query response.
 #[derive(Clone)]
 struct WriterQueue {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<WriterMessage>,
     queued_bytes: Arc<AtomicUsize>,
+    queued_messages: Arc<AtomicUsize>,
+    queued_reply_bytes: Arc<AtomicUsize>,
+    queued_replies: Arc<AtomicUsize>,
+}
+
+enum WriterMessage {
+    Input(Vec<u8>),
+    Reply(Vec<u8>),
 }
 
 impl WriterQueue {
@@ -118,12 +130,65 @@ impl WriterQueue {
                 data.len()
             )));
         }
-        if !self.reserve(data.len()) {
+        if !reserve_budget(
+            &self.queued_bytes,
+            MAX_INPUT_BYTES,
+            &self.queued_messages,
+            WRITE_QUEUE_MESSAGES,
+            data.len(),
+        ) {
             return Err(AppError::Pty("terminal is not accepting input".to_string()));
         }
-        self.tx.try_send(data.to_vec()).map_err(|error| {
-            // Nothing was enqueued; release the byte reservation.
-            self.queued_bytes.fetch_sub(data.len(), Ordering::AcqRel);
+        self.send_reserved(
+            WriterMessage::Input(data.to_vec()),
+            &self.queued_bytes,
+            &self.queued_messages,
+            data.len(),
+        )
+    }
+
+    /// Queue terminal-generated protocol output using capacity reserved from
+    /// ordinary input. This keeps bounded DSR/DA replies deliverable after a
+    /// large paste fills the normal input budget.
+    fn enqueue_reply(&self, data: &[u8]) -> AppResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data.len() > MAX_REPLY_BYTES {
+            return Err(AppError::Pty(format!(
+                "terminal reply of {} bytes exceeds the {MAX_REPLY_BYTES}-byte limit",
+                data.len()
+            )));
+        }
+        if !reserve_budget(
+            &self.queued_reply_bytes,
+            MAX_REPLY_BYTES,
+            &self.queued_replies,
+            WRITE_REPLY_QUEUE_MESSAGES,
+            data.len(),
+        ) {
+            return Err(AppError::Pty(
+                "terminal is not accepting protocol replies".to_string(),
+            ));
+        }
+        self.send_reserved(
+            WriterMessage::Reply(data.to_vec()),
+            &self.queued_reply_bytes,
+            &self.queued_replies,
+            data.len(),
+        )
+    }
+
+    fn send_reserved(
+        &self,
+        message: WriterMessage,
+        bytes: &AtomicUsize,
+        messages: &AtomicUsize,
+        len: usize,
+    ) -> AppResult<()> {
+        self.tx.try_send(message).map_err(|error| {
+            bytes.fetch_sub(len, Ordering::AcqRel);
+            messages.fetch_sub(1, Ordering::AcqRel);
             match error {
                 TrySendError::Full(_) => {
                     AppError::Pty("terminal is not accepting input".to_string())
@@ -132,27 +197,37 @@ impl WriterQueue {
             }
         })
     }
+}
 
-    /// Atomically reserve `len` bytes of the buffered-input budget; `false`
-    /// when the whole operation does not fit.
-    fn reserve(&self, len: usize) -> bool {
-        let mut current = self.queued_bytes.load(Ordering::Relaxed);
-        loop {
-            let Some(next) = current.checked_add(len) else {
-                return false;
-            };
-            if next > MAX_INPUT_BYTES {
-                return false;
-            }
-            match self.queued_bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(observed) => current = observed,
-            }
+fn reserve_budget(
+    bytes: &AtomicUsize,
+    max_bytes: usize,
+    messages: &AtomicUsize,
+    max_messages: usize,
+    len: usize,
+) -> bool {
+    if !reserve_counter(bytes, len, max_bytes) {
+        return false;
+    }
+    if reserve_counter(messages, 1, max_messages) {
+        return true;
+    }
+    bytes.fetch_sub(len, Ordering::AcqRel);
+    false
+}
+
+fn reserve_counter(counter: &AtomicUsize, amount: usize, max: usize) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(amount) else {
+            return false;
+        };
+        if next > max {
+            return false;
+        }
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
         }
     }
 }
@@ -300,20 +375,33 @@ impl PtyManager {
         // all writes happen here, off the UI thread. The thread exits when the
         // session (and with it `write_tx`) is dropped, or when a write fails
         // (EIO after the child dies).
-        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_MESSAGES);
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<WriterMessage>(
+            WRITE_QUEUE_MESSAGES + WRITE_REPLY_QUEUE_MESSAGES,
+        );
         let writer_queue = WriterQueue {
             tx: write_tx,
             queued_bytes: Arc::new(AtomicUsize::new(0)),
+            queued_messages: Arc::new(AtomicUsize::new(0)),
+            queued_reply_bytes: Arc::new(AtomicUsize::new(0)),
+            queued_replies: Arc::new(AtomicUsize::new(0)),
         };
         let queued_bytes = Arc::clone(&writer_queue.queued_bytes);
+        let queued_messages = Arc::clone(&writer_queue.queued_messages);
+        let queued_reply_bytes = Arc::clone(&writer_queue.queued_reply_bytes);
+        let queued_replies = Arc::clone(&writer_queue.queued_replies);
         if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-writer-{id}"))
             .spawn(move || {
-                while let Ok(data) = write_rx.recv() {
+                while let Ok(message) = write_rx.recv() {
+                    let (data, bytes, messages) = match message {
+                        WriterMessage::Input(data) => (data, &queued_bytes, &queued_messages),
+                        WriterMessage::Reply(data) => (data, &queued_reply_bytes, &queued_replies),
+                    };
                     let result = writer.write_all(&data).and_then(|_| writer.flush());
                     // Release the budget only after the blocking write, so
                     // buffered plus in-flight input stays within the bound.
-                    queued_bytes.fetch_sub(data.len(), Ordering::AcqRel);
+                    bytes.fetch_sub(data.len(), Ordering::AcqRel);
+                    messages.fetch_sub(1, Ordering::AcqRel);
                     if result.is_err() {
                         break;
                     }
@@ -405,6 +493,18 @@ impl PtyManager {
             .writer_queue
             .clone();
         queue.enqueue(data)
+    }
+
+    /// Queue terminal-generated protocol output (for example a DSR cursor
+    /// report) using capacity reserved separately from user input.
+    pub fn write_reply(&self, id: u32, data: &[u8]) -> AppResult<()> {
+        let queue = self
+            .lock()
+            .get(&id)
+            .ok_or_else(|| AppError::Pty("no such pty".to_string()))?
+            .writer_queue
+            .clone();
+        queue.enqueue_reply(data)
     }
 
     pub fn resize(&self, id: u32, rows: u16, cols: u16) -> AppResult<()> {
@@ -1172,15 +1272,25 @@ mod tests {
         assert!(reaped, "child {pid} was not reaped after sink detach");
     }
 
-    fn writer_queue(capacity: usize) -> (WriterQueue, std::sync::mpsc::Receiver<Vec<u8>>) {
+    fn writer_queue(capacity: usize) -> (WriterQueue, std::sync::mpsc::Receiver<WriterMessage>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
         (
             WriterQueue {
                 tx,
                 queued_bytes: Arc::new(AtomicUsize::new(0)),
+                queued_messages: Arc::new(AtomicUsize::new(0)),
+                queued_reply_bytes: Arc::new(AtomicUsize::new(0)),
+                queued_replies: Arc::new(AtomicUsize::new(0)),
             },
             rx,
         )
+    }
+
+    fn input(message: WriterMessage) -> Vec<u8> {
+        match message {
+            WriterMessage::Input(data) => data,
+            WriterMessage::Reply(_) => panic!("expected user input"),
+        }
     }
 
     fn bracketed_paste() -> Vec<u8> {
@@ -1195,7 +1305,7 @@ mod tests {
         queue.enqueue(&paste).unwrap();
 
         // Begin marker, content, and end marker arrive as a single message.
-        assert_eq!(rx.try_recv().unwrap(), paste);
+        assert_eq!(input(rx.try_recv().unwrap()), paste);
         assert!(rx.try_recv().is_err());
     }
 
@@ -1214,12 +1324,12 @@ mod tests {
         // No paste bytes leaked into the queue — in particular no dangling
         // begin marker — and the failed attempt released its byte reservation.
         assert_eq!(queue.queued_bytes.load(Ordering::Acquire), 1);
-        assert_eq!(rx.try_recv().unwrap(), b"x".to_vec());
+        assert_eq!(input(rx.try_recv().unwrap()), b"x".to_vec());
         assert!(rx.try_recv().is_err());
 
         // Once the queue drains, the same paste is accepted whole.
         queue.enqueue(&paste).unwrap();
-        assert_eq!(rx.try_recv().unwrap(), paste);
+        assert_eq!(input(rx.try_recv().unwrap()), paste);
     }
 
     #[test]
@@ -1237,8 +1347,92 @@ mod tests {
 
         // Only the filler is buffered; the rejected paste reserved nothing.
         assert_eq!(queue.queued_bytes.load(Ordering::Acquire), filler.len());
-        assert_eq!(rx.try_recv().unwrap().len(), filler.len());
+        assert_eq!(input(rx.try_recv().unwrap()).len(), filler.len());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn protocol_reply_has_capacity_reserved_from_bulk_input() {
+        let (queue, rx) = writer_queue(2);
+        let filler = vec![b'a'; MAX_INPUT_BYTES];
+        queue.enqueue(&filler).unwrap();
+
+        queue.enqueue_reply(b"\x1b[1;1R").unwrap();
+
+        assert_eq!(input(rx.try_recv().unwrap()), filler);
+        match rx.try_recv().unwrap() {
+            WriterMessage::Reply(data) => assert_eq!(data, b"\x1b[1;1R"),
+            WriterMessage::Input(_) => panic!("expected terminal reply"),
+        }
+    }
+
+    #[test]
+    fn protocol_reply_has_capacity_reserved_from_many_input_messages() {
+        let (queue, rx) = writer_queue(WRITE_QUEUE_MESSAGES + 1);
+        for _ in 0..WRITE_QUEUE_MESSAGES {
+            queue.enqueue(b"x").unwrap();
+        }
+
+        queue.enqueue_reply(b"reply").unwrap();
+
+        for _ in 0..WRITE_QUEUE_MESSAGES {
+            assert_eq!(input(rx.try_recv().unwrap()), b"x");
+        }
+        match rx.try_recv().unwrap() {
+            WriterMessage::Reply(data) => assert_eq!(data, b"reply"),
+            WriterMessage::Input(_) => panic!("expected terminal reply"),
+        }
+    }
+
+    #[test]
+    fn writer_queue_preserves_order_across_input_and_replies() {
+        let (queue, rx) = writer_queue(3);
+
+        queue.enqueue(b"before").unwrap();
+        queue.enqueue_reply(b"reply").unwrap();
+        queue.enqueue(b"after").unwrap();
+
+        assert_eq!(input(rx.try_recv().unwrap()), b"before");
+        match rx.try_recv().unwrap() {
+            WriterMessage::Reply(data) => assert_eq!(data, b"reply"),
+            WriterMessage::Input(_) => panic!("expected terminal reply"),
+        }
+        assert_eq!(input(rx.try_recv().unwrap()), b"after");
+    }
+
+    #[test]
+    fn exhausted_reply_budget_does_not_consume_input_capacity() {
+        let (queue, rx) = writer_queue(WRITE_REPLY_QUEUE_MESSAGES + 1);
+        for _ in 0..WRITE_REPLY_QUEUE_MESSAGES {
+            queue.enqueue_reply(b"r").unwrap();
+        }
+
+        assert!(queue.enqueue_reply(b"overflow").is_err());
+        assert_eq!(
+            queue.queued_replies.load(Ordering::Acquire),
+            WRITE_REPLY_QUEUE_MESSAGES
+        );
+        assert_eq!(
+            queue.queued_reply_bytes.load(Ordering::Acquire),
+            WRITE_REPLY_QUEUE_MESSAGES
+        );
+        queue.enqueue(b"input").unwrap();
+
+        for _ in 0..WRITE_REPLY_QUEUE_MESSAGES {
+            assert!(matches!(rx.try_recv().unwrap(), WriterMessage::Reply(_)));
+        }
+        assert_eq!(input(rx.try_recv().unwrap()), b"input");
+    }
+
+    #[test]
+    fn disconnected_reply_queue_rolls_back_its_reservation() {
+        let (queue, rx) = writer_queue(1);
+        drop(rx);
+
+        assert!(queue.enqueue_reply(b"reply").is_err());
+
+        assert_eq!(queue.queued_replies.load(Ordering::Acquire), 0);
+        assert_eq!(queue.queued_reply_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]
