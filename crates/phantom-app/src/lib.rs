@@ -2858,11 +2858,34 @@ impl App {
     }
 
     fn apply_terminal_grid(&mut self, rows: u16, cols: u16) {
-        for tab in &mut self.tabs {
-            tab.core.resize(rows, cols);
-            let _ = self.pty.resize(tab.pty_id, rows, cols);
+        let pty = &self.pty;
+        let failures = apply_terminal_grid_to_tabs(&mut self.tabs, rows, cols, |pty_id| {
+            pty.resize(pty_id, rows, cols)
+        });
+        if failures.is_empty() {
+            self.last_terminal_grid = Some((rows, cols));
+        } else {
+            // A tab whose kernel resize failed keeps its prior emulator grid.
+            // Successful tabs remain in sync with their PTYs, but the global
+            // applied size is now mixed and must not cancel a later retry.
+            self.last_terminal_grid = None;
+            self.pending_terminal_grid = Some((rows, cols));
+            self.terminal_resize_deadline = Some(Instant::now() + TERMINAL_RESIZE_DEBOUNCE);
+            for (tab_id, error) in &failures {
+                eprintln!("could not resize PTY for tab {tab_id}: {error}");
+            }
+            self.show_notice(if failures.len() == 1 {
+                format!(
+                    "Could not resize one terminal session; its previous grid was preserved and Phantom will retry: {}",
+                    failures[0].1
+                )
+            } else {
+                format!(
+                    "Could not resize {} terminal sessions; their previous grids were preserved and Phantom will retry",
+                    failures.len()
+                )
+            });
         }
-        self.last_terminal_grid = Some((rows, cols));
         if self.ui.find_open() {
             self.refresh_find();
         }
@@ -2873,8 +2896,8 @@ impl App {
             self.terminal_resize_deadline = None;
             return;
         };
-        self.apply_terminal_grid(rows, cols);
         self.terminal_resize_deadline = None;
+        self.apply_terminal_grid(rows, cols);
         self.request_redraw();
     }
 
@@ -3760,6 +3783,22 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
+fn apply_terminal_grid_to_tabs(
+    tabs: &mut [Tab],
+    rows: u16,
+    cols: u16,
+    mut resize_pty: impl FnMut(u32) -> phantom_core::AppResult<()>,
+) -> Vec<(u64, String)> {
+    let mut failures = Vec::new();
+    for tab in tabs {
+        match resize_pty(tab.pty_id) {
+            Ok(()) => tab.core.resize(rows, cols),
+            Err(error) => failures.push((tab.id, error.to_string())),
+        }
+    }
+    failures
+}
+
 fn cursor_shape(style: &str) -> CursorShape {
     match style {
         "bar" => CursorShape::Beam,
@@ -4460,27 +4499,65 @@ mod tests {
         assert_eq!(app.pending_terminal_grid, Some((24, 80)));
 
         app.flush_pending_terminal_resize();
-        assert_eq!(app.tabs[0].core.size(), (24, 80));
-        assert_eq!(app.pending_terminal_grid, None);
-        assert_eq!(app.terminal_resize_deadline, None);
+        assert_eq!(app.tabs[0].core.size(), (2, 20));
+        assert_eq!(app.pending_terminal_grid, Some((24, 80)));
+        assert!(app.terminal_resize_deadline.is_some());
+        assert_eq!(app.last_terminal_grid, None);
+        assert!(app
+            .notice_text()
+            .unwrap()
+            .contains("previous grid was preserved"));
     }
 
     #[test]
-    fn forced_terminal_grid_sync_applies_immediately() {
-        let mut app = test_app();
-        app.tabs.push(Tab::new(
+    fn terminal_grid_resize_updates_emulator_only_after_pty_success() {
+        let mut tabs = vec![
+            Tab::new(
+                0,
+                AlacrittyCore::new(2, 20, 100, CursorShape::Block),
+                10,
+                String::new(),
+                None,
+            ),
+            Tab::new(
+                1,
+                AlacrittyCore::new(3, 30, 100, CursorShape::Block),
+                11,
+                String::new(),
+                None,
+            ),
+        ];
+
+        let failures = apply_terminal_grid_to_tabs(&mut tabs, 24, 80, |pty_id| {
+            if pty_id == 11 {
+                Err(phantom_core::AppError::Pty("driver rejected resize".into()))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(tabs[0].core.size(), (24, 80));
+        assert_eq!(tabs[1].core.size(), (3, 30));
+        assert_eq!(
+            failures,
+            [(1, "pty error: driver rejected resize".to_string())]
+        );
+    }
+
+    #[test]
+    fn successful_terminal_grid_resize_updates_every_emulator() {
+        let mut tabs = vec![Tab::new(
             0,
             AlacrittyCore::new(2, 20, 100, CursorShape::Block),
-            u32::MAX,
+            10,
             String::new(),
             None,
-        ));
-        app.last_terminal_grid = Some((24, 80));
+        )];
 
-        app.sync_terminal_grid(true);
-        assert_eq!(app.tabs[0].core.size(), (24, 80));
-        assert_eq!(app.pending_terminal_grid, None);
-        assert_eq!(app.terminal_resize_deadline, None);
+        let failures = apply_terminal_grid_to_tabs(&mut tabs, 24, 80, |_| Ok(()));
+
+        assert!(failures.is_empty());
+        assert_eq!(tabs[0].core.size(), (24, 80));
     }
 
     #[test]
