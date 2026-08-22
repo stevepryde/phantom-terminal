@@ -31,10 +31,11 @@ terminal/egui ownership boundary, and general visual rules remain owned by
   preserve the entered text and show a compact inline error state rather than
   closing the overlay or searching as a literal.
 - **FIND-006 (confirmed):** A valid query with matches must highlight one active
-  match and scroll it into view. Next and Previous must move through matches in
-  buffer order, wrap at either end, and keep the active match visibly
-  highlighted without replacing the user's ordinary terminal selection.
-  `Enter` must activate Next and `Shift+Enter` Previous.
+  match and scroll it into view. Other visible matches must use a distinct,
+  dimmer highlight without the active underline. Next and Previous must move
+  through matches in buffer order, wrap at either end, and keep the active match
+  visibly highlighted without replacing the user's ordinary terminal
+  selection. `Enter` must activate Next and `Shift+Enter` Previous.
 - **FIND-007 (confirmed):** `Escape` must close the overlay, return keyboard
   input to the terminal, and keep the viewport at the last visited match. The
   temporary search highlight must be removed; the ordinary terminal selection
@@ -72,8 +73,10 @@ terminal/egui ownership boundary, and general visual rules remain owned by
 
 - **AC-FIND-A:** Populate more output than one viewport, press `Ctrl+F`, enter a
   mixed-case fragment, and observe case-insensitive matches in both visible and
-  scrolled-off output. Next/Previous wrap and scroll each active match into
-  view; `Enter` and `Shift+Enter` perform the same navigation.
+  scrolled-off output. Visible non-active matches use a dimmer fill while the
+  active match retains its stronger fill and underline. Next/Previous wrap and
+  scroll each active match into view; `Enter` and `Shift+Enter` perform the same
+  navigation.
 - **AC-FIND-B:** Toggle case-sensitive and whole-word independently and observe
   the result set update immediately. A word embedded inside a longer Unicode
   word is excluded only when whole-word is active.
@@ -107,6 +110,9 @@ terminal/egui ownership boundary, and general visual rules remain owned by
   interaction. The active find highlight is separate from the terminal's
   ordinary selection so selection-only remains deterministic and copy behavior
   is not changed by navigation.
+- Active and non-active match state is derived in `phantom-emu` from the app's
+  latest bounded async result set. `phantom-gfx` owns the two clipped paint
+  styles; it does not repeat search or navigation logic.
 - The overlay intentionally omits a close button. The compact result count and
   active terminal highlight provide steady-state feedback; `Escape` is the
   close action.

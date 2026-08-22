@@ -1056,6 +1056,7 @@ impl App {
     fn close_find(&mut self) {
         self.find_worker.cancel();
         if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.set_search_matches(&[]);
             tab.core.set_active_search_match(None);
         }
         self.ui.close_find();
@@ -1198,6 +1199,7 @@ impl App {
         let active_match = (!self.find_matches.is_empty()).then_some(self.find_active);
         let search_match = active_match.and_then(|index| self.find_matches.get(index).copied());
         if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.set_search_matches(&self.find_matches);
             tab.core.set_active_search_match(search_match);
         }
         self.ui.set_find_results(FindResultSummary {
@@ -1237,6 +1239,7 @@ impl App {
         self.find_active = 0;
         self.find_capped = false;
         if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.set_search_matches(&[]);
             tab.core.set_active_search_match(None);
         }
         self.ui.set_find_results(FindResultSummary {
@@ -5109,6 +5112,59 @@ mod tests {
         app.close_find();
         assert_eq!(app.find_selection_scope, None);
         assert_eq!(app.tabs[0].core.selection_range(), Some(replacement));
+    }
+
+    #[test]
+    fn completed_find_maps_all_matches_and_navigation_preserves_capped_state() {
+        let mut app = test_app();
+        let mut tab = Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        );
+        tab.advance_pty(b"hit gap hit");
+        let matches = tab
+            .core
+            .search_scrollback("hit", SearchOptions::default(), None)
+            .unwrap()
+            .matches;
+        app.tabs.push(tab);
+        app.ui.open_find(false);
+        app.apply_find_result(Ok(SearchOutcome {
+            matches: matches.clone(),
+            capped: true,
+        }));
+
+        let first = app.tabs[0].core.snapshot();
+        assert_eq!(
+            first.cells.iter().filter(|cell| cell.search_match).count(),
+            3
+        );
+        assert_eq!(
+            first
+                .cells
+                .iter()
+                .filter(|cell| cell.search_match_inactive)
+                .count(),
+            3
+        );
+        assert!(app.ui.find_state().results().capped);
+
+        app.navigate_find(FindNavigation::Next);
+        let second = app.tabs[0].core.snapshot();
+        assert!(second.cell(0, 0).unwrap().search_match_inactive);
+        assert!(second.cell(0, 8).unwrap().search_match);
+        assert!(app.ui.find_state().results().capped);
+
+        app.close_find();
+        assert!(!app.tabs[0]
+            .core
+            .snapshot()
+            .cells
+            .iter()
+            .any(|cell| cell.search_match || cell.search_match_inactive));
     }
 
     #[test]

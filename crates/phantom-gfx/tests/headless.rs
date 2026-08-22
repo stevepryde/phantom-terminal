@@ -4,7 +4,7 @@
 #![cfg(feature = "headless")]
 
 use phantom_core::AppConfig;
-use phantom_emu::{AlacrittyCore, CursorShape, SelSide, VtCore};
+use phantom_emu::{AlacrittyCore, CursorShape, SearchOptions, SelSide, VtCore};
 use phantom_gfx::headless::Harness;
 
 fn core(rows: u16, cols: u16) -> AlacrittyCore {
@@ -131,6 +131,44 @@ fn selection_highlights_the_cells() {
     assert!(
         sum_after > sum_before + 10,
         "selection did not lighten the cell ({sum_before} -> {sum_after})"
+    );
+}
+
+#[test]
+fn inactive_find_matches_are_dimmer_than_the_active_match() {
+    let config = AppConfig::default();
+    let mut h = harness_or_skip!(&config, 240, 120);
+    let (rows, cols) = h.grid();
+    let mut term = core(rows, cols);
+    term.advance(b"x gap x");
+    let matches = term
+        .search_scrollback("x", SearchOptions::default(), None)
+        .unwrap()
+        .matches;
+    assert_eq!(matches.len(), 2);
+
+    let (inactive_x, inactive_y, inactive_w, inactive_h) = cell_sample(&h, 6, 0);
+    let plain = h
+        .render_snapshot(&term.snapshot(), false)
+        .avg(inactive_x, inactive_y, inactive_w, inactive_h);
+
+    term.set_search_matches(&matches);
+    term.set_active_search_match(Some(matches[0]));
+    let highlighted = h.render_snapshot(&term.snapshot(), false);
+    let (active_x, active_y, active_w, active_h) = cell_sample(&h, 0, 0);
+    let active = highlighted.avg(active_x, active_y, active_w, active_h);
+    let inactive = highlighted.avg(inactive_x, inactive_y, inactive_w, inactive_h);
+
+    let plain_sum: u32 = plain.iter().sum();
+    let inactive_sum: u32 = inactive.iter().sum();
+    let active_sum: u32 = active.iter().sum();
+    assert!(
+        inactive_sum > plain_sum + 10,
+        "inactive match was not visible ({plain_sum} -> {inactive_sum})"
+    );
+    assert!(
+        active_sum > inactive_sum + 20,
+        "inactive and active matches were not distinct ({inactive_sum} vs {active_sum})"
     );
 }
 

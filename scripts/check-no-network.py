@@ -156,11 +156,11 @@ BUILTIN_MACROS = {
 
 APPROVED_CUSTOM_MACRO_FILES = {
     "crates/phantom-emu/src/alacritty_core.rs": (
-        "af4782addaacb9a2df8b43660e810d81d30ca4b0e45203d6ac4ffe1396f9987b",
+        "96cb01f77884a419758d118b98d8d9fc502fa558483e61abd14c069ec0aff634",
         {"reset_state"},
     ),
     "crates/phantom-gfx/tests/headless.rs": (
-        "194bf25be61f92c20873cf26e90660e1269cbf42efa2f167048d8d05b6229b74",
+        "29c949537046184aea1778f7927b07e86e16e583c6cf7edb9237eee17fdd8df5",
         {"harness_or_skip"},
     ),
 }
