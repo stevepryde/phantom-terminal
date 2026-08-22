@@ -3800,7 +3800,9 @@ impl App {
             terminal_pane.w,
             terminal_pane.h,
         );
-        if let Some(wash) = themes::ui_theme_terminal_wash(&self.config.ui_theme) {
+        if let Some(wash) =
+            themes::terminal_pane_wash(&self.config.ui_theme, &self.config.terminal_background)
+        {
             renderer.draw_terminal_wash(
                 wash,
                 terminal_pane.x,

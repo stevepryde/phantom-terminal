@@ -44,9 +44,10 @@ Rows and menu items must define hover states. Avoid single-hue pages by using ne
 ## UI Themes
 
 UI themes are separate from terminal color themes. They may tint the title bar,
-tab chrome, active tab accent, and a very dim terminal backdrop wash or local
-fantasy background image, but they must not rewrite ANSI foreground/background
-colors or reduce terminal text contrast.
+tab chrome, and active tab accent. When no backdrop image is selected, decorative
+themes may also draw a very dim terminal wash. They must not tint a selected
+backdrop image, rewrite ANSI foreground/background colors, or reduce terminal
+text contrast.
 
 | Preset | Chrome Direction | Terminal Backdrop Rule |
 | --- | --- | --- |
@@ -77,11 +78,12 @@ Image opacity is a separate bounded setting from `0` to `60` and is applied as
 actual percent opacity by the native renderer. Disable the slider when the
 selected backdrop is `None`. Draw the backdrop across the full terminal pane
 behind the `8px` terminal text inset, with terminal cells, cursor, selection,
-IME, chrome, and overlays composited above it. For decorative UI themes, draw
-the theme's wash above the optional image but below terminal cell backgrounds,
-selection, cursor, and glyphs. Each wash stop must remain at or below 5% opacity
-so it tints empty/default-background cells without rewriting ANSI colours or
-reducing text contrast. Phantom remains neutral with no wash.
+IME, chrome, and overlays composited above it. When the selected backdrop is
+`None`, decorative UI themes may draw the theme's wash below terminal cell
+backgrounds, selection, cursor, and glyphs. Each wash stop must remain at or
+below 5% opacity so it tints empty/default-background cells without rewriting
+ANSI colours or reducing text contrast. Do not draw the wash over a selected
+backdrop image. Phantom remains neutral with no wash.
 
 | Backdrop | Rule |
 | --- | --- |

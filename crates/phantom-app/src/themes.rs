@@ -1,7 +1,7 @@
 //! UI theme accents and terminal washes. The terminal ANSI palette comes from
-//! `config.theme`; `ui_theme` only tints chrome and the translucent wash behind
-//! terminal content. The name list lives in `phantom-core` so the validated set
-//! and the picker can never drift apart.
+//! `config.theme`; `ui_theme` only tints chrome and, when no backdrop image is
+//! selected, the translucent wash behind terminal content. The name list lives
+//! in `phantom-core` so the validated set and the picker can never drift apart.
 
 pub use phantom_core::UI_THEMES;
 
@@ -29,7 +29,7 @@ pub fn ui_theme_accent(name: &str) -> [u8; 4] {
 
 /// Low-opacity sRGBA corner colours for the terminal-pane wash. Phantom stays
 /// neutral; every decorative preset uses three restrained hues and four stops.
-pub fn ui_theme_terminal_wash(name: &str) -> Option<[[u8; 4]; 4]> {
+fn ui_theme_terminal_wash(name: &str) -> Option<[[u8; 4]; 4]> {
     let hues = match name {
         "aurora" => [[34, 211, 238], [139, 92, 246], [20, 184, 166]],
         "ember" => [[239, 68, 68], [249, 115, 22], [139, 92, 246]],
@@ -56,6 +56,16 @@ pub fn ui_theme_terminal_wash(name: &str) -> Option<[[u8; 4]; 4]> {
 
 fn with_alpha(rgb: [u8; 3], alpha: u8) -> [u8; 4] {
     [rgb[0], rgb[1], rgb[2], alpha]
+}
+
+/// Decorative wash for empty terminal cells. A chosen backdrop image is shown
+/// without a theme tint; the wash only applies when the backdrop is `none`.
+pub fn terminal_pane_wash(ui_theme: &str, terminal_background: &str) -> Option<[[u8; 4]; 4]> {
+    if terminal_background == "none" {
+        ui_theme_terminal_wash(ui_theme)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -96,5 +106,15 @@ mod tests {
             washes.iter().copied().collect::<HashSet<_>>().len(),
             washes.len()
         );
+    }
+
+    #[test]
+    fn decorative_wash_is_not_applied_over_a_backdrop_image() {
+        let aurora =
+            ui_theme_terminal_wash("aurora").expect("aurora should have a decorative wash");
+        assert_eq!(terminal_pane_wash("aurora", "none"), Some(aurora));
+        assert_eq!(terminal_pane_wash("aurora", "phantom"), None);
+        assert_eq!(terminal_pane_wash("aurora", "dragon"), None);
+        assert_eq!(terminal_pane_wash("phantom", "none"), None);
     }
 }

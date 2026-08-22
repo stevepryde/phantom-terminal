@@ -423,8 +423,8 @@ impl Renderer {
         self.backdrop.draw(name, opacity_percent, x, y, w, h);
     }
 
-    /// Draw a translucent terminal-theme wash above the optional backdrop
-    /// image and below terminal cells, selection, cursor, and glyphs.
+    /// Draw a translucent terminal-theme wash below terminal cells, selection,
+    /// cursor, and glyphs.
     pub fn draw_terminal_wash(&mut self, corners: [Rgba; 4], x: f32, y: f32, w: f32, h: f32) {
         self.fill_rect_gradient(x, y, w, h, corners);
     }
