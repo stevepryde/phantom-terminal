@@ -1512,6 +1512,14 @@ mod tests {
             .record_directory_visit(&root, 42)
             .unwrap();
         cfg.trusted_projects.push(trusted.clone());
+        let spdeploy_trust = crate::TrustedSpdeployProject {
+            root: "/project".to_string(),
+            sources: vec![crate::TrustedSpdeploySource {
+                relative_path: "deploy.yml".to_string(),
+                source: "name: Project\noperation:\n  deploy:\n    stage: []\n".to_string(),
+            }],
+        };
+        cfg.trusted_spdeploy_projects.push(spdeploy_trust.clone());
 
         store.save_config(&cfg).unwrap();
         let loaded = store.load_config().unwrap();
@@ -1552,6 +1560,7 @@ mod tests {
                 .section_collapsed
         );
         assert_eq!(loaded.trusted_projects, [trusted]);
+        assert_eq!(loaded.trusted_spdeploy_projects, [spdeploy_trust]);
     }
 
     #[test]

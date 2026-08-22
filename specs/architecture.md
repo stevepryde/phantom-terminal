@@ -66,7 +66,8 @@ flow can authorize execution.
 - A disabled plugin performs no discovery and renders no section.
 - An idle contextual sidebar does not capture terminal keyboard input.
 - Context task tabs are not restored as executable tasks after restart.
-- Spdeploy discovery reads bounded `deploy.yml` sources directly and extracts
-  only names, descriptions, and single-stage submenu paths. It never invokes a
-  discovery process. Explicit execution still uses the fixed spdeploy
-  executable/flag shape after rechecking every parsed config source.
+- Spdeploy discovery descriptor-safely reads the bounded, sorted, root-relative
+  full transitive graph of typed nested deploy configs. Operations remain inert
+  until that exact graph and canonical root are stored as trusted. Dispatch
+  rechecks persisted trust and rereads the graph before using the fixed
+  spdeploy executable/flag shape; discovery never invokes a process.

@@ -479,6 +479,7 @@ struct ContextDiscoveryRequest {
     cwd: PathBuf,
     config: phantom_core::ContextActionsConfig,
     trusted_projects: Vec<phantom_core::TrustedProject>,
+    trusted_spdeploy_projects: Vec<phantom_core::TrustedSpdeployProject>,
 }
 
 fn spawn_context_discovery_worker(
@@ -495,8 +496,12 @@ fn spawn_context_discovery_worker(
                 while let Ok(newer) = rx.try_recv() {
                     request = newer;
                 }
-                let snapshot =
-                    discover_context(&request.cwd, &request.config, &request.trusted_projects);
+                let snapshot = discover_context(
+                    &request.cwd,
+                    &request.config,
+                    &request.trusted_projects,
+                    &request.trusted_spdeploy_projects,
+                );
                 if !outbox.send(AppEvent::ContextDiscovered {
                     generation: request.generation,
                     snapshot: Box::new(snapshot),
@@ -1681,6 +1686,7 @@ impl App {
             cwd: cwd.clone(),
             config: self.config.context_actions.clone(),
             trusted_projects: self.config.trusted_projects.clone(),
+            trusted_spdeploy_projects: self.config.trusted_spdeploy_projects.clone(),
         };
         if self.context_discovery_tx.send(request).is_err() {
             self.context_snapshot = ContextSnapshot::empty(cwd);
@@ -1694,7 +1700,9 @@ impl App {
             | ContextRequest::EditManifest { .. }
             | ContextRequest::OpenManifestAll { .. }
             | ContextRequest::OpenManifestTab { .. } => context_actions::MANIFEST_PROVIDER_ID,
-            ContextRequest::RunSpdeploy { .. } => context_actions::SPDEPLOY_PROVIDER_ID,
+            ContextRequest::RunSpdeploy { .. } | ContextRequest::TrustSpdeploy { .. } => {
+                context_actions::SPDEPLOY_PROVIDER_ID
+            }
             ContextRequest::OpenDirectory { .. } => phantom_core::RECENT_DIRECTORIES_PLUGIN_ID,
         };
         if !self.config.context_actions.enabled
@@ -1729,6 +1737,7 @@ impl App {
                 config_path,
                 operation,
             } => self.run_spdeploy_context_action(config_path, operation),
+            ContextRequest::TrustSpdeploy { root, sources } => self.trust_spdeploy(root, sources),
             ContextRequest::OpenDirectory { path } => self.open_context_directory(path),
         }
     }
@@ -1994,6 +2003,56 @@ impl App {
         self.run_spdeploy_context_action_with_resolver(config_path, operation, resolve_program);
     }
 
+    fn trust_spdeploy(&mut self, root: PathBuf, sources: Vec<phantom_core::TrustedSpdeploySource>) {
+        let active_cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| Path::new(&tab.cwd).canonicalize().ok());
+        let canonical_root = root.canonicalize().ok();
+        if active_cwd.is_none() || active_cwd != canonical_root {
+            self.show_notice("The active tab has left this spdeploy project");
+            self.schedule_context_discovery();
+            return;
+        }
+        let graph = match phantom_core::load_spdeploy_graph(&root) {
+            Ok(Some(graph)) if graph.sources == sources => graph,
+            Ok(_) => {
+                self.show_notice("spdeploy configuration changed; review it again");
+                self.schedule_context_discovery();
+                return;
+            }
+            Err(error) => {
+                self.show_notice(format!("Could not trust spdeploy operations: {error}"));
+                self.schedule_context_discovery();
+                return;
+            }
+        };
+        let trusted = match phantom_core::trust_spdeploy_graph(&graph) {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                self.show_notice(format!("Could not trust spdeploy operations: {error}"));
+                return;
+            }
+        };
+        let mut candidate = self.config.clone();
+        if let Some(existing) = candidate
+            .trusted_spdeploy_projects
+            .iter_mut()
+            .find(|project| project.root == trusted.root)
+        {
+            *existing = trusted;
+        } else {
+            candidate.trusted_spdeploy_projects.push(trusted);
+        }
+        if let Err(error) = candidate.validate() {
+            self.show_notice(format!("Could not store spdeploy trust: {error}"));
+            return;
+        }
+        self.config = candidate;
+        self.mark_config_dirty();
+        self.schedule_context_discovery();
+    }
+
     fn run_spdeploy_context_action_with_resolver(
         &mut self,
         config_path: PathBuf,
@@ -2017,23 +2076,30 @@ impl App {
                 .iter()
                 .find_map(|section| match &section.content {
                     context_actions::ContextSectionContent::Spdeploy(spdeploy)
-                        if spdeploy.operations.iter().any(|item| {
-                            item.config_path == config_path && item.name == operation
-                        }) =>
+                        if spdeploy.trust == context_actions::SpdeployTrustState::Trusted
+                            && spdeploy.operations.iter().any(|item| {
+                                item.config_path == config_path && item.name == operation
+                            }) =>
                     {
                         Some(spdeploy)
                     }
                     _ => None,
                 });
-        if let Some(section) = listed_section {
-            if let Err(error) = context_actions::verify_spdeploy_sources(section) {
-                self.show_notice(format!("spdeploy configuration changed: {error}"));
-                self.schedule_context_discovery();
-                return;
-            }
+        let Some(listed_section) = listed_section else {
+            self.show_notice("The selected spdeploy action is stale or invalid");
+            self.schedule_context_discovery();
+            return;
+        };
+        let stored_trust = self.config.trusted_spdeploy_projects.iter().any(|project| {
+            Path::new(&project.root) == listed_section.root
+                && project.sources == listed_section.config_sources
+        });
+        if !stored_trust {
+            self.show_notice("spdeploy operations are not trusted");
+            self.schedule_context_discovery();
+            return;
         }
-        let valid = listed_section.is_some()
-            && self.context_snapshot.cwd == active_cwd
+        let valid = self.context_snapshot.cwd == active_cwd
             && config_path.starts_with(&active_cwd)
             && !operation.is_empty()
             && operation.len() <= 256
@@ -2043,14 +2109,6 @@ impl App {
             self.schedule_context_discovery();
             return;
         }
-        // spdeploy currently accepts only a pathname and resolves every stage
-        // path relative to that config's real parent. Moving the validated
-        // bytes to a private snapshot would change those semantics. The
-        // descriptor-safe verification above rejects symlinks, growth, and
-        // stale bytes, but any actor allowed to mutate the file or one of its
-        // parent directories can still replace it between this check and
-        // spdeploy reopening it. Closing that final gap requires an inherited-
-        // FD/config-bundle interface in spdeploy.
         let startup = match spdeploy_startup_command(&config_path, &operation, resolver) {
             Ok(startup) => startup,
             Err(error) => {
@@ -2058,6 +2116,39 @@ impl App {
                 return;
             }
         };
+        let current_active_cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| Path::new(&tab.cwd).canonicalize().ok());
+        let still_trusted = self.config.trusted_spdeploy_projects.iter().any(|project| {
+            Path::new(&project.root) == listed_section.root
+                && project.sources == listed_section.config_sources
+        });
+        let still_listed = listed_section
+            .operations
+            .iter()
+            .any(|item| item.config_path == config_path && item.name == operation);
+        if current_active_cwd.as_ref() != Some(&listed_section.root)
+            || !still_trusted
+            || !still_listed
+        {
+            self.show_notice("The selected spdeploy action is stale or invalid");
+            self.schedule_context_discovery();
+            return;
+        }
+        if let Err(error) = context_actions::verify_spdeploy_sources(listed_section) {
+            self.show_notice(format!("spdeploy configuration changed: {error}"));
+            self.schedule_context_discovery();
+            return;
+        }
+        // spdeploy currently accepts only a pathname and resolves every stage
+        // path relative to that config's real parent. Moving the validated
+        // bytes to a private snapshot would change those semantics. The final
+        // descriptor-safe verification follows executable resolution and
+        // rejects symlinks, growth, and stale bytes, but any actor allowed to
+        // mutate the file or one of its parent directories can still replace
+        // it between this check and spdeploy reopening it. Closing that final
+        // gap requires an inherited-FD/config-bundle interface in spdeploy.
         self.spawn_new_tab(NewTabRequest {
             profile_id: None,
             cwd: config_path
@@ -3752,13 +3843,17 @@ fn spdeploy_startup_command(
             "resolved spdeploy program is not an absolute path".to_string(),
         ));
     }
+    let config_path = config_path.to_str().ok_or_else(|| {
+        phantom_core::AppError::InvalidConfig(
+            "spdeploy config path must be valid UTF-8".to_string(),
+        )
+    })?;
     Ok(StartupCommand {
         program,
         args: vec![
             "--config".to_string(),
-            config_path.to_string_lossy().into_owned(),
-            "--operation".to_string(),
-            operation.to_string(),
+            config_path.to_string(),
+            format!("--operation={operation}"),
         ],
         env: Default::default(),
     })
@@ -5378,7 +5473,7 @@ mod tests {
         assert!(Path::new(&startup.program).is_absolute());
         assert_eq!(
             startup.args,
-            ["--config", "/project/deploy.yml", "--operation", "deploy"]
+            ["--config", "/project/deploy.yml", "--operation=deploy"]
         );
         assert!(!startup.args.iter().any(|arg| arg == "--no-ui"));
         assert!(!startup.args.iter().any(|arg| arg == "--yes"));
@@ -5394,6 +5489,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid config: resolved spdeploy program is not an absolute path"
+        );
+    }
+
+    #[test]
+    fn sidebar_spdeploy_preserves_leading_dash_operation_as_one_argument() {
+        let startup =
+            spdeploy_startup_command(Path::new("/project/deploy.yml"), "--emergency", |_| {
+                Ok("/trusted/bin/spdeploy".to_string())
+            })
+            .unwrap();
+
+        assert_eq!(
+            startup.args,
+            ["--config", "/project/deploy.yml", "--operation=--emergency"]
         );
     }
 
@@ -5416,7 +5525,11 @@ mod tests {
         )
         .unwrap();
         let root = temp.canonicalize().unwrap();
-        let section = context_actions::discover_spdeploy(&root).unwrap();
+        let graph = phantom_core::load_spdeploy_graph(&root).unwrap().unwrap();
+        let trusted = phantom_core::trust_spdeploy_graph(&graph).unwrap();
+        let section =
+            context_actions::discover_spdeploy_with_trust(&root, std::slice::from_ref(&trusted))
+                .unwrap();
         let context_actions::ContextSectionContent::Spdeploy(spdeploy) = &section.content else {
             panic!("expected spdeploy section");
         };
@@ -5434,6 +5547,7 @@ mod tests {
             cwd: root,
             sections: vec![section],
         };
+        app.config.trusted_spdeploy_projects.push(trusted);
 
         app.run_spdeploy_context_action_with_resolver(config_path, "deploy".to_string(), |_| {
             Err(phantom_core::AppError::Pty(
@@ -5448,6 +5562,128 @@ mod tests {
                 "Could not resolve spdeploy: pty error: program 'spdeploy' was not found in the normalized PATH"
             )
         );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn untrusted_spdeploy_request_is_inert_before_program_resolution() {
+        use std::fs;
+
+        let temp =
+            std::env::temp_dir().join(format!("phantom-spdeploy-untrusted-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(
+            temp.join("deploy.yml"),
+            "name: Test\noperation:\n  deploy:\n    stage: []\n",
+        )
+        .unwrap();
+        let root = temp.canonicalize().unwrap();
+        let section = context_actions::discover_spdeploy(&root).unwrap();
+        let context_actions::ContextSectionContent::Spdeploy(spdeploy) = &section.content else {
+            panic!("expected spdeploy section");
+        };
+        let config_path = spdeploy.operations[0].config_path.clone();
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            root.to_string_lossy().into_owned(),
+            None,
+        ));
+        app.context_snapshot = ContextSnapshot {
+            cwd: root,
+            sections: vec![section],
+        };
+        app.run_spdeploy_context_action_with_resolver(config_path, "deploy".to_string(), |_| {
+            panic!("untrusted dispatch must not resolve an executable")
+        });
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(
+            app.notice_text(),
+            Some("The selected spdeploy action is stale or invalid")
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn changed_spdeploy_source_cannot_be_trusted_from_a_stale_review() {
+        use std::fs;
+
+        let temp = std::env::temp_dir().join(format!(
+            "phantom-spdeploy-stale-trust-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("deploy.yml");
+        fs::write(&path, "name: Test\noperation:\n  deploy:\n    stage: []\n").unwrap();
+        let root = temp.canonicalize().unwrap();
+        let graph = phantom_core::load_spdeploy_graph(&root).unwrap().unwrap();
+        fs::write(&path, "name: Test\noperation:\n  changed:\n    stage: []\n").unwrap();
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            root.to_string_lossy().into_owned(),
+            None,
+        ));
+
+        app.trust_spdeploy(root, graph.sources);
+
+        assert!(app.config.trusted_spdeploy_projects.is_empty());
+        assert_eq!(
+            app.notice_text(),
+            Some("spdeploy configuration changed; review it again")
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn changed_trusted_spdeploy_source_blocks_dispatch_after_resolution() {
+        use std::fs;
+
+        let temp =
+            std::env::temp_dir().join(format!("phantom-spdeploy-stale-run-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("deploy.yml");
+        fs::write(&path, "name: Test\noperation:\n  deploy:\n    stage: []\n").unwrap();
+        let root = temp.canonicalize().unwrap();
+        let graph = phantom_core::load_spdeploy_graph(&root).unwrap().unwrap();
+        let trusted = phantom_core::trust_spdeploy_graph(&graph).unwrap();
+        let section =
+            context_actions::discover_spdeploy_with_trust(&root, std::slice::from_ref(&trusted))
+                .unwrap();
+        let context_actions::ContextSectionContent::Spdeploy(spdeploy) = &section.content else {
+            panic!("expected spdeploy section");
+        };
+        let config_path = spdeploy.operations[0].config_path.clone();
+        fs::write(&path, "name: Test\noperation:\n  changed:\n    stage: []\n").unwrap();
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            root.to_string_lossy().into_owned(),
+            None,
+        ));
+        app.context_snapshot = ContextSnapshot {
+            cwd: root,
+            sections: vec![section],
+        };
+        app.config.trusted_spdeploy_projects.push(trusted);
+
+        let resolved = std::cell::Cell::new(false);
+        app.run_spdeploy_context_action_with_resolver(config_path, "deploy".to_string(), |_| {
+            resolved.set(true);
+            Ok("/trusted/bin/spdeploy".to_string())
+        });
+
+        assert_eq!(app.tabs.len(), 1);
+        assert!(resolved.get());
+        assert!(app
+            .notice_text()
+            .is_some_and(|notice| notice.contains("configuration changed")));
         let _ = fs::remove_dir_all(temp);
     }
 

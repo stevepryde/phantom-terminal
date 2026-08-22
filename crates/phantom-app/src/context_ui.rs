@@ -18,7 +18,7 @@ use phantom_core::{
 use crate::context_actions::{
     ContextRequest, ContextSection, ContextSectionContent, ContextSnapshot,
     FrequentCommandsSection, ManifestSection, ManifestTab, ManifestTrustState,
-    RecentDirectoriesSection, SpdeploySection,
+    RecentDirectoriesSection, SpdeploySection, SpdeployTrustState,
 };
 use crate::ui_components::{with_alpha, CustomDropdown, DIVIDER, SIDEBAR_SURFACE};
 
@@ -507,6 +507,10 @@ impl ContextUi {
             return None;
         }
 
+        if spdeploy.trust == SpdeployTrustState::NeedsTrust {
+            return section_body(ui, |ui| draw_spdeploy_review(ui, spdeploy));
+        }
+
         let selected = self
             .selections
             .entry(section_id.to_string())
@@ -542,6 +546,30 @@ impl ContextUi {
             operation: operation.name.clone(),
         })
     }
+}
+
+fn draw_spdeploy_review(ui: &mut Ui, spdeploy: &SpdeploySection) -> Option<ContextRequest> {
+    ui.spacing_mut().item_spacing.y = 2.0;
+    ui.colored_label(WARNING_TEXT_COLOR, "Review before trusting:");
+    for operation in &spdeploy.operations {
+        let mut name = operation.breadcrumbs.join(" › ");
+        if !name.is_empty() {
+            name.push_str(" › ");
+        }
+        name.push_str(&operation.name);
+        if let Some(description) = &operation.description {
+            name.push_str(": ");
+            name.push_str(description);
+        }
+        ui.label(RichText::new(name).size(11.0));
+    }
+    ui.add_space(2.0);
+    ui.button("Trust deploy operations")
+        .clicked()
+        .then(|| ContextRequest::TrustSpdeploy {
+            root: spdeploy.root.clone(),
+            sources: spdeploy.config_sources.clone(),
+        })
 }
 
 fn draw_manifest(ui: &mut Ui, manifest: &ManifestSection) -> Option<ContextRequest> {
@@ -1273,13 +1301,16 @@ mod tests {
                     id: SPDEPLOY_PLUGIN_ID.to_string(),
                     title: "spdeploy".to_string(),
                     content: ContextSectionContent::Spdeploy(SpdeploySection {
+                        root: "/projects/soulfire".into(),
                         config_path: "/projects/soulfire/deploy.yml".into(),
                         project_name: "Soulfire".to_string(),
+                        trust: SpdeployTrustState::Trusted,
                         operations: vec![SpdeployOperation {
                             name: "deploy".to_string(),
                             breadcrumbs: Vec::new(),
                             description: Some("Deploy Soulfire".to_string()),
                             config_path: "/projects/soulfire/deploy.yml".into(),
+                            config_relative_path: "deploy.yml".to_string(),
                         }],
                         config_sources: Vec::new(),
                     }),
@@ -1550,6 +1581,30 @@ mod tests {
 
         let _ = ctx.run_ui(input, |ui| {
             request = draw_manifest_review(ui, manifest);
+        });
+
+        assert!(request.is_none());
+    }
+
+    #[test]
+    fn untrusted_spdeploy_review_is_inert_without_explicit_click() {
+        let ctx = Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut snapshot = snapshot();
+        let ContextSectionContent::Spdeploy(spdeploy) = &mut snapshot.sections[1].content else {
+            panic!("expected spdeploy section");
+        };
+        spdeploy.trust = SpdeployTrustState::NeedsTrust;
+        let mut request = None;
+
+        let _ = ctx.run_ui(input, |ui| {
+            request = draw_spdeploy_review(ui, spdeploy);
         });
 
         assert!(request.is_none());
@@ -2087,20 +2142,24 @@ mod tests {
     #[test]
     fn spdeploy_breadcrumbs_are_non_selectable_group_headings() {
         let section = SpdeploySection {
+            root: "/projects/soulfire".into(),
             config_path: "/projects/soulfire/deploy.yml".into(),
             project_name: "Soulfire".to_string(),
+            trust: SpdeployTrustState::Trusted,
             operations: vec![
                 SpdeployOperation {
                     name: "release".to_string(),
                     breadcrumbs: vec!["api".to_string()],
                     description: Some("Release the API".to_string()),
                     config_path: "/projects/soulfire/api.yml".into(),
+                    config_relative_path: "api.yml".to_string(),
                 },
                 SpdeployOperation {
                     name: "release".to_string(),
                     breadcrumbs: vec!["ui".to_string()],
                     description: Some("Release the UI".to_string()),
                     config_path: "/projects/soulfire/ui.yml".into(),
+                    config_relative_path: "ui.yml".to_string(),
                 },
             ],
             config_sources: Vec::new(),

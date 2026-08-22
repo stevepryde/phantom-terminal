@@ -27,10 +27,10 @@ validated-execution posture.
 - **CTX-007 (confirmed):** Settings must include Context Actions controls for
   globally enabling the feature and independently enabling built-in plugins.
 - **CTX-008 (confirmed):** A built-in spdeploy plugin must detect `deploy.yml`
-  in the exact active directory, internally parse only the project name,
-  operation names/descriptions, and single-stage submenu paths needed to build
-  the dropdown, and launch the selected operation in a new tab only after
-  explicit user action. The visible terminal tab must retain spdeploy's TTY UI,
+  in the exact active directory and keep its operations inert until the user
+  reviews and trusts the canonical root plus exact bounded source of the full
+  statically reachable typed deploy-config graph. Any source-graph change
+  invalidates trust. The visible terminal tab must retain spdeploy's TTY UI,
   including colors and compact scrolling output; Phantom must select the
   operation with structured `--config`/`--operation` arguments but must not pass
   `--no-ui` or `--yes`. Discovery must not require or invoke the spdeploy CLI.
@@ -180,9 +180,11 @@ a shell command string. Omitting `run` opens the default validated shell.
   trust.
 - **AC-CTX-D:** Collapse the panel and each section, restart, and observe the
   same states. Disabled plugins remain undiscovered and hidden.
-- **AC-CTX-E:** A `deploy.yml` fixture produces structured operations; selecting
-  one launches fixed spdeploy argv without `--no-ui` or `--yes`, preserves the
-  interactive TTY presentation, and does not bypass spdeploy confirmations.
+- **AC-CTX-E:** A `deploy.yml` fixture first presents every operation for an
+  explicit trust decision. After trust, selecting one launches fixed spdeploy
+  argv without `--no-ui` or `--yes`, preserves the interactive TTY presentation,
+  and does not bypass spdeploy confirmations. A root or transitive source change
+  disables launch until the new graph is reviewed and trusted.
 - **AC-CTX-F:** Malformed, oversized, traversing, symlink-escaping, unknown-key,
   or unsupported-version manifests produce a bounded local error and no launch.
 - **AC-CTX-G:** Typing into the terminal while an idle contextual panel is
