@@ -58,8 +58,8 @@ use phantom_core::{
 };
 use phantom_emu::{
     encode_key, encode_mouse_legacy, encode_mouse_sgr, AlacrittyCore, CursorShape, Key,
-    MouseProtocol, ScrollState, SearchMatch, SearchOptions, SearchOutcome, SelSide, SelectionKind,
-    VtCore,
+    MouseProtocol, ScrollState, SearchMatch, SearchOptions, SearchOutcome, SearchRange, SelSide,
+    SelectionKind, VtCore,
 };
 use phantom_gfx::Renderer;
 use tab::Tab;
@@ -617,6 +617,10 @@ pub struct App {
     ui: UiState,
     find_matches: Vec<SearchMatch>,
     find_active: usize,
+    /// Selection range captured when the current find interaction opened.
+    /// It follows Alacritty's rotation while the original selection survives;
+    /// once detached, a coordinate-changing terminal mutation expires it.
+    find_selection_scope: Option<SearchRange>,
     /// True when the last search stopped at the emulator's match cap.
     find_capped: bool,
     /// Coalesces PTY-driven find refreshes: a full-history search per PTY
@@ -721,6 +725,7 @@ impl App {
             ui,
             find_matches: Vec::new(),
             find_active: 0,
+            find_selection_scope: None,
             find_capped: false,
             find_refresh_deadline: None,
             notice: None,
@@ -814,12 +819,18 @@ impl App {
                     .tabs
                     .get(self.active)
                     .is_some_and(|active| active.id == tab);
+                let tracks_live_selection = active_tab
+                    && !bytes.is_empty()
+                    && self.find_selection_scope_tracks_live_selection();
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.advance_pty(&bytes);
                     let out = t.core.take_pty_output();
                     if !out.is_empty() {
                         response = Some((t.pty_id, out));
                     }
+                }
+                if active_tab && !bytes.is_empty() && self.ui.find_open() {
+                    self.sync_find_selection_scope_after_terminal_change(tracks_live_selection);
                 }
                 if let Some((pty_id, out)) = response {
                     if let Err(error) = self.pty.write_reply(pty_id, &out) {
@@ -951,11 +962,11 @@ impl App {
             return;
         }
         self.rename = None;
-        let selection_available = self
+        self.find_selection_scope = self
             .tabs
             .get(self.active)
-            .and_then(|tab| tab.core.selection_range())
-            .is_some();
+            .and_then(|tab| tab.core.selection_range());
+        let selection_available = self.find_selection_scope.is_some();
         self.find_matches.clear();
         self.find_active = 0;
         self.ui.open_find(selection_available);
@@ -970,6 +981,7 @@ impl App {
         self.ui.close_find();
         self.find_matches.clear();
         self.find_active = 0;
+        self.find_selection_scope = None;
         self.find_capped = false;
         self.request_redraw();
     }
@@ -994,6 +1006,40 @@ impl App {
         self.ui.find_open() && !self.palette.open && !self.ui.panel_open()
     }
 
+    fn expire_find_selection_scope(&mut self) {
+        if self.find_selection_scope.take().is_some() {
+            self.ui.expire_find_selection();
+        }
+    }
+
+    fn find_selection_scope_tracks_live_selection(&self) -> bool {
+        self.find_selection_scope.is_some_and(|scope| {
+            self.tabs
+                .get(self.active)
+                .and_then(|tab| tab.core.selection_range())
+                == Some(scope)
+        })
+    }
+
+    fn sync_find_selection_scope_after_terminal_change(&mut self, tracked_live_selection: bool) {
+        if self.find_selection_scope.is_none() {
+            return;
+        }
+        if tracked_live_selection {
+            if let Some(range) = self
+                .tabs
+                .get(self.active)
+                .and_then(|tab| tab.core.selection_range())
+            {
+                self.find_selection_scope = Some(range);
+                return;
+            }
+        }
+        // The user replaced the ordinary selection, or history rotation
+        // discarded it, so there is no longer a trustworthy coordinate remap.
+        self.expire_find_selection_scope();
+    }
+
     fn refresh_find(&mut self) {
         // A completed refresh supersedes any scheduled debounced one.
         self.find_refresh_deadline = None;
@@ -1003,15 +1049,10 @@ impl App {
         let state = self.ui.find_state();
         let query = state.query().to_owned();
         let options = state.options();
-        // Alacritty keeps its live selection coordinates synchronized as
-        // history rotates. Re-read that range on every refresh instead of
-        // searching a stale copied coordinate after new PTY output.
-        let scope = options.selection_only.then(|| {
-            self.tabs
-                .get(self.active)
-                .and_then(|tab| tab.core.selection_range())
-        });
-        let scope = scope.flatten();
+        let scope = options
+            .selection_only
+            .then_some(self.find_selection_scope)
+            .flatten();
         let result = if options.selection_only && scope.is_none() {
             Ok(SearchOutcome::default())
         } else {
@@ -3038,6 +3079,7 @@ impl App {
     }
 
     fn apply_terminal_grid(&mut self, rows: u16, cols: u16) {
+        let tracks_live_selection = self.find_selection_scope_tracks_live_selection();
         let pty = &self.pty;
         let failures = apply_terminal_grid_to_tabs(&mut self.tabs, rows, cols, |pty_id| {
             pty.resize(pty_id, rows, cols)
@@ -3065,6 +3107,12 @@ impl App {
                     failures.len()
                 )
             });
+        }
+        if self.ui.find_open() {
+            // Reflow can invalidate both line and column coordinates. Follow
+            // Alacritty's remapped ordinary selection while it is still the
+            // captured one; otherwise expire the detached scope.
+            self.sync_find_selection_scope_after_terminal_change(tracks_live_selection);
         }
         if self.ui.find_open() {
             self.refresh_find();
@@ -4372,6 +4420,100 @@ mod tests {
         assert!(app.find_open());
         app.switch_tab(1);
         assert!(!app.find_open());
+    }
+
+    #[test]
+    fn selection_only_find_keeps_the_scope_captured_on_open() {
+        let mut app = test_app();
+        let mut tab = Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        );
+        tab.advance_pty(b"target gap target");
+        tab.core.selection_start(0, 0, SelSide::Left);
+        tab.core.selection_update(0, 5, SelSide::Right);
+        let captured = tab.core.selection_range().unwrap();
+        let expected = tab
+            .core
+            .search_scrollback("target", SearchOptions::default(), Some(captured))
+            .unwrap()
+            .matches;
+        app.tabs.push(tab);
+
+        app.open_find();
+        app.ui.configure_find_for_tests("target", true);
+        app.refresh_find();
+        assert_eq!(app.find_selection_scope, Some(captured));
+        assert_eq!(app.find_matches, expected);
+
+        // Replacing the ordinary selection during the same interaction must
+        // not retarget selection-only search.
+        app.tabs[0].core.selection_start(0, 11, SelSide::Left);
+        app.tabs[0].core.selection_update(0, 16, SelSide::Right);
+        let replacement = app.tabs[0].core.selection_range().unwrap();
+        assert_ne!(replacement, captured);
+        app.refresh_find();
+        assert_eq!(app.find_selection_scope, Some(captured));
+        assert_eq!(app.find_matches, expected);
+        assert_eq!(app.tabs[0].core.selection_range(), Some(replacement));
+
+        // PTY output can rotate absolute buffer coordinates, so the captured
+        // range expires instead of falling back to the replacement selection.
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 0,
+            bytes: b"!".to_vec(),
+        });
+        assert_eq!(app.find_selection_scope, None);
+        assert!(!app.ui.find_state().selection_available());
+        app.refresh_find();
+        assert!(app.find_matches.is_empty());
+        assert_eq!(app.tabs[0].core.selection_range(), Some(replacement));
+
+        app.close_find();
+        assert_eq!(app.find_selection_scope, None);
+        assert_eq!(app.tabs[0].core.selection_range(), Some(replacement));
+    }
+
+    #[test]
+    fn captured_find_scope_tracks_rotation_until_the_original_selection_expires() {
+        let mut app = test_app();
+        let mut tab = Tab::new(
+            0,
+            AlacrittyCore::new(2, 20, 2, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        );
+        tab.advance_pty(b"target");
+        tab.core.selection_start(0, 0, SelSide::Left);
+        tab.core.selection_update(0, 5, SelSide::Right);
+        let captured = tab.core.selection_range().unwrap();
+        app.tabs.push(tab);
+        app.open_find();
+        app.ui.configure_find_for_tests("target", true);
+
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 0,
+            bytes: b"\r\none\r\ntwo".to_vec(),
+        });
+        let rotated = app.tabs[0].core.selection_range().unwrap();
+        assert_ne!(rotated, captured);
+        assert_eq!(app.find_selection_scope, Some(rotated));
+        app.refresh_find();
+        assert_eq!(app.find_matches.len(), 1);
+
+        app.on_pty_event(AppEvent::PtyBytes {
+            tab: 0,
+            bytes: b"\r\nthree\r\nfour\r\nfive".to_vec(),
+        });
+        assert!(app.tabs[0].core.selection_range().is_none());
+        assert_eq!(app.find_selection_scope, None);
+        assert!(!app.ui.find_state().selection_available());
+        app.refresh_find();
+        assert!(app.find_matches.is_empty());
     }
 
     #[test]

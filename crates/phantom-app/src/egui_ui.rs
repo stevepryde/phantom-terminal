@@ -250,6 +250,15 @@ impl UiState {
         self.find.request_focus();
     }
 
+    pub fn expire_find_selection(&mut self) {
+        self.find.expire_selection();
+    }
+
+    #[cfg(test)]
+    pub fn configure_find_for_tests(&mut self, query: &str, selection_only: bool) {
+        self.find.configure_for_tests(query, selection_only);
+    }
+
     pub fn find_state(&self) -> &FindState {
         &self.find
     }

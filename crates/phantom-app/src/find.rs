@@ -70,6 +70,7 @@ pub(crate) struct FindState {
     options: FindOptions,
     results: FindResultSummary,
     selection_available: bool,
+    selection_expired: bool,
     focus_requested: bool,
     select_query_requested: bool,
 }
@@ -78,6 +79,7 @@ impl FindState {
     pub fn open(&mut self, selection_available: bool) {
         self.open = true;
         self.selection_available = selection_available;
+        self.selection_expired = false;
         if !selection_available {
             self.options.selection_only = false;
         }
@@ -109,6 +111,17 @@ impl FindState {
 
     pub fn options(&self) -> FindOptions {
         self.options
+    }
+
+    pub fn expire_selection(&mut self) {
+        self.selection_available = false;
+        self.selection_expired = true;
+    }
+
+    #[cfg(test)]
+    pub fn configure_for_tests(&mut self, query: &str, selection_only: bool) {
+        self.query = query.to_owned();
+        self.options.selection_only = selection_only;
     }
 
     #[cfg(test)]
@@ -276,6 +289,8 @@ impl FindState {
         );
         let selection_tooltip = if self.selection_available {
             "Selection only"
+        } else if self.selection_expired {
+            "Selection only (captured selection expired after a terminal change)"
         } else {
             "Selection only (no selection was captured when Find opened)"
         };
