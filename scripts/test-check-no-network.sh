@@ -54,13 +54,18 @@ expect_failure() {
   fi
 }
 
+echo "==> repository's reviewed AccessKit graph passes"
+"$gate"
+
 echo "==> harmless address types, comments, and strings pass"
 clean="$scratch/clean"
 new_fixture "$clean"
 printf '%s\n' \
   'pub const EXAMPLE: &str = "std::net::TcpStream::connect";' \
   '// std::net::UdpSocket::bind is forbidden in executable code.' \
+  'use libc::{openat, O_CLOEXEC};' \
   'pub fn local_address(port: u16) -> std::net::SocketAddr {' \
+  '    let _ = (openat, O_CLOEXEC);' \
   '    std::net::SocketAddr::from(([127, 0, 0, 1], port))' \
   '}' >"$clean/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$clean/Cargo.toml"
@@ -117,7 +122,7 @@ printf '%s\n' \
   'helper = { package = "innocent-wrapper", path = "../../../dependencies/innocent-wrapper" }' \
   >"$unknown/crates/app/Cargo.toml"
 cargo generate-lockfile --offline --manifest-path "$unknown/Cargo.toml"
-expect_failure "$unknown" 'unreviewed direct dependency: phantom-core -> innocent-wrapper'
+expect_failure "$unknown" 'unreviewed direct dependency identity: phantom-core -> innocent-wrapper'
 
 echo "==> unauthorized transitive socket transport fails"
 transitive="$scratch/transitive"
@@ -146,7 +151,7 @@ printf '%s\n' \
 cargo generate-lockfile --offline --manifest-path "$transitive/Cargo.toml"
 expect_failure "$transitive" 'resolved socket transport: socket2'
 
-echo "==> approved AccessKit ancestry passes"
+echo "==> name-spoofed AccessKit ancestry fails identity checks"
 accesskit="$scratch/accesskit"
 new_fixture "$accesskit" phantom-app
 for package in egui-winit accesskit_winit accesskit_unix; do
@@ -170,7 +175,7 @@ printf '%s\n' '' '[dependencies]' \
   'async-io = { path = "../async-io" }' \
   >>"$scratch/dependencies/zbus/Cargo.toml"
 cargo generate-lockfile --offline --manifest-path "$accesskit/Cargo.toml"
-run_gate "$accesskit"
+expect_failure "$accesskit" 'unreviewed direct dependency identity:'
 
 echo "==> unauthorized zbus ancestry fails"
 unauthorized="$scratch/unauthorized-zbus"
@@ -190,6 +195,18 @@ printf '%s\n' \
   '}' >"$socket/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$socket/Cargo.toml"
 expect_failure "$socket" 'direct socket API:'
+
+echo "==> raw libc FFI socket declarations fail"
+raw_ffi="$scratch/raw-ffi"
+new_fixture "$raw_ffi"
+printf '%s\n' \
+  'unsafe extern "C" {' \
+  '    fn socket(domain: i32, kind: i32, protocol: i32) -> i32;' \
+  '}' \
+  'pub fn raw() { let _ = socket; }' \
+  >"$raw_ffi/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$raw_ffi/Cargo.toml"
+expect_failure "$raw_ffi" 'direct socket API:'
 
 echo "==> grouped and aliased libc socket imports fail"
 libc_alias="$scratch/libc-alias"
