@@ -2044,10 +2044,14 @@ impl App {
             return;
         }
         let requested = self.window_chrome();
-        if cfg!(target_os = "macos") {
-            self.show_notice("Window chrome change saved. Restart Phantom to apply it.");
-            return;
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = self.gpu.as_ref() {
+            if !apply_macos_window_chrome(&gpu.window, requested) {
+                self.show_notice("Window chrome change saved. Restart Phantom to apply it.");
+                return;
+            }
         }
+        #[cfg(not(target_os = "macos"))]
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.set_decorations(!requested.is_custom());
             gpu.window.set_transparent(requested.is_custom());
@@ -3778,6 +3782,42 @@ fn set_macos_window_movable(window: &Window, movable: bool) {
 }
 
 #[cfg(target_os = "macos")]
+fn apply_macos_window_chrome(window: &Window, window_chrome: chrome::WindowChrome) -> bool {
+    use objc2_app_kit::NSWindowTitleVisibility;
+
+    let Some(ns_window) = macos_ns_window(window) else {
+        return false;
+    };
+    let custom = window_chrome.is_custom();
+    let first_responder = ns_window.firstResponder();
+    ns_window.setStyleMask(macos_window_style_mask(ns_window.styleMask(), custom));
+    ns_window.setTitlebarAppearsTransparent(custom);
+    ns_window.setTitleVisibility(if custom {
+        NSWindowTitleVisibility::Hidden
+    } else {
+        NSWindowTitleVisibility::Visible
+    });
+    ns_window.setMovableByWindowBackground(false);
+    ns_window.setMovable(!custom);
+    let _ = ns_window.makeFirstResponder(first_responder.as_deref());
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_style_mask(
+    style_mask: objc2_app_kit::NSWindowStyleMask,
+    custom: bool,
+) -> objc2_app_kit::NSWindowStyleMask {
+    use objc2_app_kit::NSWindowStyleMask;
+
+    if custom {
+        style_mask | NSWindowStyleMask::FullSizeContentView
+    } else {
+        style_mask & !NSWindowStyleMask::FullSizeContentView
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn macos_ns_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
     use objc2_app_kit::NSView;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -4234,6 +4274,26 @@ mod tests {
                 remember_tabs: true,
             },
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_chrome_style_mask_toggles_only_full_size_content() {
+        use objc2_app_kit::NSWindowStyleMask;
+
+        let base = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::FullScreen;
+        let custom = macos_window_style_mask(base, true);
+        assert!(custom.contains(NSWindowStyleMask::FullSizeContentView));
+        assert_eq!(
+            custom & !NSWindowStyleMask::FullSizeContentView,
+            base,
+            "unrelated AppKit window behavior must be preserved"
+        );
+        assert_eq!(macos_window_style_mask(custom, false), base);
     }
 
     #[test]
