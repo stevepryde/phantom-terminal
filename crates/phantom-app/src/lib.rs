@@ -48,7 +48,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui_ui::{EguiLayer, UiFrameContext, UiState};
-use event::{AppInput, Mods};
+use event::{AppInput, AppMouseButton, Mods};
 use find::{FindError as FindUiError, FindNavigation, FindResultSummary};
 use find_worker::{FindResponse, FindWorker};
 use gpu::{GpuContext, PresentStatus};
@@ -529,8 +529,8 @@ impl PtySink for ProxySink {
 /// A mouse interaction to report to a mouse-aware application.
 #[derive(Clone, Copy)]
 enum MouseEvent {
-    Press,
-    Release,
+    Press(TerminalMouseButton),
+    Release(TerminalMouseButton),
     Drag,
     WheelUp,
     WheelDown,
@@ -557,6 +557,50 @@ fn mouse_up_action(
     }
 }
 
+#[derive(Clone, Copy)]
+enum TerminalMouseButton {
+    Left,
+    #[cfg(any(target_os = "linux", test))]
+    Middle,
+}
+
+impl TerminalMouseButton {
+    fn code(self) -> u8 {
+        match self {
+            Self::Left => 0,
+            #[cfg(any(target_os = "linux", test))]
+            Self::Middle => 1,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MiddleClickRoute {
+    Ignore,
+    MouseReport,
+    PrimaryPaste,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn middle_click_route(in_viewport: bool, mouse_reporting: bool, shift: bool) -> MiddleClickRoute {
+    if !in_viewport {
+        MiddleClickRoute::Ignore
+    } else if mouse_reporting && !shift {
+        MiddleClickRoute::MouseReport
+    } else {
+        MiddleClickRoute::PrimaryPaste
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn should_report_middle_mouse_release(
+    terminal_press_forwarded: bool,
+    mouse_reporting: bool,
+) -> bool {
+    terminal_press_forwarded && mouse_reporting
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WheelRoute {
     TabStrip,
@@ -573,6 +617,10 @@ enum ClipAction {
 trait ClipboardAccess {
     fn set_text(&mut self, text: String) -> Result<(), arboard::Error>;
     fn get_text(&mut self) -> Result<String, arboard::Error>;
+    #[cfg(target_os = "linux")]
+    fn set_primary_text(&mut self, text: String) -> Result<(), arboard::Error>;
+    #[cfg(target_os = "linux")]
+    fn get_primary_text(&mut self) -> Result<String, arboard::Error>;
 }
 
 impl ClipboardAccess for arboard::Clipboard {
@@ -582,6 +630,20 @@ impl ClipboardAccess for arboard::Clipboard {
 
     fn get_text(&mut self) -> Result<String, arboard::Error> {
         arboard::Clipboard::get_text(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_primary_text(&mut self, text: String) -> Result<(), arboard::Error> {
+        use arboard::{LinuxClipboardKind, SetExtLinux};
+
+        self.set().clipboard(LinuxClipboardKind::Primary).text(text)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_primary_text(&mut self) -> Result<String, arboard::Error> {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+
+        self.get().clipboard(LinuxClipboardKind::Primary).text()
     }
 }
 
@@ -644,6 +706,8 @@ pub struct App {
 
     clipboard: Option<Box<dyn ClipboardAccess>>,
     left_down: bool,
+    #[cfg(target_os = "linux")]
+    middle_report_down: bool,
     selecting: bool,
     last_click: Option<LastClick>,
     redraw_queued: bool,
@@ -773,6 +837,8 @@ impl App {
                 .ok()
                 .map(|clipboard| Box::new(clipboard) as Box<dyn ClipboardAccess>),
             left_down: false,
+            #[cfg(target_os = "linux")]
+            middle_report_down: false,
             selecting: false,
             last_click: None,
             redraw_queued: false,
@@ -863,15 +929,15 @@ impl App {
                 self.cursor_seen = true;
                 self.on_mouse_move();
             }
-            AppInput::MouseDown { x, y } => {
+            AppInput::MouseDown { x, y, button } => {
                 self.cursor_pos = (x, y);
                 self.cursor_seen = true;
-                self.on_mouse_down();
+                self.on_mouse_down(button);
             }
-            AppInput::MouseUp { x, y } => {
+            AppInput::MouseUp { x, y, button } => {
                 self.cursor_pos = (x, y);
                 self.cursor_seen = true;
-                self.on_mouse_up();
+                self.on_mouse_up(button);
             }
             AppInput::Wheel { lines } => self.on_scroll(lines),
             AppInput::Key { key, text, mods } => {
@@ -2694,16 +2760,22 @@ impl App {
             .then_some(chrome::terminal_scrollbar_hit_track(&layout))
     }
 
-    fn on_mouse_down(&mut self) {
+    fn on_mouse_down(&mut self, button: AppMouseButton) {
         let (px, py) = self.cursor_pos;
         #[cfg(target_os = "linux")]
-        if let Some(direction) = self.linux_window_resize_direction() {
-            if let Some(gpu) = self.gpu.as_ref() {
-                let _ = gpu.window.drag_resize_window(direction);
+        if button == AppMouseButton::Left {
+            if let Some(direction) = self.linux_window_resize_direction() {
+                if let Some(gpu) = self.gpu.as_ref() {
+                    let _ = gpu.window.drag_resize_window(direction);
+                }
+                return;
             }
-            return;
         }
         if self.palette.open {
+            return;
+        }
+        if button == AppMouseButton::Middle {
+            self.on_middle_mouse_down();
             return;
         }
         if let (Some(track), Some(scroll)) =
@@ -2764,7 +2836,8 @@ impl App {
             return;
         }
         if self.active_mouse_mode().reports() {
-            self.left_down = self.report_mouse(px, py, MouseEvent::Press);
+            self.left_down =
+                self.report_mouse(px, py, MouseEvent::Press(TerminalMouseButton::Left));
         } else if let Some((row, col, side)) = self.viewport_cell(px, py) {
             self.left_down = true;
             let click_count = self.terminal_click_count(row, col);
@@ -2802,8 +2875,12 @@ impl App {
         count
     }
 
-    fn on_mouse_up(&mut self) {
+    fn on_mouse_up(&mut self, button: AppMouseButton) {
         let (px, py) = self.cursor_pos;
+        if button == AppMouseButton::Middle {
+            self.on_middle_mouse_up();
+            return;
+        }
         if self.scroll_drag.take().is_some() {
             return;
         }
@@ -2822,10 +2899,44 @@ impl App {
             self.active_mouse_mode().reports(),
         ) {
             MouseUpAction::Ignore => {}
-            MouseUpAction::EndSelection => self.selecting = false,
-            MouseUpAction::Report => {
-                self.report_mouse(px, py, MouseEvent::Release);
+            MouseUpAction::EndSelection => {
+                self.selecting = false;
+                self.copy_selection_to_primary();
             }
+            MouseUpAction::Report => {
+                self.report_mouse(px, py, MouseEvent::Release(TerminalMouseButton::Left));
+            }
+        }
+    }
+
+    fn on_middle_mouse_down(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.middle_report_down = false;
+            let (px, py) = self.cursor_pos;
+            match middle_click_route(
+                self.point_in_viewport(px, py),
+                self.active_mouse_mode().reports(),
+                self.mods.shift,
+            ) {
+                MiddleClickRoute::Ignore => {}
+                MiddleClickRoute::MouseReport => {
+                    self.middle_report_down =
+                        self.report_mouse(px, py, MouseEvent::Press(TerminalMouseButton::Middle));
+                }
+                MiddleClickRoute::PrimaryPaste => self.paste_primary_selection(),
+            }
+        }
+    }
+
+    fn on_middle_mouse_up(&mut self) {
+        #[cfg(target_os = "linux")]
+        if should_report_middle_mouse_release(
+            std::mem::take(&mut self.middle_report_down),
+            self.active_mouse_mode().reports(),
+        ) {
+            let (px, py) = self.cursor_pos;
+            self.report_mouse(px, py, MouseEvent::Release(TerminalMouseButton::Middle));
         }
     }
 
@@ -3027,8 +3138,13 @@ impl App {
     fn input_starts_window_resize(&self, input: &AppInput) -> bool {
         #[cfg(target_os = "linux")]
         {
-            matches!(input, AppInput::MouseDown { .. })
-                && self.linux_window_resize_direction().is_some()
+            matches!(
+                input,
+                AppInput::MouseDown {
+                    button: AppMouseButton::Left,
+                    ..
+                }
+            ) && self.linux_window_resize_direction().is_some()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -3120,8 +3236,8 @@ impl App {
             return false;
         }
         let (base, pressed) = match event {
-            MouseEvent::Press => (0u8, true),
-            MouseEvent::Release => (0u8, false),
+            MouseEvent::Press(button) => (button.code(), true),
+            MouseEvent::Release(button) => (button.code(), false),
             MouseEvent::Drag => (32u8, true),
             MouseEvent::WheelUp => (64u8, true),
             MouseEvent::WheelDown => (65u8, true),
@@ -3163,6 +3279,25 @@ impl App {
         }
     }
 
+    fn copy_selection_to_primary(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(text) = self
+                .tabs
+                .get(self.active)
+                .and_then(|tab| tab.core.selection_text())
+            else {
+                return;
+            };
+            let Some(clipboard) = self.clipboard.as_mut() else {
+                return;
+            };
+            if let Err(error) = clipboard.set_primary_text(text) {
+                self.show_notice(format!("Could not copy primary selection: {error}"));
+            }
+        }
+    }
+
     fn paste_clipboard(&mut self) {
         let Some(clipboard) = self.clipboard.as_mut() else {
             self.show_notice("Clipboard is unavailable");
@@ -3179,6 +3314,30 @@ impl App {
                 return;
             }
         };
+        self.paste_text(text);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn paste_primary_selection(&mut self) {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            self.show_notice("Primary selection is unavailable");
+            return;
+        };
+        let text = match clipboard.get_primary_text() {
+            Ok(text) if !text.is_empty() => text,
+            Ok(_) => {
+                self.show_notice("Primary selection is empty");
+                return;
+            }
+            Err(error) => {
+                self.show_notice(format!("Could not paste primary selection: {error}"));
+                return;
+            }
+        };
+        self.paste_text(text);
+    }
+
+    fn paste_text(&mut self, text: String) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -3801,20 +3960,25 @@ fn translate(
             x: position.x as f32,
             y: position.y as f32,
         },
-        WindowEvent::MouseInput {
-            state,
-            button: MouseButton::Left,
-            ..
-        } => match state {
-            ElementState::Pressed => AppInput::MouseDown {
-                x: cursor.0,
-                y: cursor.1,
-            },
-            ElementState::Released => AppInput::MouseUp {
-                x: cursor.0,
-                y: cursor.1,
-            },
-        },
+        WindowEvent::MouseInput { state, button, .. } => {
+            let button = match button {
+                MouseButton::Left => AppMouseButton::Left,
+                MouseButton::Middle => AppMouseButton::Middle,
+                _ => return None,
+            };
+            match state {
+                ElementState::Pressed => AppInput::MouseDown {
+                    x: cursor.0,
+                    y: cursor.1,
+                    button,
+                },
+                ElementState::Released => AppInput::MouseUp {
+                    x: cursor.0,
+                    y: cursor.1,
+                    button,
+                },
+            }
+        }
         WindowEvent::MouseWheel { delta, .. } => {
             let lines = match delta {
                 MouseScrollDelta::LineDelta(_, y) => *y,
@@ -4633,6 +4797,16 @@ mod tests {
                 TestClipboardMode::WriteFailure => Ok("paste".to_string()),
             }
         }
+
+        #[cfg(target_os = "linux")]
+        fn set_primary_text(&mut self, text: String) -> Result<(), arboard::Error> {
+            self.set_text(text)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn get_primary_text(&mut self) -> Result<String, arboard::Error> {
+            self.get_text()
+        }
     }
 
     fn test_app() -> App {
@@ -4780,6 +4954,38 @@ mod tests {
         app.copy_selection();
 
         assert_eq!(app.notice_text(), None);
+    }
+
+    #[test]
+    fn middle_click_routes_only_grid_events_and_shift_overrides_mouse_reporting() {
+        assert_eq!(TerminalMouseButton::Middle.code(), 1);
+        assert_eq!(
+            middle_click_route(false, false, false),
+            MiddleClickRoute::Ignore
+        );
+        assert_eq!(
+            middle_click_route(false, true, false),
+            MiddleClickRoute::Ignore
+        );
+        assert_eq!(
+            middle_click_route(true, true, false),
+            MiddleClickRoute::MouseReport
+        );
+        assert_eq!(
+            middle_click_route(true, true, true),
+            MiddleClickRoute::PrimaryPaste
+        );
+        assert_eq!(
+            middle_click_route(true, false, false),
+            MiddleClickRoute::PrimaryPaste
+        );
+    }
+
+    #[test]
+    fn middle_mouse_release_requires_reporting_to_remain_active() {
+        assert!(should_report_middle_mouse_release(true, true));
+        assert!(!should_report_middle_mouse_release(true, false));
+        assert!(!should_report_middle_mouse_release(false, true));
     }
 
     #[test]

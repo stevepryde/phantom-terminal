@@ -55,10 +55,12 @@ pub enum AppInput {
     MouseDown {
         x: f32,
         y: f32,
+        button: AppMouseButton,
     },
     MouseUp {
         x: f32,
         y: f32,
+        button: AppMouseButton,
     },
     MouseMove {
         x: f32,
@@ -75,4 +77,11 @@ pub enum AppInput {
     ScaleChanged,
     ModifiersChanged(Mods),
     CloseRequested,
+}
+
+/// Mouse buttons whose behavior is owned by the terminal application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppMouseButton {
+    Left,
+    Middle,
 }
