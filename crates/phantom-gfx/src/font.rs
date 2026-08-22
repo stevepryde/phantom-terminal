@@ -379,7 +379,7 @@ fn rasterize_font(
             // We request Alpha, so this is unexpected; average the channels
             // back into a coverage mask defensively.
             let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-            for px in image.data.chunks_exact(4) {
+            for px in image.data.as_chunks::<4>().0 {
                 let coverage = ((px[0] as u16 + px[1] as u16 + px[2] as u16) / 3) as u8;
                 rgba.extend_from_slice(&[255, 255, 255, coverage]);
             }
