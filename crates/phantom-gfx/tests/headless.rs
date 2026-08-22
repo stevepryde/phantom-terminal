@@ -5,7 +5,7 @@
 
 use phantom_core::AppConfig;
 use phantom_emu::{AlacrittyCore, CursorShape, SearchOptions, SelSide, VtCore};
-use phantom_gfx::headless::Harness;
+use phantom_gfx::headless::{Harness, TerminalBackground};
 
 fn core(rows: u16, cols: u16) -> AlacrittyCore {
     AlacrittyCore::new(rows, cols, 1000, CursorShape::Block)
@@ -46,6 +46,91 @@ fn empty_grid_is_theme_background() {
     assert!(
         r < 40 && g < 40 && b < 40,
         "background too bright: {r},{g},{b}"
+    );
+}
+
+#[test]
+fn terminal_wash_composites_between_backdrop_and_terminal_content() {
+    let config = AppConfig::default();
+    let mut h = harness_or_skip!(&config, 240, 120);
+    let (rows, cols) = h.grid();
+    let mut term = core(rows, cols);
+    // An explicit ANSI background must remain renderer-owned and opaque. The
+    // following default-background cell lets the backdrop stack show through.
+    term.advance(b"\x1b[44m  \x1b[0mW  ");
+    term.selection_start(0, 4, SelSide::Left);
+    term.selection_update(0, 4, SelSide::Right);
+    let snapshot = term.snapshot();
+    let wash = [
+        [34, 211, 238, 12],
+        [139, 92, 246, 9],
+        [20, 184, 166, 11],
+        [34, 211, 238, 7],
+    ];
+
+    let plain = h.render_snapshot(&snapshot, false);
+    let none_wash = h.render_snapshot_with_background(
+        &snapshot,
+        false,
+        TerminalBackground {
+            backdrop: None,
+            wash: Some(wash),
+        },
+    );
+    let image = h.render_snapshot_with_background(
+        &snapshot,
+        false,
+        TerminalBackground {
+            backdrop: Some(("phantom", 24)),
+            wash: None,
+        },
+    );
+    let image_wash = h.render_snapshot_with_background(
+        &snapshot,
+        false,
+        TerminalBackground {
+            backdrop: Some(("phantom", 24)),
+            wash: Some(wash),
+        },
+    );
+
+    let (empty_x, empty_y, empty_w, empty_h) = cell_sample(&h, 6, 1);
+    let plain_empty = plain.avg(empty_x, empty_y, empty_w, empty_h);
+    let none_wash_empty = none_wash.avg(empty_x, empty_y, empty_w, empty_h);
+    assert_ne!(
+        none_wash_empty, plain_empty,
+        "wash was not visible when the backdrop was None"
+    );
+
+    let image_empty = image.avg(empty_x, empty_y, empty_w, empty_h);
+    let image_wash_empty = image_wash.avg(empty_x, empty_y, empty_w, empty_h);
+    assert_ne!(
+        image_wash_empty, image_empty,
+        "wash was not composited above the backdrop image"
+    );
+
+    let (ansi_x, ansi_y, ansi_w, ansi_h) = cell_sample(&h, 0, 0);
+    assert_eq!(
+        image_wash.avg(ansi_x, ansi_y, ansi_w, ansi_h),
+        image.avg(ansi_x, ansi_y, ansi_w, ansi_h),
+        "wash changed an opaque ANSI cell background"
+    );
+
+    let (glyph_x, glyph_y, glyph_w, glyph_h) = cell_sample(&h, 2, 0);
+    let glyph = image_wash.avg(glyph_x, glyph_y, glyph_w, glyph_h);
+    let empty_sum: u32 = image_wash_empty.iter().sum();
+    let glyph_sum: u32 = glyph.iter().sum();
+    assert!(
+        glyph_sum > empty_sum + 30,
+        "foreground lost contrast over wash ({glyph_sum} vs {empty_sum})"
+    );
+
+    let (selection_x, selection_y, selection_w, selection_h) = cell_sample(&h, 4, 0);
+    let selection = image_wash.avg(selection_x, selection_y, selection_w, selection_h);
+    let selection_sum: u32 = selection.iter().sum();
+    assert!(
+        selection_sum > empty_sum + 10,
+        "selection lost contrast over wash ({selection_sum} vs {empty_sum})"
     );
 }
 

@@ -160,7 +160,7 @@ APPROVED_CUSTOM_MACRO_FILES = {
         {"reset_state"},
     ),
     "crates/phantom-gfx/tests/headless.rs": (
-        "29c949537046184aea1778f7927b07e86e16e583c6cf7edb9237eee17fdd8df5",
+        "54f8f34a00dab870e80951f35319e82c14c2586b8a60b63a46f808e7340676c6",
         {"harness_or_skip"},
     ),
 }
