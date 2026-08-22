@@ -4,7 +4,7 @@
 //! comparable [`Combo`]s, and matches engine-independent key presses against
 //! them. `CmdOrCtrl` resolves to Cmd (Super) on macOS and Ctrl elsewhere.
 
-use phantom_core::Keybinding;
+use phantom_core::{Keybinding, KeybindingAction};
 use phantom_emu::Key;
 
 use crate::event::Mods;
@@ -22,14 +22,13 @@ pub enum Action {
 }
 
 fn action_from_id(action: &str) -> Option<Action> {
-    match action {
-        "tab.new" => Some(Action::NewTab),
-        "tab.close" => Some(Action::CloseTab),
-        "tab.rename" => Some(Action::RenameTab),
-        "palette.toggle" => Some(Action::TogglePalette),
-        "settings.toggle" => Some(Action::ToggleSettings),
-        _ => None,
-    }
+    Some(match KeybindingAction::from_id(action)? {
+        KeybindingAction::NewTab => Action::NewTab,
+        KeybindingAction::CloseTab => Action::CloseTab,
+        KeybindingAction::RenameTab => Action::RenameTab,
+        KeybindingAction::TogglePalette => Action::TogglePalette,
+        KeybindingAction::ToggleSettings => Action::ToggleSettings,
+    })
 }
 
 /// The key part of a combo, normalized so config strings and winit events meet
@@ -197,6 +196,14 @@ mod tests {
         let c = parse_combo("CmdOrCtrl+T").unwrap();
         assert!(c.primary && !c.shift && !c.alt);
         assert_eq!(c.key, ComboKey::Char('t'));
+    }
+
+    #[test]
+    fn every_validated_config_action_has_runtime_dispatch() {
+        for action in KeybindingAction::ALL {
+            assert!(action_from_id(action.id()).is_some());
+        }
+        assert_eq!(action_from_id("unknown.action"), None);
     }
 
     #[test]

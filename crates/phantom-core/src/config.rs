@@ -157,6 +157,43 @@ pub struct Keybinding {
     pub keys: String,
 }
 
+/// Actions that may be selected by persisted keybindings.
+///
+/// Keeping the accepted identifiers typed here makes config validation and the
+/// app's runtime dispatch share one exhaustive authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeybindingAction {
+    NewTab,
+    CloseTab,
+    RenameTab,
+    TogglePalette,
+    ToggleSettings,
+}
+
+impl KeybindingAction {
+    pub const ALL: [Self; 5] = [
+        Self::NewTab,
+        Self::CloseTab,
+        Self::RenameTab,
+        Self::TogglePalette,
+        Self::ToggleSettings,
+    ];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::NewTab => "tab.new",
+            Self::CloseTab => "tab.close",
+            Self::RenameTab => "tab.rename",
+            Self::TogglePalette => "palette.toggle",
+            Self::ToggleSettings => "settings.toggle",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.id() == id)
+    }
+}
+
 /// Last settled normal-window size in logical pixels. Logical dimensions keep
 /// the window's apparent size stable when it is restored on a display with a
 /// different scale factor.
@@ -197,6 +234,12 @@ impl Keybinding {
         validate_no_nul("keybinding id", &self.id)?;
         validate_no_nul("keybinding action", &self.action)?;
         validate_no_nul("keybinding keys", &self.keys)?;
+        if KeybindingAction::from_id(&self.action).is_none() {
+            return Err(AppError::InvalidConfig(format!(
+                "unknown keybinding action '{}'",
+                self.action
+            )));
+        }
         Ok(())
     }
 }
@@ -483,27 +526,27 @@ fn default_keybindings() -> Vec<Keybinding> {
     vec![
         Keybinding {
             id: "new-tab".to_string(),
-            action: "tab.new".to_string(),
+            action: KeybindingAction::NewTab.id().to_string(),
             keys: "CmdOrCtrl+T".to_string(),
         },
         Keybinding {
             id: "close-tab".to_string(),
-            action: "tab.close".to_string(),
+            action: KeybindingAction::CloseTab.id().to_string(),
             keys: "CmdOrCtrl+W".to_string(),
         },
         Keybinding {
             id: "rename-tab".to_string(),
-            action: "tab.rename".to_string(),
+            action: KeybindingAction::RenameTab.id().to_string(),
             keys: "F2".to_string(),
         },
         Keybinding {
             id: "command-palette".to_string(),
-            action: "palette.toggle".to_string(),
+            action: KeybindingAction::TogglePalette.id().to_string(),
             keys: "CmdOrCtrl+K".to_string(),
         },
         Keybinding {
             id: "settings".to_string(),
-            action: "settings.toggle".to_string(),
+            action: KeybindingAction::ToggleSettings.id().to_string(),
             keys: "CmdOrCtrl+Comma".to_string(),
         },
     ]
@@ -609,6 +652,21 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         AppConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn keybinding_actions_share_the_typed_allowlist() {
+        for action in KeybindingAction::ALL {
+            let mut config = AppConfig::default();
+            config.keybindings[0].action = action.id().to_string();
+            config.validate().unwrap();
+            assert_eq!(KeybindingAction::from_id(action.id()), Some(action));
+        }
+
+        let mut config = AppConfig::default();
+        config.keybindings[0].action = "unknown.action".to_string();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("unknown keybinding action"));
     }
 
     #[test]
