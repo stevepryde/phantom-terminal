@@ -11,6 +11,7 @@
 //! accepts an ad-hoc shell command string. See [`resolve_launch_opts`] and
 //! [`resolve_trusted_task`].
 
+mod bounded_file;
 pub mod config;
 pub mod context;
 pub mod error;
@@ -22,6 +23,7 @@ pub mod spawn;
 /// Maximum number of terminal tabs that may be live or persisted at once.
 pub const MAX_TABS: usize = 128;
 
+pub use bounded_file::{read_bounded_regular_file, BoundedReadError};
 pub use config::{AppConfig, Keybinding, ShellProfile, Theme, WindowSize, UI_THEMES};
 pub use context::{
     load_context_manifest, load_context_manifest_source, parse_context_manifest,

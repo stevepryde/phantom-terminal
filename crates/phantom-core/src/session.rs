@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
-use rusqlite::Connection;
 #[cfg(unix)]
 use rusqlite::OpenFlags;
+use rusqlite::{Connection, MAIN_DB};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
+use crate::config::MAX_SERIALIZED_APP_CONFIG_BYTES;
 use crate::error::{AppError, AppResult};
 use crate::MAX_TABS;
 
@@ -18,6 +21,7 @@ pub const MAX_TAB_TITLE_LEN: usize = 256;
 pub const MAX_TAB_CWD_LEN: usize = 4096;
 pub const MAX_TAB_PROFILE_ID_LEN: usize = 128;
 const REMEMBERED_TABS_LOCK_FILE: &str = "remembered-tabs.lock";
+const MAX_APP_CONFIG_BYTES: usize = MAX_SERIALIZED_APP_CONFIG_BYTES;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabRecord {
@@ -174,6 +178,11 @@ impl RememberedTabsLock {
 #[derive(Clone)]
 pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
+    // #82 establishes one normal session/config writer. Shared clones belong
+    // to that owner: once it observes an unbounded or non-text config row, no
+    // clone may write config for the rest of this process lifetime. An
+    // external database replacement deliberately cannot re-enable writes.
+    config_write_blocked: Arc<AtomicBool>,
 }
 
 impl SessionStore {
@@ -203,6 +212,7 @@ impl SessionStore {
         verify_store_identity(path, &secure_store)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            config_write_blocked: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -212,6 +222,7 @@ impl SessionStore {
         migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            config_write_blocked: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -279,36 +290,106 @@ impl SessionStore {
     }
 
     pub fn load_config(&self) -> AppResult<AppConfig> {
+        self.load_config_with_limit(MAX_APP_CONFIG_BYTES)
+    }
+
+    fn load_config_with_limit(&self, max_bytes: usize) -> AppResult<AppConfig> {
         let conn = self.lock();
-        let value: Option<String> =
-            match conn.query_row("SELECT value FROM config WHERE key = 'app'", [], |r| {
-                r.get(0)
-            }) {
-                Ok(value) => Some(value),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(error) => return Err(error.into()),
-            };
-        match value {
-            Some(json) => match serde_json::from_str::<AppConfig>(&json)
-                .map_err(AppError::from)
-                .and_then(AppConfig::validated)
-            {
-                Ok(config) => Ok(config),
-                Err(error) => {
-                    let _ = backup_invalid_config(&conn, &json, &error.to_string());
-                    let default = AppConfig::default().validated()?;
-                    save_config_conn(&conn, &default)?;
-                    Ok(default)
-                }
-            },
-            None => Ok(AppConfig::default().validated()?),
+        let allow_recovery_writes = !self.config_write_blocked.load(Ordering::Acquire);
+        let loaded = load_config_conn(&conn, max_bytes, allow_recovery_writes)?;
+        if loaded.write_blocked {
+            self.config_write_blocked.store(true, Ordering::Release);
         }
+        Ok(loaded.config)
     }
 
     pub fn save_config(&self, config: &AppConfig) -> AppResult<()> {
+        self.save_config_with_locked_hook(config, || {})
+    }
+
+    fn save_config_with_locked_hook(
+        &self,
+        config: &AppConfig,
+        after_lock: impl FnOnce(),
+    ) -> AppResult<()> {
         let conn = self.lock();
+        after_lock();
+        if self.config_write_blocked.load(Ordering::Acquire) {
+            return Err(AppError::InvalidConfig(
+                "refusing to overwrite an oversized or non-text persisted app config".to_string(),
+            ));
+        }
         config.validate()?;
         save_config_conn(&conn, config)
+    }
+}
+
+struct LoadedConfig {
+    config: AppConfig,
+    write_blocked: bool,
+}
+
+fn load_config_conn(
+    conn: &Connection,
+    max_bytes: usize,
+    allow_recovery_writes: bool,
+) -> AppResult<LoadedConfig> {
+    let value = load_config_value(conn, max_bytes)?;
+    match value {
+        Some(value) if value.storage_type == "text" && !value.exceeds_limit => {
+            match serde_json::from_slice::<AppConfig>(&value.bytes)
+                .map_err(AppError::from)
+                .and_then(AppConfig::validated)
+            {
+                Ok(config) => Ok(LoadedConfig {
+                    config,
+                    write_blocked: false,
+                }),
+                Err(error) => {
+                    if allow_recovery_writes {
+                        if value.bytes.len() <= MAX_INVALID_CONFIG_BACKUP_VALUE_BYTES {
+                            if let Ok(json) = std::str::from_utf8(&value.bytes) {
+                                let _ = backup_invalid_config(conn, json, &error.to_string());
+                            } else {
+                                let _ = backup_omitted_invalid_config(
+                                    conn,
+                                    value.bytes.len(),
+                                    "stored app config is not valid UTF-8",
+                                );
+                            }
+                        } else {
+                            let _ = backup_omitted_invalid_config(
+                                conn,
+                                value.bytes.len(),
+                                "stored invalid app config is too large to back up",
+                            );
+                        }
+                    }
+                    let default = AppConfig::default().validated()?;
+                    if allow_recovery_writes {
+                        save_config_conn(conn, &default)?;
+                    }
+                    Ok(LoadedConfig {
+                        config: default,
+                        write_blocked: false,
+                    })
+                }
+            }
+        }
+        Some(_) => {
+            // Do not mutate an unbounded row: even changing its key can make
+            // SQLite reconstruct the whole record. The store returns safe
+            // in-memory defaults and blocks later config writes so automatic
+            // persistence cannot destroy the original value.
+            Ok(LoadedConfig {
+                config: AppConfig::default().validated()?,
+                write_blocked: true,
+            })
+        }
+        None => Ok(LoadedConfig {
+            config: AppConfig::default().validated()?,
+            write_blocked: false,
+        }),
     }
 }
 
@@ -465,6 +546,11 @@ fn validate_no_nul(name: &str, value: &str) -> AppResult<()> {
 
 fn save_config_conn(conn: &Connection, config: &AppConfig) -> AppResult<()> {
     let json = serde_json::to_string(config)?;
+    if json.len() > MAX_APP_CONFIG_BYTES {
+        return Err(AppError::InvalidConfig(format!(
+            "serialized app config may be no more than {MAX_APP_CONFIG_BYTES} bytes"
+        )));
+    }
     conn.execute(
         "INSERT INTO config (key, value) VALUES ('app', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -476,29 +562,106 @@ fn save_config_conn(conn: &Connection, config: &AppConfig) -> AppResult<()> {
 /// Cap on retained `app.invalid.*` backup rows: repeated corrupt-config loads
 /// must not grow the table forever.
 const MAX_INVALID_CONFIG_BACKUPS: usize = 5;
+const MAX_INVALID_CONFIG_BACKUP_VALUE_BYTES: usize = 1024 * 1024;
+
+struct StoredConfigValue {
+    storage_type: String,
+    bytes: Vec<u8>,
+    exceeds_limit: bool,
+}
+
+fn load_config_value(conn: &Connection, max_bytes: usize) -> AppResult<Option<StoredConfigValue>> {
+    let transaction = conn.unchecked_transaction()?;
+    let identity = match transaction.query_row(
+        "SELECT rowid, typeof(value) FROM config WHERE key = 'app'",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    ) {
+        Ok(identity) => identity,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let (row_id, storage_type) = identity;
+    if storage_type != "text" {
+        transaction.commit()?;
+        return Ok(Some(StoredConfigValue {
+            storage_type,
+            bytes: Vec::new(),
+            exceeds_limit: false,
+        }));
+    }
+
+    let mut blob = transaction.blob_open(MAIN_DB, "config", "value", row_id, true)?;
+    if blob.len() > max_bytes {
+        drop(blob);
+        transaction.commit()?;
+        return Ok(Some(StoredConfigValue {
+            storage_type,
+            bytes: Vec::new(),
+            exceeds_limit: true,
+        }));
+    }
+    let mut bytes = vec![0; blob.len()];
+    blob.read_exact(&mut bytes)?;
+    drop(blob);
+    transaction.commit()?;
+    Ok(Some(StoredConfigValue {
+        storage_type,
+        bytes,
+        exceeds_limit: false,
+    }))
+}
 
 fn backup_invalid_config(conn: &Connection, json: &str, reason: &str) -> AppResult<()> {
-    // Keep only the newest backups (by insertion order), counting the row
-    // about to be inserted.
+    let backup = serde_json::json!({
+        "reason": reason,
+        "value": json,
+    });
+    insert_invalid_config_backup(conn, backup)
+}
+
+fn backup_omitted_invalid_config(
+    conn: &Connection,
+    observed_bytes: usize,
+    reason: &str,
+) -> AppResult<()> {
+    // The rejected value is deliberately not fetched or copied into its
+    // backup: a tampered database must not turn recovery into another large
+    // allocation. `observed_bytes` is capped at the caller's limit + 1.
+    let backup = serde_json::json!({
+        "reason": reason,
+        "observed_bytes": observed_bytes,
+        "value_omitted": true,
+    });
+    insert_invalid_config_backup(conn, backup)
+}
+
+fn insert_invalid_config_backup(conn: &Connection, backup: serde_json::Value) -> AppResult<()> {
+    prune_invalid_config_backups(conn)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let key = format!("app.invalid.{stamp}");
+    conn.execute(
+        "INSERT INTO config (key, value) VALUES (?1, ?2)",
+        rusqlite::params![key, backup.to_string()],
+    )?;
+    Ok(())
+}
+
+fn prune_invalid_config_backups(conn: &Connection) -> AppResult<()> {
+    // Keep only the newest backups (by insertion order), leaving one slot for
+    // the backup about to be added.
     conn.execute(
         "DELETE FROM config WHERE key LIKE 'app.invalid.%' AND rowid NOT IN (
              SELECT rowid FROM config WHERE key LIKE 'app.invalid.%'
              ORDER BY rowid DESC LIMIT ?1
          )",
         rusqlite::params![(MAX_INVALID_CONFIG_BACKUPS - 1) as i64],
-    )?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let key = format!("app.invalid.{stamp}");
-    let backup = serde_json::json!({
-        "reason": reason,
-        "value": json,
-    });
-    conn.execute(
-        "INSERT INTO config (key, value) VALUES (?1, ?2)",
-        rusqlite::params![key, backup.to_string()],
     )?;
     Ok(())
 }
@@ -1104,6 +1267,7 @@ mod tests {
         migrate(&conn).unwrap();
         SessionStore {
             conn: Arc::new(Mutex::new(conn)),
+            config_write_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1284,6 +1448,7 @@ mod tests {
 
         let store = SessionStore {
             conn: Arc::new(Mutex::new(conn)),
+            config_write_blocked: Arc::new(AtomicBool::new(false)),
         };
         let loaded = store.load_tabs().unwrap();
         assert_eq!(loaded.len(), 1);
@@ -1423,6 +1588,107 @@ mod tests {
             )
             .unwrap();
         assert_eq!(backup_count, 1);
+    }
+
+    #[test]
+    fn oversized_database_config_is_bounded_before_materialization() {
+        let store = in_memory();
+        {
+            let conn = store.lock();
+            conn.execute(
+                "INSERT INTO config (key, value)
+                 VALUES ('app', CAST(zeroblob(8388608) AS TEXT))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let loaded = store.load_config_with_limit(1024).unwrap();
+        assert_eq!(loaded.font_size, AppConfig::default().font_size);
+
+        let later = AppConfig {
+            font_size: 18,
+            ..AppConfig::default()
+        };
+        let error = store.save_config(&later).unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+
+        let conn = store.lock();
+        let retained_after_save: i64 = conn
+            .query_row(
+                "SELECT length(CAST(value AS BLOB)) FROM config WHERE key = 'app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_after_save, 8 * 1024 * 1024);
+        let replacement = "{bad json";
+        conn.execute(
+            "UPDATE config SET value = ?1 WHERE key = 'app'",
+            rusqlite::params![replacement],
+        )
+        .unwrap();
+        drop(conn);
+
+        let clone = store.clone();
+        clone.load_config_with_limit(1024).unwrap();
+        assert!(clone.save_config(&later).is_err());
+        let conn = clone.lock();
+        let retained_invalid: String = conn
+            .query_row("SELECT value FROM config WHERE key = 'app'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained_invalid, replacement);
+    }
+
+    #[test]
+    fn save_rechecks_the_shared_write_block_after_locking() {
+        let store = in_memory();
+        let shared_block = Arc::clone(&store.config_write_blocked);
+
+        let error = store
+            .save_config_with_locked_hook(&AppConfig::default(), move || {
+                shared_block.store(true, Ordering::Release);
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("refusing to overwrite"));
+        let conn = store.lock();
+        let app_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM config WHERE key = 'app'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(app_rows, 0);
+    }
+
+    #[test]
+    fn null_database_config_recovers_through_the_bounded_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO config (key, value) VALUES ('app', NULL);",
+        )
+        .unwrap();
+        let store = SessionStore {
+            conn: Arc::new(Mutex::new(conn)),
+            config_write_blocked: Arc::new(AtomicBool::new(false)),
+        };
+
+        let loaded = store.load_config_with_limit(1024).unwrap();
+
+        assert_eq!(loaded.font_size, AppConfig::default().font_size);
+        assert!(store.save_config(&AppConfig::default()).is_err());
+        let conn = store.lock();
+        let stored_type: String = conn
+            .query_row(
+                "SELECT typeof(value) FROM config WHERE key = 'app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_type, "null");
     }
 
     /// Unique per-test scratch directory (no tempfile dependency), removed on

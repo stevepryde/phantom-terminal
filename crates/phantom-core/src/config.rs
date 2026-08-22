@@ -19,6 +19,7 @@ const MAX_ARGS_PER_PROFILE: usize = 128;
 const MAX_CWD_LEN: usize = 4096;
 const MAX_KEYBINDINGS: usize = 128;
 const MAX_KEYBINDING_FIELD_LEN: usize = 128;
+pub const MAX_SERIALIZED_APP_CONFIG_BYTES: usize = 64 * 1024 * 1024;
 const OLD_DEFAULT_SELECTION: &str = "#33415580";
 const DEFAULT_SELECTION: &str = "#ffffff24";
 const DEFAULT_UI_THEME: &str = "phantom";
@@ -374,6 +375,7 @@ impl AppConfig {
         validate_keybindings(&self.keybindings)?;
         self.context_actions.validate()?;
         validate_trusted_projects(&self.trusted_projects)?;
+        validate_serialized_size(self)?;
         Ok(())
     }
 
@@ -401,6 +403,36 @@ impl AppConfig {
             })
             .or_else(|| self.shell_profiles.first())
     }
+}
+
+fn validate_serialized_size(config: &AppConfig) -> AppResult<()> {
+    struct BoundedWriter {
+        written: usize,
+    }
+
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(total) = self.written.checked_add(bytes.len()) else {
+                return Err(std::io::Error::other("serialized config size overflow"));
+            };
+            if total > MAX_SERIALIZED_APP_CONFIG_BYTES {
+                return Err(std::io::Error::other("serialized config is too large"));
+            }
+            self.written = total;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = BoundedWriter { written: 0 };
+    serde_json::to_writer(&mut writer, config).map_err(|_| {
+        AppError::InvalidConfig(format!(
+            "serialized app config may be no more than {MAX_SERIALIZED_APP_CONFIG_BYTES} bytes"
+        ))
+    })
 }
 
 fn validate_trusted_projects(projects: &[TrustedProject]) -> AppResult<()> {
@@ -771,5 +803,29 @@ mod tests {
             .push(config.context_actions.plugins[0].clone());
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn serialized_size_is_part_of_the_validation_contract() {
+        let escaped_arg = "\u{0001}".repeat(MAX_ARG_LEN);
+        let shell_profiles: Vec<_> = (0..MAX_PROFILE_COUNT)
+            .map(|index| ShellProfile {
+                id: format!("profile-{index}"),
+                name: String::new(),
+                command: String::new(),
+                args: vec![escaped_arg.clone(); MAX_ARGS_PER_PROFILE],
+                cwd: None,
+            })
+            .collect();
+        validate_profiles(&shell_profiles, "profile-0").unwrap();
+        let config = AppConfig {
+            shell_profiles,
+            default_shell_profile_id: "profile-0".to_string(),
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.to_string().contains("serialized app config"));
     }
 }
