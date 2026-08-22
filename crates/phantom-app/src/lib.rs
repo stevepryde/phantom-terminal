@@ -31,6 +31,15 @@ mod tab;
 mod themes;
 
 use std::collections::VecDeque;
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -63,6 +72,7 @@ use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 use context_actions::{discover_context, ContextRequest, ContextSnapshot};
+use egui_winit::accesskit_winit::{Event as AccessKitEvent, WindowEvent as AccessKitWindowEvent};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const CWD_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -144,7 +154,14 @@ pub enum AppEvent {
     EditorOpenFailed {
         error: String,
     },
+    AccessKit(AccessKitEvent),
     PtyWake,
+}
+
+impl From<AccessKitEvent> for AppEvent {
+    fn from(event: AccessKitEvent) -> Self {
+        Self::AccessKit(event)
+    }
 }
 
 /// Sink for PTY output events. The winit host wraps an [`EventLoopProxy`]; tests
@@ -250,6 +267,7 @@ fn event_byte_len(event: &AppEvent) -> usize {
         AppEvent::PtyExit { .. }
         | AppEvent::ContextDiscovered { .. }
         | AppEvent::EditorOpenFailed { .. }
+        | AppEvent::AccessKit(_)
         | AppEvent::PtyWake => 0,
     }
 }
@@ -510,6 +528,7 @@ struct LastClick {
 pub struct App {
     outbox: Arc<dyn PtyOutbox>,
     pending_pty_events: Option<Arc<PendingPtyEvents>>,
+    event_loop_proxy: Option<EventLoopProxy<AppEvent>>,
     config: AppConfig,
     pty: PtyManager,
     store: Option<SessionStore>,
@@ -628,6 +647,7 @@ impl App {
         Self {
             outbox,
             pending_pty_events: None,
+            event_loop_proxy: None,
             config,
             pty: PtyManager::new(),
             store,
@@ -797,6 +817,9 @@ impl App {
             AppEvent::EditorOpenFailed { error } => {
                 self.show_notice(format!("Could not open .phantom.yml: {error}"));
             }
+            // Accessibility events use their own direct event-loop path and
+            // are handled by the winit host, never the bounded PTY queue.
+            AppEvent::AccessKit(_) => {}
             AppEvent::PtyWake => self.drain_pending_pty_events(),
         }
     }
@@ -3569,6 +3592,44 @@ fn macos_ns_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit:
     }
 }
 
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn accesskit_session_bus_allowed(address: Option<&OsStr>) -> bool {
+    address.is_none_or(|address| {
+        address
+            .to_str()
+            .is_some_and(|address| address.starts_with("unix:"))
+    })
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn accesskit_transport_allowed() -> bool {
+    accesskit_session_bus_allowed(std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref())
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn accesskit_transport_allowed() -> bool {
+    true
+}
+
 impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gpu.is_some() {
@@ -3577,7 +3638,7 @@ impl ApplicationHandler<AppEvent> for App {
         let custom_window_chrome = self.custom_window_chrome();
         let window = Arc::new(
             event_loop
-                .create_window(window_attributes(&self.config))
+                .create_window(window_attributes(&self.config).with_visible(false))
                 .expect("failed to create window"),
         );
         let gpu = match pollster::block_on(GpuContext::new(
@@ -3588,6 +3649,7 @@ impl ApplicationHandler<AppEvent> for App {
             Ok(gpu) => gpu,
             Err(error) => {
                 window.set_title(&format!("Phantom Terminal - {error}"));
+                window.set_visible(true);
                 self.show_notice(error);
                 return;
             }
@@ -3604,24 +3666,76 @@ impl ApplicationHandler<AppEvent> for App {
             Ok(renderer) => renderer,
             Err(error) => {
                 window.set_title(&format!("Phantom Terminal - {error}"));
+                window.set_visible(true);
                 self.show_notice(error);
                 return;
             }
         };
         let (w, h) = gpu.size();
         renderer.resize(&gpu.queue, w, h);
-        let egui = EguiLayer::new(&gpu.window, &gpu.device, gpu.format());
+        let mut egui = EguiLayer::new(&gpu.window, &gpu.device, gpu.format());
+        let accesskit_enabled = accesskit_transport_allowed();
+        if accesskit_enabled {
+            if let Some(proxy) = self.event_loop_proxy.as_ref() {
+                egui.init_accesskit(event_loop, &gpu.window, proxy.clone());
+            }
+        }
 
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
         self.egui = Some(egui);
 
+        if !accesskit_enabled {
+            self.show_notice(
+                "Accessibility disabled: DBUS_SESSION_BUS_ADDRESS must use a local unix: transport",
+            );
+        }
+        if let Some(gpu) = self.gpu.as_ref() {
+            gpu.window.set_visible(true);
+        }
         self.start();
         self.request_redraw();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
-        self.on_pty_event(event);
+        match event {
+            AppEvent::AccessKit(event) => {
+                let Some(gpu) = self.gpu.as_ref() else {
+                    return;
+                };
+                if event.window_id != gpu.window.id() {
+                    return;
+                }
+                let redraw = match event.window_event {
+                    AccessKitWindowEvent::InitialTreeRequested => {
+                        if let Some(egui) = self.egui.as_ref() {
+                            egui.enable_accesskit();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    AccessKitWindowEvent::ActionRequested(request) => {
+                        if let Some(egui) = self.egui.as_mut() {
+                            egui.on_accesskit_action_request(request);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    AccessKitWindowEvent::AccessibilityDeactivated => {
+                        if let Some(egui) = self.egui.as_ref() {
+                            egui.disable_accesskit();
+                        }
+                        false
+                    }
+                };
+                if redraw {
+                    self.request_redraw();
+                }
+            }
+            event => self.on_pty_event(event),
+        }
         if self.exit_requested {
             self.flush_persistence();
             event_loop.exit();
@@ -3875,11 +3989,12 @@ pub fn run() {
     let proxy = event_loop.create_proxy();
     let pending = Arc::new(PendingPtyEvents::new());
     let outbox: Arc<dyn PtyOutbox> = Arc::new(ProxyOutbox {
-        proxy,
+        proxy: proxy.clone(),
         pending: Arc::clone(&pending),
     });
     let mut app = App::new(outbox, config, store, launch);
     app.pending_pty_events = Some(pending);
+    app.event_loop_proxy = Some(proxy);
     event_loop.run_app(&mut app).expect("event loop error");
 }
 
@@ -4858,5 +4973,33 @@ mod tests {
             other => panic!("expected coalesced bytes, got {other:?}"),
         }
         assert!(matches!(events[1], AppEvent::PtyExit { tab: 7 }));
+    }
+
+    #[test]
+    fn accesskit_session_bus_requires_an_explicit_local_unix_transport() {
+        assert!(accesskit_session_bus_allowed(None));
+        assert!(accesskit_session_bus_allowed(Some(OsStr::new(
+            "unix:path=/run/user/1000/bus"
+        ))));
+        assert!(accesskit_session_bus_allowed(Some(OsStr::new(
+            "unix:abstract=/tmp/dbus"
+        ))));
+        assert!(!accesskit_session_bus_allowed(Some(OsStr::new(
+            "tcp:host=127.0.0.1"
+        ))));
+        assert!(!accesskit_session_bus_allowed(Some(OsStr::new(
+            "UNIX:path=/run/user/1000/bus"
+        ))));
+        assert!(!accesskit_session_bus_allowed(Some(OsStr::new(""))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accesskit_session_bus_rejects_non_utf8_addresses() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(!accesskit_session_bus_allowed(Some(OsStr::from_bytes(
+            b"unix:path=/tmp/\xff"
+        ))));
     }
 }
