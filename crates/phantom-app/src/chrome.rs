@@ -2444,6 +2444,31 @@ mod tests {
     }
 
     #[test]
+    fn window_control_hover_animations_transition_independently() {
+        let now = Instant::now();
+        let mut state = ChromeAnimationState::default();
+
+        assert!(state.set_hover(ChromeHoverTarget::WindowControl(WindowControl::Minimize)));
+        assert!(state.advance(now, 0));
+        let minimize_hover = state.window_control(WindowControl::Minimize);
+        assert!(minimize_hover > 0.0);
+        assert_eq!(state.window_control(WindowControl::Maximize), 0.0);
+        assert_eq!(state.window_control(WindowControl::Close), 0.0);
+
+        assert!(state.set_hover(ChromeHoverTarget::WindowControl(WindowControl::Maximize)));
+        assert!(state.advance(now + std::time::Duration::from_millis(16), 0));
+        assert!(state.window_control(WindowControl::Minimize) < minimize_hover);
+        assert!(state.window_control(WindowControl::Maximize) > 0.0);
+        assert_eq!(state.window_control(WindowControl::Close), 0.0);
+
+        assert!(state.set_hover(ChromeHoverTarget::WindowControl(WindowControl::Close)));
+        assert!(!state.advance(now + std::time::Duration::from_millis(500), 0));
+        assert_eq!(state.window_control(WindowControl::Minimize), 0.0);
+        assert_eq!(state.window_control(WindowControl::Maximize), 0.0);
+        assert_eq!(state.window_control(WindowControl::Close), 1.0);
+    }
+
+    #[test]
     fn chrome_hover_targets_report_clickability() {
         assert!(!ChromeHoverTarget::None.is_clickable());
         assert!(ChromeHoverTarget::Tab(0).is_clickable());
