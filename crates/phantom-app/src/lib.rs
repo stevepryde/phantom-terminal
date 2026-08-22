@@ -29,6 +29,7 @@ mod palette;
 mod skill_install;
 mod tab;
 mod themes;
+mod ui_components;
 
 use std::collections::VecDeque;
 #[cfg(any(
