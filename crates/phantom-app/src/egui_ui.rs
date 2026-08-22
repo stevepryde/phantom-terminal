@@ -10,8 +10,8 @@ use egui::{
 };
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use phantom_core::{
-    AppConfig, Keybinding, Theme, WindowSize, FREQUENT_COMMANDS_PLUGIN_ID, MANIFEST_PLUGIN_ID,
-    RECENT_DIRECTORIES_PLUGIN_ID, SPDEPLOY_PLUGIN_ID,
+    AppConfig, Keybinding, ShellProfile, Theme, WindowSize, FREQUENT_COMMANDS_PLUGIN_ID,
+    MANIFEST_PLUGIN_ID, RECENT_DIRECTORIES_PLUGIN_ID, SPDEPLOY_PLUGIN_ID,
 };
 use phantom_gfx::available_terminal_font_families;
 use winit::event::WindowEvent;
@@ -43,6 +43,7 @@ enum PanelKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     Appearance,
+    Profiles,
     Terminal,
     Session,
     ContextActions,
@@ -51,8 +52,9 @@ enum SettingsTab {
 }
 
 impl SettingsTab {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Appearance,
+        Self::Profiles,
         Self::Terminal,
         Self::Session,
         Self::ContextActions,
@@ -63,6 +65,7 @@ impl SettingsTab {
     fn id(self) -> &'static str {
         match self {
             Self::Appearance => "appearance",
+            Self::Profiles => "profiles",
             Self::Terminal => "terminal",
             Self::Session => "session",
             Self::ContextActions => "context_actions",
@@ -74,6 +77,7 @@ impl SettingsTab {
     fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
+            Self::Profiles => "Profiles",
             Self::Terminal => "Terminal",
             Self::Session => "Session",
             Self::ContextActions => "Context Actions",
@@ -104,6 +108,8 @@ pub struct UiState {
     /// typing through; only a draft that passes `AppConfig::validate()` is
     /// committed to the live config.
     settings_draft: Option<AppConfig>,
+    profile_editor_index: Option<usize>,
+    confirm_profile_delete: bool,
     context_ui: ContextUi,
     find: FindState,
     /// Rects (egui points) of panels drawn translucent this frame, whose
@@ -131,6 +137,8 @@ impl UiState {
             font_families: font_families_with_current(&config.font_family),
             notice: None,
             settings_draft: None,
+            profile_editor_index: None,
+            confirm_profile_delete: false,
             context_ui: ContextUi::default(),
             find: FindState::default(),
             blur_regions: Vec::new(),
@@ -146,6 +154,8 @@ impl UiState {
         self.font_families = font_families_with_current(&config.font_family);
         self.notice = None;
         self.settings_draft = Some(config.clone());
+        self.profile_editor_index = None;
+        self.confirm_profile_delete = false;
     }
 
     pub fn toggle_settings(&mut self, config: &AppConfig) {
@@ -161,6 +171,8 @@ impl UiState {
         self.panel_width_px = 0.0;
         self.notice = None;
         self.settings_draft = None;
+        self.profile_editor_index = None;
+        self.confirm_profile_delete = false;
     }
 
     pub fn settings_open(&self) -> bool {
@@ -398,6 +410,8 @@ impl UiState {
         for tab in SettingsTab::ALL {
             if settings_tab_button(ui, tab, self.settings_tab == tab).clicked() {
                 self.settings_tab = tab;
+                self.profile_editor_index = None;
+                self.confirm_profile_delete = false;
             }
         }
     }
@@ -457,6 +471,9 @@ impl UiState {
                             .size(11.0)
                             .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
                         );
+                    }
+                    SettingsTab::Profiles => {
+                        changed |= self.profiles_settings(ui, config);
                     }
                     SettingsTab::Terminal => {
                         section(ui, "Layout");
@@ -552,6 +569,220 @@ impl UiState {
         changed
     }
 
+    fn profiles_settings(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
+        let Some(index) = self.profile_editor_index else {
+            return self.profile_list(ui, config);
+        };
+        if index >= config.shell_profiles.len() {
+            self.profile_editor_index = None;
+            self.confirm_profile_delete = false;
+            return false;
+        }
+        self.profile_editor(ui, config, index)
+    }
+
+    fn profile_list(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
+        let mut changed = false;
+        section(ui, "Shell profiles");
+        ui.label(
+            RichText::new("Choose a profile to edit, or use the star to make it the default.")
+                .size(11.0)
+                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+        );
+        ui.add_space(8.0);
+
+        for index in 0..config.shell_profiles.len() {
+            let profile = &config.shell_profiles[index];
+            let is_default = profile.id == config.default_shell_profile_id;
+            let profile_id = profile.id.clone();
+            let name = profile.name.clone();
+            let summary = profile_summary(profile);
+
+            ui.horizontal(|ui| {
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    &name,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(13.0),
+                        color: Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &format!("\n{summary}"),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::monospace(11.0),
+                        color: Color32::from_rgba_unmultiplied(255, 255, 255, 110),
+                        ..Default::default()
+                    },
+                );
+                let row_width = (ui.available_width() - 64.0).max(40.0);
+                let row = ui.add_sized([row_width, 44.0], Button::new(job));
+                if profile_icon_button(
+                    ui,
+                    if is_default {
+                        "Default profile"
+                    } else {
+                        "Make default"
+                    },
+                    ProfileIcon::Star { filled: is_default },
+                    is_default,
+                )
+                .clicked()
+                    && !is_default
+                {
+                    config.default_shell_profile_id = profile_id;
+                    changed = true;
+                }
+                let edit = profile_icon_button(ui, "Edit profile", ProfileIcon::Edit, false);
+                if row.clicked() || edit.clicked() {
+                    self.profile_editor_index = Some(index);
+                    self.confirm_profile_delete = false;
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        ui.add_space(8.0);
+        if ui.button("Add profile").clicked() {
+            let new_profile = ShellProfile {
+                id: next_profile_id(&config.shell_profiles),
+                name: "New Profile".to_string(),
+                command: String::new(),
+                args: Vec::new(),
+                cwd: None,
+            };
+            let mut candidate = config.clone();
+            let index = candidate.shell_profiles.len();
+            candidate.shell_profiles.push(new_profile);
+            match candidate.validate() {
+                Ok(()) => {
+                    *config = candidate;
+                    self.profile_editor_index = Some(index);
+                    self.confirm_profile_delete = false;
+                    changed = true;
+                }
+                Err(error) => self.notice = Some(error.to_string()),
+            }
+        }
+        changed
+    }
+
+    fn profile_editor(&mut self, ui: &mut Ui, config: &mut AppConfig, index: usize) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            if ui.button("← Profiles").clicked() {
+                self.profile_editor_index = None;
+                self.confirm_profile_delete = false;
+            }
+            ui.label(
+                RichText::new(&config.shell_profiles[index].name)
+                    .size(13.0)
+                    .strong(),
+            );
+        });
+
+        section(ui, "Identity");
+        ui.label(label("Name"));
+        changed |= ui
+            .add_sized(
+                [ui.available_width(), 32.0],
+                TextEdit::singleline(&mut config.shell_profiles[index].name),
+            )
+            .changed();
+
+        section(ui, "Launch");
+        ui.label(label("Executable"));
+        changed |= ui
+            .add_sized(
+                [ui.available_width(), 32.0],
+                TextEdit::singleline(&mut config.shell_profiles[index].command)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("Use the user's $SHELL when empty"),
+            )
+            .changed();
+
+        ui.add_space(8.0);
+        ui.label(label("Arguments"));
+        let mut remove_arg = None;
+        for (arg_index, arg) in config.shell_profiles[index].args.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add_sized(
+                        [(ui.available_width() - 72.0).max(40.0), 32.0],
+                        TextEdit::singleline(arg).font(egui::TextStyle::Monospace),
+                    )
+                    .changed();
+                if ui.button("Remove").clicked() {
+                    remove_arg = Some(arg_index);
+                }
+            });
+        }
+        if let Some(arg_index) = remove_arg {
+            config.shell_profiles[index].args.remove(arg_index);
+            changed = true;
+        }
+        if ui.button("Add argument").clicked() {
+            config.shell_profiles[index].args.push(String::new());
+            changed = true;
+        }
+
+        ui.add_space(8.0);
+        ui.label(label("Working directory"));
+        let mut cwd = config.shell_profiles[index].cwd.clone().unwrap_or_default();
+        if ui
+            .add_sized(
+                [ui.available_width(), 32.0],
+                TextEdit::singleline(&mut cwd)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("Inherit when empty"),
+            )
+            .changed()
+        {
+            config.shell_profiles[index].cwd = (!cwd.is_empty()).then_some(cwd);
+            changed = true;
+        }
+
+        section(ui, "Delete profile");
+        if config.shell_profiles.len() == 1 {
+            ui.label(
+                RichText::new("At least one shell profile is required.")
+                    .size(11.0)
+                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+            );
+        } else if self.confirm_profile_delete {
+            ui.label("Delete this profile?");
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        Button::new("Delete")
+                            .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 77)),
+                    )
+                    .clicked()
+                {
+                    delete_profile(config, index);
+                    self.profile_editor_index = None;
+                    self.confirm_profile_delete = false;
+                    changed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_profile_delete = false;
+                }
+            });
+        } else if ui
+            .add(
+                Button::new("Delete profile…")
+                    .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 77)),
+            )
+            .clicked()
+        {
+            self.confirm_profile_delete = true;
+        }
+        changed
+    }
+
     fn font_family_selector(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
         ui.label(label("Font family"));
         if !self
@@ -581,6 +812,114 @@ impl UiState {
             true
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ProfileIcon {
+    Star { filled: bool },
+    Edit,
+}
+
+fn profile_icon_button(
+    ui: &mut Ui,
+    accessible_label: &str,
+    icon: ProfileIcon,
+    selected: bool,
+) -> egui::Response {
+    let label = RichText::new(accessible_label).color(Color32::TRANSPARENT);
+    let response = ui.add_sized([28.0, 28.0], Button::new(label));
+    let color = if selected || response.hovered() {
+        Color32::from_rgb(125, 211, 252)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 150)
+    };
+    let painter = ui.painter_at(response.rect);
+    match icon {
+        ProfileIcon::Star { filled } => {
+            let center = response.rect.center();
+            let mut points = Vec::with_capacity(10);
+            for point in 0..10 {
+                let angle =
+                    -std::f32::consts::FRAC_PI_2 + point as f32 * std::f32::consts::PI / 5.0;
+                let radius = if point % 2 == 0 { 7.0 } else { 3.2 };
+                points.push(center + egui::vec2(angle.cos(), angle.sin()) * radius);
+            }
+            if filled {
+                for point in 0..points.len() {
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![center, points[point], points[(point + 1) % points.len()]],
+                        color,
+                        egui::Stroke::NONE,
+                    ));
+                }
+            }
+            painter.add(egui::Shape::closed_line(
+                points,
+                egui::Stroke::new(1.4, color),
+            ));
+        }
+        ProfileIcon::Edit => {
+            let center = response.rect.center();
+            painter.line_segment(
+                [
+                    center + egui::vec2(-5.0, 5.0),
+                    center + egui::vec2(4.5, -4.5),
+                ],
+                egui::Stroke::new(2.0, color),
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(3.0, -6.0),
+                    center + egui::vec2(6.0, -3.0),
+                ],
+                egui::Stroke::new(2.0, color),
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(-6.0, 6.0),
+                    center + egui::vec2(-2.0, 5.0),
+                ],
+                egui::Stroke::new(1.5, color),
+            );
+        }
+    }
+    response.on_hover_text(accessible_label)
+}
+
+fn profile_summary(profile: &ShellProfile) -> String {
+    let command = if profile.command.is_empty() {
+        "$SHELL"
+    } else {
+        profile.command.as_str()
+    };
+    match profile.args.len() {
+        0 => command.to_string(),
+        1 => format!("{command} · 1 argument"),
+        count => format!("{command} · {count} arguments"),
+    }
+}
+
+fn next_profile_id(profiles: &[ShellProfile]) -> String {
+    let mut suffix = profiles.len() + 1;
+    loop {
+        let candidate = format!("profile-{suffix}");
+        if profiles.iter().all(|profile| profile.id != candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn delete_profile(config: &mut AppConfig, index: usize) -> bool {
+    if config.shell_profiles.len() <= 1 || index >= config.shell_profiles.len() {
+        return false;
+    }
+    let deleted_default = config.shell_profiles[index].id == config.default_shell_profile_id;
+    config.shell_profiles.remove(index);
+    if deleted_default {
+        config.default_shell_profile_id = config.shell_profiles[0].id.clone();
+    }
+    true
 }
 
 fn font_families_with_current(current: &str) -> Vec<String> {
@@ -1394,6 +1733,52 @@ mod tests {
         let families = font_families_with_current("Custom Mono");
 
         assert_eq!(families.first().map(String::as_str), Some("Custom Mono"));
+    }
+
+    #[test]
+    fn next_profile_id_skips_existing_suffixes() {
+        let mut profiles = AppConfig::default().shell_profiles;
+        profiles.push(ShellProfile {
+            id: "profile-2".to_string(),
+            name: "Two".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+        });
+        profiles.push(ShellProfile {
+            id: "profile-3".to_string(),
+            name: "Three".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+        });
+
+        assert_eq!(next_profile_id(&profiles), "profile-4");
+    }
+
+    #[test]
+    fn deleting_default_profile_selects_a_remaining_profile() {
+        let mut config = AppConfig::default();
+        config.shell_profiles.push(ShellProfile {
+            id: "secondary".to_string(),
+            name: "Secondary".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+        });
+
+        assert!(delete_profile(&mut config, 0));
+        assert_eq!(config.default_shell_profile_id, "secondary");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn deleting_the_only_profile_is_rejected() {
+        let mut config = AppConfig::default();
+
+        assert!(!delete_profile(&mut config, 0));
+        assert_eq!(config.shell_profiles.len(), 1);
+        assert!(config.validate().is_ok());
     }
 
     #[test]
