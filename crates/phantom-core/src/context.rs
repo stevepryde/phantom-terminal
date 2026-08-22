@@ -782,8 +782,7 @@ fn validate_env_key(key: &str) -> AppResult<()> {
             | "TERM_PROGRAM_VERSION"
             | "CLICOLOR"
             | "LSCOLORS"
-    ) || upper.starts_with("LD_")
-        || upper.starts_with("DYLD_");
+    ) || crate::pty::is_loader_env_name(&upper);
     if reserved {
         return invalid(format!(
             "context task may not override reserved environment variable '{key}'"

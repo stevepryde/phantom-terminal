@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -344,6 +345,7 @@ impl PtyManager {
             }
             cmd
         };
+        strip_inherited_loader_env(&mut cmd);
         if let Some(cwd) = opts.cwd.as_ref().filter(|c| !c.is_empty()) {
             cmd.cwd(cwd);
         }
@@ -627,6 +629,49 @@ fn apply_account_env(cmd: &mut CommandBuilder, account: &AccountEnv) {
     }
 }
 
+/// Remove dynamic-loader controls copied into `CommandBuilder` from Phantom's
+/// own launch environment. Ordinary environment variables remain inherited.
+fn strip_inherited_loader_env(cmd: &mut CommandBuilder) {
+    let inherited_keys = std::env::vars_os().map(|(key, _)| key);
+    strip_loader_env_keys(cmd, inherited_keys);
+}
+
+fn strip_loader_env_keys(cmd: &mut CommandBuilder, keys: impl IntoIterator<Item = OsString>) {
+    for key in keys {
+        if is_inherited_loader_env_key(&key) {
+            cmd.env_remove(key);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_inherited_loader_env_key(key: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let key = key.as_bytes();
+    key.starts_with(b"LD_")
+        || key.starts_with(b"DYLD_")
+        || matches!(
+            key,
+            b"LIBPATH" | b"SHLIB_PATH" | b"_RLD_LIST" | b"LDR_PRELOAD" | b"LDR_PRELOAD64"
+        )
+}
+
+#[cfg(not(unix))]
+fn is_inherited_loader_env_key(key: &OsStr) -> bool {
+    key.to_str()
+        .is_some_and(|key| is_loader_env_name(&key.to_ascii_uppercase()))
+}
+
+pub(crate) fn is_loader_env_name(key: &str) -> bool {
+    key.starts_with("LD_")
+        || key.starts_with("DYLD_")
+        || matches!(
+            key,
+            "LIBPATH" | "SHLIB_PATH" | "_RLD_LIST" | "LDR_PRELOAD" | "LDR_PRELOAD64"
+        )
+}
+
 fn startup_shell_args(startup: StartupCommand) -> Vec<String> {
     let mut args = vec![
         "-lic".to_string(),
@@ -705,8 +750,7 @@ pub(crate) fn validate_launch_env(env: &BTreeMap<String, String>) -> AppResult<(
                 | "TERM_PROGRAM_VERSION"
                 | "CLICOLOR"
                 | "LSCOLORS"
-        ) || upper.starts_with("LD_")
-            || upper.starts_with("DYLD_");
+        ) || is_loader_env_name(&upper);
         if reserved {
             return Err(AppError::InvalidConfig(format!(
                 "launch environment may not override reserved variable '{key}'"
@@ -1143,9 +1187,46 @@ mod tests {
     }
 
     #[test]
+    fn loader_controls_are_removed_without_clearing_normal_environment() {
+        let mut cmd = CommandBuilder::new("/bin/true");
+        cmd.env("LD_PRELOAD", "/tmp/injected.so");
+        cmd.env("DYLD_INSERT_LIBRARIES", "/tmp/injected.dylib");
+        cmd.env("LIBPATH", "/tmp/loader-search");
+        cmd.env("EDITOR", "vim");
+
+        strip_loader_env_keys(
+            &mut cmd,
+            ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "LIBPATH", "EDITOR"]
+                .into_iter()
+                .map(OsString::from),
+        );
+
+        assert_eq!(cmd.get_env("LD_PRELOAD"), None);
+        assert_eq!(cmd.get_env("DYLD_INSERT_LIBRARIES"), None);
+        assert_eq!(cmd.get_env("LIBPATH"), None);
+        assert_eq!(cmd.get_env("EDITOR"), Some(OsStr::new("vim")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loader_control_removal_does_not_depend_on_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut cmd = CommandBuilder::new("/bin/true");
+        cmd.env("LD_PRELOAD", OsString::from_vec(vec![0xff]));
+
+        strip_loader_env_keys(&mut cmd, [OsString::from("LD_PRELOAD")]);
+
+        assert_eq!(cmd.get_env("LD_PRELOAD"), None);
+    }
+
+    #[test]
     fn final_launch_boundary_rejects_reserved_or_control_environment() {
         let reserved = BTreeMap::from([("PATH".to_string(), "/tmp".to_string())]);
         assert!(validate_launch_env(&reserved).is_err());
+
+        let loader = BTreeMap::from([("LIBPATH".to_string(), "/tmp".to_string())]);
+        assert!(validate_launch_env(&loader).is_err());
 
         let control = BTreeMap::from([("RUST_LOG".to_string(), "info\nPATH=/tmp".to_string())]);
         assert!(validate_launch_env(&control).is_err());
