@@ -98,7 +98,18 @@ const SURFACE_OCCLUDED_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_FATAL_PRESENTS: u32 = 10;
 /// Logical px the tab strip scrolls per wheel notch line.
 const TAB_STRIP_WHEEL_PX: f32 = 24.0;
-const TAB_DRAG_TOLERANCE_PX: f32 = 8.0;
+const TAB_DRAG_TOLERANCE_LOGICAL_PX: f32 = 8.0;
+
+fn tab_drag_moved_past_tolerance(
+    start: (f32, f32),
+    current: (f32, f32),
+    scale_factor: f32,
+) -> bool {
+    let dx = current.0 - start.0;
+    let dy = current.1 - start.1;
+    let tolerance = TAB_DRAG_TOLERANCE_LOGICAL_PX * scale_factor.max(1.0);
+    dx * dx + dy * dy >= tolerance * tolerance
+}
 
 /// The only supported entry point for creating a terminal tab. Every caller,
 /// including contextual actions, starts from the same validated shell profile
@@ -3003,9 +3014,12 @@ impl App {
             return false;
         };
         let (px, py) = self.cursor_pos;
-        let dx = px - drag.start.0;
-        let dy = py - drag.start.1;
-        if !drag.active && dx * dx + dy * dy < TAB_DRAG_TOLERANCE_PX * TAB_DRAG_TOLERANCE_PX {
+        let scale_factor = self
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.scale_factor())
+            .unwrap_or(1.0);
+        if !drag.active && !tab_drag_moved_past_tolerance(drag.start, (px, py), scale_factor) {
             return true;
         }
         let target = self
@@ -6358,6 +6372,16 @@ mod tests {
 
         assert_eq!(app.cursor_icon, CursorIcon::Default);
         assert!(!app.cursor_seen);
+    }
+
+    #[test]
+    fn tab_drag_tolerance_is_eight_logical_pixels_at_one_and_two_x() {
+        let start = (100.0, 200.0);
+        assert!(!tab_drag_moved_past_tolerance(start, (107.9, 200.0), 1.0));
+        assert!(tab_drag_moved_past_tolerance(start, (108.0, 200.0), 1.0));
+
+        assert!(!tab_drag_moved_past_tolerance(start, (115.9, 200.0), 2.0));
+        assert!(tab_drag_moved_past_tolerance(start, (116.0, 200.0), 2.0));
     }
 
     #[test]
