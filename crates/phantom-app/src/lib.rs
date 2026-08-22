@@ -2207,6 +2207,7 @@ impl App {
             cursor_shape(&self.config.cursor_style),
         );
         if self.applied_term_options != term_options {
+            let tracks_live_selection = self.find_selection_scope_tracks_live_selection();
             self.applied_term_options = term_options;
             if !self.find_worker.set_options(term_options.0, term_options.1) {
                 self.handle_find_worker_failure();
@@ -2216,6 +2217,15 @@ impl App {
             for tab in &mut self.tabs {
                 tab.core
                     .set_terminal_options(term_options.0, term_options.1);
+            }
+            if self.ui.find_open() {
+                // A history resize can rotate every absolute buffer
+                // coordinate. Never leave the previous result set navigable
+                // while its replacement runs, and keep selection-only search
+                // scoped only when Alacritty could remap the captured range.
+                self.sync_find_selection_scope_after_terminal_change(tracks_live_selection);
+                self.apply_find_result(Ok(SearchOutcome::default()));
+                self.refresh_find();
             }
         }
         let next_signature = renderer_signature(&self.config);
@@ -5402,6 +5412,56 @@ mod tests {
         app.apply_config_change();
 
         assert_eq!(app.tabs[0].core.snapshot().cursor.shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn scrollback_change_invalidates_find_coordinates_and_submits_a_new_generation() {
+        let mut app = test_app();
+        let bytes = b"target old\r\none\r\ntwo\r\ntarget current\r\nlast";
+        app.config.scrollback_lines = 8;
+        app.applied_term_options = (8, CursorShape::Block);
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(2, 40, 8, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.tabs[0].advance_pty(bytes);
+        app.find_worker.create(0, 2, 40, 8, CursorShape::Block);
+        app.find_worker.advance(0, bytes.to_vec(), false);
+        app.ui.open_find(false);
+        app.ui.configure_find_for_tests("target", false);
+        app.refresh_find();
+        app.wait_for_find_for_tests();
+
+        let stale_matches = app.find_matches.clone();
+        let stale_generation = app.find_request_generation.unwrap();
+        assert_eq!(stale_matches.len(), 2);
+
+        app.config.scrollback_lines = 1;
+        app.apply_config_change();
+
+        // The old absolute coordinates must not remain navigable during the
+        // asynchronous replacement search.
+        assert!(app.find_matches.is_empty());
+        assert!(app.find_pending);
+        assert!(app.find_request_generation.unwrap() > stale_generation);
+        assert!(!app.tabs[0]
+            .core
+            .snapshot()
+            .cells
+            .iter()
+            .any(|cell| cell.search_match));
+
+        let expected = app.tabs[0]
+            .core
+            .search_scrollback("target", SearchOptions::default(), None)
+            .unwrap()
+            .matches;
+        assert_ne!(expected, stale_matches);
+        app.wait_for_find_for_tests();
+        assert_eq!(app.find_matches, expected);
     }
 
     #[test]
