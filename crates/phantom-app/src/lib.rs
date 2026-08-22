@@ -2599,12 +2599,10 @@ impl App {
                 hit = Some(Hit::Settings);
             } else if hits.new_tab.contains(px, py) {
                 hit = Some(Hit::New);
+            } else if let Some(index) = hits.close_at(px, py) {
+                hit = Some(Hit::Close(index));
             } else {
                 for th in &hits.tabs {
-                    if th.close.contains(px, py) {
-                        hit = Some(Hit::Close(th.index));
-                        break;
-                    }
                     if th.rect.contains(px, py) {
                         hit = Some(Hit::Switch(th.index));
                         break;
