@@ -8,7 +8,13 @@ use egui::{Color32, ComboBox, Context, Id, InnerResponse, Stroke, Ui};
 pub const APP_BACKGROUND: Color32 = Color32::from_rgb(11, 11, 14);
 pub const SIDEBAR_SURFACE: Color32 = Color32::from_rgb(17, 17, 22);
 pub const ELEVATED_SURFACE: Color32 = Color32::from_rgb(26, 26, 32);
-pub const DIVIDER: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 26);
+pub const DIVIDER_RGBA: [u8; 4] = [255, 255, 255, 26];
+pub const DIVIDER: Color32 = Color32::from_rgba_unmultiplied_const(
+    DIVIDER_RGBA[0],
+    DIVIDER_RGBA[1],
+    DIVIDER_RGBA[2],
+    DIVIDER_RGBA[3],
+);
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 230);
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 140);
 pub const TEXT_MUTED: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 90);
