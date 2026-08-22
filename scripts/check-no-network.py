@@ -125,13 +125,17 @@ SOCKET_PATTERNS = [
     re.compile(r"\bextern\s+crate\s+libc\s+as\b"),
     re.compile(r"\buse\s+(?:::)?libc\s+as\b"),
     re.compile(r"\buse\s+(?:::)?libc\s*::\s*\{[^}]*\bself\s+as\b", re.S),
+    re.compile(r"\b(?:pub\s+)?use\s+(?:::)?libc\s*::\s*(?:\*|\{[^}]*\*)", re.S),
     re.compile(r"\blibc\s*::\s*(socket|connect|bind)\b"),
     re.compile(r"\blibc\s*::\s*\{[^}]*\b(socket|connect|bind)\b", re.S),
     re.compile(r"\b(?:unsafe\s+)?extern\s*\{[^}]*\b(socket|connect|bind)\s*\(", re.S),
+    re.compile(r"\blink_name\b"),
+    re.compile(r"#\s*\[\s*path\s*="),
+    re.compile(r"\binclude\s*!\s*[({]"),
 ]
 
 
-def strip_comments_and_literals(source, strip_literals=True):
+def strip_comments_and_literals(source):
     """Replace Rust comments and string/char contents while preserving lines."""
     result = list(source)
     i = 0
@@ -170,10 +174,9 @@ def strip_comments_and_literals(source, strip_literals=True):
             end_marker = '"' + hashes
             end = source.find(end_marker, i)
             i = length if end < 0 else end + len(end_marker)
-            if strip_literals:
-                for offset in range(start, i):
-                    if result[offset] != "\n":
-                        result[offset] = " "
+            for offset in range(start, i):
+                if result[offset] != "\n":
+                    result[offset] = " "
             continue
 
         prefix = 1 if source.startswith(('b"', 'c"'), i) else 0
@@ -189,18 +192,16 @@ def strip_comments_and_literals(source, strip_literals=True):
                 escaped = char == "\\" and not escaped
                 if char != "\\":
                     escaped = False
-            if strip_literals:
-                for offset in range(start, i):
-                    if result[offset] != "\n":
-                        result[offset] = " "
+            for offset in range(start, i):
+                if result[offset] != "\n":
+                    result[offset] = " "
             continue
 
         char_literal = re.match(r"(?:b)?'(?:\\.|[^\\'\n])'", source[i:])
         if char_literal:
             end = i + char_literal.end()
-            if strip_literals:
-                for offset in range(i, end):
-                    result[offset] = " "
+            for offset in range(i, end):
+                result[offset] = " "
             i = end
             continue
         i += 1
@@ -382,15 +383,6 @@ def validate_sources(metadata):
             blocked.add(f"could not read Rust source {source_file}: {error}")
             continue
         code = strip_comments_and_literals(source)
-        comments_removed = strip_comments_and_literals(source, strip_literals=False)
-        link_name = re.search(
-            r'#\s*\[\s*link_name\s*=\s*"(socket|connect|bind)"\s*\]',
-            comments_removed,
-        )
-        if link_name:
-            line = comments_removed.count("\n", 0, link_name.start()) + 1
-            blocked.add(f"direct socket API: {source_file}:{line}")
-            continue
         for pattern in SOCKET_PATTERNS:
             match = pattern.search(code)
             if match:

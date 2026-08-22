@@ -85,6 +85,7 @@ clean="$scratch/clean"
 new_fixture "$clean"
 printf '%s\n' \
   'pub const EXAMPLE: &str = "std::net::TcpStream::connect";' \
+  'pub const ATTRIBUTE_EXAMPLE: &str = r##"#[link_name = "socket"]"##;' \
   '// std::net::UdpSocket::bind is forbidden in executable code.' \
   'use libc::{openat, O_CLOEXEC};' \
   'pub fn local_address(port: u16) -> std::net::SocketAddr {' \
@@ -242,6 +243,17 @@ printf '%s\n' \
 cargo generate-lockfile --offline --manifest-path "$libc_module_alias/Cargo.toml"
 expect_failure "$libc_module_alias" 'direct socket API:'
 
+echo "==> libc glob imports and local re-exports fail"
+libc_glob="$scratch/libc-glob"
+new_fixture "$libc_glob"
+printf '%s\n' \
+  'mod native { pub use libc::*; }' \
+  'use native::*;' \
+  'pub fn raw() { let _ = socket; }' \
+  >"$libc_glob/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$libc_glob/Cargo.toml"
+expect_failure "$libc_glob" 'direct socket API:'
+
 echo "==> raw FFI link-name aliases fail"
 link_name="$scratch/link-name"
 new_fixture "$link_name"
@@ -253,6 +265,35 @@ printf '%s\n' \
   >"$link_name/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$link_name/Cargo.toml"
 expect_failure "$link_name" 'direct socket API:'
+
+echo "==> every link-name spelling fails without literal false positives"
+link_name_variants="$scratch/link-name-variants"
+new_fixture "$link_name_variants"
+printf '%s\n' \
+  'unsafe extern "C" {' \
+  '    #[link_name = r#"socket"#]' \
+  '    fn raw_name();' \
+  '    #[link_name = "sock\x65t"]' \
+  '    fn escaped_name();' \
+  '    #[link_name = concat!("sock", "et")]' \
+  '    fn concatenated_name();' \
+  '    #[cfg_attr(unix, link_name = "socket")]' \
+  '    fn conditional_name();' \
+  '}' \
+  >"$link_name_variants/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$link_name_variants/Cargo.toml"
+expect_failure "$link_name_variants" 'direct socket API:'
+
+echo "==> out-of-root compiler inputs fail closed"
+compiler_input="$scratch/compiler-input"
+new_fixture "$compiler_input"
+printf '%s\n' \
+  '#[path = "../../../network.rs"]' \
+  'mod network;' \
+  'include!("../../../more_network.rs");' \
+  >"$compiler_input/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$compiler_input/Cargo.toml"
+expect_failure "$compiler_input" 'direct socket API:'
 
 echo "==> grouped and aliased libc socket imports fail"
 libc_alias="$scratch/libc-alias"
