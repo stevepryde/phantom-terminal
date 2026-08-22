@@ -17,5 +17,5 @@ directories = { workspace = true }
 thiserror = { workspace = true }
 noyalib = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

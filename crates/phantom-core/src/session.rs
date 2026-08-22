@@ -64,19 +64,28 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn open() -> AppResult<Self> {
-        let path = db_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            set_mode(parent, 0o700);
-        }
-        let conn = Connection::open(&path)?;
-        restrict_db_permissions(&path);
+        Self::open_at(&db_path()?)
+    }
+
+    /// Open (creating if needed) the store at `path`, refusing to proceed
+    /// unless owner-only at-rest protection is actually in place: a `0700`
+    /// directory holding a `0600` regular-file database, both owned by the
+    /// current user, with no symlinks anywhere in the final components. On
+    /// failure the caller gets an error and no store — the app then runs
+    /// without persistence rather than writing session data somewhere an
+    /// attacker could read or redirect.
+    fn open_at(path: &std::path::Path) -> AppResult<Self> {
+        prepare_secure_store(path)?;
+        let conn = Connection::open(path)?;
         // Two running instances share this WAL database; without a busy
         // timeout a concurrent write returns SQLITE_BUSY immediately and the
         // save fails with a user-visible notice.
         conn.busy_timeout(std::time::Duration::from_millis(2000))?;
         migrate(&conn)?;
-        restrict_db_permissions(&path);
+        // SQLite creates the WAL/SHM sidecars next to the database with the
+        // database's own 0600 mode, but re-verify so a loose sidecar left by
+        // an earlier build cannot linger inside the store directory.
+        verify_sidecars(path)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -385,28 +394,229 @@ fn db_path() -> AppResult<PathBuf> {
     Ok(dirs.data_dir().join("phantom.db"))
 }
 
-/// Best-effort `chmod` for the session store's files and dir. Failures are
-/// ignored: the store still works without the tightened mode, and the parent
-/// `0700` dir already gates access. No-op on non-unix targets.
+/// Establish the store's at-rest protection before SQLite touches the path,
+/// failing closed on any doubt. The directory and database are created with
+/// their final modes (no create-then-chmod window), existing paths are opened
+/// with `O_NOFOLLOW` and verified through the opened handle's metadata
+/// (rejecting symlinks, non-regular files, and foreign ownership), and modes
+/// looser than owner-only are tightened via `fchmod` and re-checked. The
+/// remaining path/handle races are only reachable by processes that can
+/// already write inside the verified `0700` directory, i.e. the same user.
 #[cfg(unix)]
-fn set_mode(path: &std::path::Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mut perms = meta.permissions();
-        perms.set_mode(mode);
-        let _ = std::fs::set_permissions(path, perms);
+fn prepare_secure_store(path: &std::path::Path) -> AppResult<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "session store path {} has no parent directory",
+                path.display()
+            ))
+        })?;
+    // mkdir(2) applies the mode at creation (masked by umask, which can only
+    // tighten it); verification below repairs or rejects anything looser.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .map_err(|error| {
+            AppError::Other(format!(
+                "could not create session store directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    let dir =
+        open_probe(parent, ProbeKind::Directory).map_err(|error| probe_error(parent, &error))?;
+    ensure_owner_only(&dir, parent, 0o700, "session store directory")?;
+
+    let db = open_or_create_db_file(path)?;
+    if !db
+        .metadata()
+        .map_err(|error| probe_error(path, &error))?
+        .file_type()
+        .is_file()
+    {
+        return Err(AppError::Other(format!(
+            "refusing to use session store database {}: not a regular file",
+            path.display()
+        )));
     }
+    ensure_owner_only(&db, path, 0o600, "session store database")?;
+
+    verify_sidecars(path)
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &std::path::Path, _mode: u32) {}
-
-fn restrict_db_permissions(path: &std::path::Path) {
-    set_mode(path, 0o600);
-    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        set_mode(&path.with_file_name(format!("{name}-wal")), 0o600);
-        set_mode(&path.with_file_name(format!("{name}-shm")), 0o600);
+fn prepare_secure_store(path: &std::path::Path) -> AppResult<()> {
+    // Phantom Terminal ships on macOS and Linux only; on other targets fall
+    // back to the platform's default ACLs, as before this hardening.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    Ok(())
+}
+
+/// Verify the WAL/SHM sidecars (when present) are owner-only regular files,
+/// tightening loose modes and refusing symlinks or special files.
+#[cfg(unix)]
+fn verify_sidecars(path: &std::path::Path) -> AppResult<()> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(AppError::Other(format!(
+            "session store path {} has no file name",
+            path.display()
+        )));
+    };
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = path.with_file_name(format!("{name}{suffix}"));
+        let file = match open_probe(&sidecar, ProbeKind::File) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(probe_error(&sidecar, &error)),
+        };
+        if !file
+            .metadata()
+            .map_err(|error| probe_error(&sidecar, &error))?
+            .file_type()
+            .is_file()
+        {
+            return Err(AppError::Other(format!(
+                "refusing to use session store sidecar {}: not a regular file",
+                sidecar.display()
+            )));
+        }
+        ensure_owner_only(&file, &sidecar, 0o600, "session store sidecar")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_sidecars(_path: &std::path::Path) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+enum ProbeKind {
+    Directory,
+    File,
+    CreateFile,
+}
+
+/// Open `path` without following a final-component symlink, so every check
+/// afterwards can go through the opened handle (`fstat`/`fchmod`) instead of
+/// a re-raceable path. `O_NONBLOCK` keeps a planted FIFO from hanging the
+/// probe open; it has no effect once the target is proven a regular file.
+#[cfg(unix)]
+fn open_probe(path: &std::path::Path, kind: ProbeKind) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    match kind {
+        ProbeKind::Directory => {
+            options
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        }
+        ProbeKind::File => {
+            options
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        ProbeKind::CreateFile => {
+            options
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn probe_error(path: &std::path::Path, error: &std::io::Error) -> AppError {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return AppError::Other(format!(
+            "refusing to use session store path {}: it is a symlink",
+            path.display()
+        ));
+    }
+    AppError::Other(format!(
+        "could not open session store path {}: {error}",
+        path.display()
+    ))
+}
+
+/// Open the database file, creating it atomically with mode `0600` when it
+/// does not exist yet (`O_CREAT|O_EXCL`, so a concurrently planted path can
+/// never be silently adopted).
+#[cfg(unix)]
+fn open_or_create_db_file(path: &std::path::Path) -> AppResult<std::fs::File> {
+    let opened = match open_probe(path, ProbeKind::File) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match open_probe(path, ProbeKind::CreateFile) {
+                Ok(file) => Ok(file),
+                // Lost a create race with another instance of this app;
+                // the now-existing file still gets fully verified.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    open_probe(path, ProbeKind::File)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    opened.map_err(|error| probe_error(path, &error))
+}
+
+/// Require `file` (already opened `O_NOFOLLOW`) to be owned by the current
+/// user with exactly `want` permission bits, tightening a looser mode through
+/// the handle and failing if the result still is not owner-only.
+#[cfg(unix)]
+fn ensure_owner_only(
+    file: &std::fs::File,
+    path: &std::path::Path,
+    want: u32,
+    what: &str,
+) -> AppResult<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    let meta = file.metadata().map_err(|error| probe_error(path, &error))?;
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(AppError::Other(format!(
+            "refusing to use {what} {}: owned by uid {} but this process runs as uid {euid}",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    let mut mode = meta.mode() & 0o7777;
+    if mode != want {
+        if unsafe { libc::fchmod(file.as_raw_fd(), want as libc::mode_t) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(AppError::Other(format!(
+                "could not restrict permissions of {what} {}: {error}",
+                path.display()
+            )));
+        }
+        mode = file
+            .metadata()
+            .map_err(|error| probe_error(path, &error))?
+            .mode()
+            & 0o7777;
+    }
+    if mode & 0o077 != 0 || mode & want != want {
+        return Err(AppError::Other(format!(
+            "refusing to use {what} {}: mode {mode:04o} could not be restricted to {want:04o}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -712,6 +922,154 @@ mod tests {
             )
             .unwrap();
         assert_eq!(backup_count, 1);
+    }
+
+    /// Unique per-test scratch directory (no tempfile dependency), removed on
+    /// drop.
+    #[cfg(unix)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(unix)]
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("phantom-session-test-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_creates_private_dir_and_db() {
+        let scratch = ScratchDir::new("create");
+        let db = scratch.path().join("data").join("phantom.db");
+
+        let store = SessionStore::open_at(&db).unwrap();
+        store.save_tabs(&[tab("one", "/a", true)]).unwrap();
+        assert_eq!(store.load_tabs().unwrap().len(), 1);
+
+        assert_eq!(mode_of(db.parent().unwrap()), 0o700);
+        assert_eq!(mode_of(&db), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = scratch
+                .path()
+                .join("data")
+                .join(format!("phantom.db{suffix}"));
+            if sidecar.exists() {
+                assert_eq!(mode_of(&sidecar), 0o600, "{}", sidecar.display());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_tightens_loose_existing_modes() {
+        let scratch = ScratchDir::new("tighten");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o755);
+        let db = data.join("phantom.db");
+        std::fs::File::create(&db).unwrap();
+        chmod(&db, 0o644);
+        let wal = data.join("phantom.db-wal");
+        std::fs::File::create(&wal).unwrap();
+        chmod(&wal, 0o664);
+
+        // Keep the store alive: SQLite removes the WAL sidecar when the last
+        // connection closes, and this test asserts on its tightened mode.
+        let _store = SessionStore::open_at(&db).unwrap();
+
+        assert_eq!(mode_of(&data), 0o700);
+        assert_eq!(mode_of(&db), 0o600);
+        assert_eq!(mode_of(&wal), 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_symlinked_db() {
+        let scratch = ScratchDir::new("symlink-db");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let target = scratch.path().join("elsewhere.db");
+        std::fs::File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, data.join("phantom.db")).unwrap();
+
+        let error = SessionStore::open_at(&data.join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_symlinked_store_dir() {
+        let scratch = ScratchDir::new("symlink-dir");
+        let real = scratch.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        chmod(&real, 0o700);
+        let data = scratch.path().join("data");
+        std::os::unix::fs::symlink(&real, &data).unwrap();
+
+        let error = SessionStore::open_at(&data.join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_non_regular_db_path() {
+        let scratch = ScratchDir::new("non-regular");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        // A directory where the database file should be.
+        std::fs::create_dir(data.join("phantom.db")).unwrap();
+
+        assert!(SessionStore::open_at(&data.join("phantom.db")).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_at_rejects_symlinked_wal_sidecar() {
+        let scratch = ScratchDir::new("symlink-wal");
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        chmod(&data, 0o700);
+        let target = scratch.path().join("stolen-wal");
+        std::fs::File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, data.join("phantom.db-wal")).unwrap();
+
+        let error = SessionStore::open_at(&data.join("phantom.db"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symlink"), "{error}");
     }
 
     #[test]
