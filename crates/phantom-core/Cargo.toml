@@ -6,6 +6,9 @@ authors = ["Steve Pryde"]
 license = "MIT"
 edition = "2021"
 
+[lints]
+workspace = true
+
 # UI-agnostic backend for the native winit/wgpu app. No GUI or rendering
 # dependencies belong here.
 [dependencies]

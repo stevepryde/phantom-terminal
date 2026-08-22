@@ -6,6 +6,9 @@ authors = ["Steve Pryde"]
 license = "MIT"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "phantom"
 path = "src/main.rs"
