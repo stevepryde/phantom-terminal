@@ -49,11 +49,14 @@ terminal/egui ownership boundary, and general visual rules remain owned by
   clearance for the floating sidebar button. It must not reserve terminal grid
   space or overlap titlebar/tab chrome.
 - **FIND-010 (confirmed):** The row must contain only a search text box, the
-  four option icons, Previous, and Next. Controls must use Phantom's compact
-  dark surface, `4px` rounding, visible focus/toggle states, accessible labels,
-  and tooltips. Option icons must communicate state without relying on color
-  alone. Previous and Next must be at least `28px` icon targets and visibly
-  disabled when unavailable.
+  four option icons, a compact match count, Previous, and Next. The count must
+  show the one-based active position and total as `N of M`, `0` when there are
+  no matches, and `10000+` when matching reaches the configured cap. It must be
+  a non-interactive accessible label. Controls must use Phantom's compact dark
+  surface, `4px` rounding, visible focus/toggle states, accessible labels, and
+  tooltips. Option icons must communicate state without relying on color alone.
+  Previous and Next must be at least `28px` icon targets and visibly disabled
+  when unavailable.
 - **FIND-011 (correctness):** Matching must preserve a stable mapping from
   returned text spans to terminal cells, including Unicode text, wide cells,
   wrapped lines, and scrollback coordinates. Whole-word matching must use
@@ -90,7 +93,10 @@ terminal/egui ownership boundary, and general visual rules remain owned by
   not reach the PTY. Press `Escape` and verify normal terminal typing resumes at
   once, the viewport remains at the last match, and temporary search highlight
   is gone.
-- **AC-FIND-G:** Verify literal and regex matching across Unicode, wide glyphs,
+- **AC-FIND-G:** Verify the overlay shows `N of M` while navigating matches, `0`
+  for an empty result set, and `10000+` after reaching the match cap. The count
+  remains in the single row and is announced as a non-interactive result label.
+- **AC-FIND-H:** Verify literal and regex matching across Unicode, wide glyphs,
   wrapped terminal lines, and scrollback boundaries. Run the repository's
   required formatting, lint, build, test, supply-chain (when installed), and
   no-network checks.
@@ -101,9 +107,8 @@ terminal/egui ownership boundary, and general visual rules remain owned by
   interaction. The active find highlight is separate from the terminal's
   ordinary selection so selection-only remains deterministic and copy behavior
   is not changed by navigation.
-- The overlay intentionally omits a result counter and close button to honor
-  the requested minimal surface. Disabled navigation and the active terminal
-  highlight provide the necessary steady-state feedback; `Escape` is the
+- The overlay intentionally omits a close button. The compact result count and
+  active terminal highlight provide steady-state feedback; `Escape` is the
   close action.
 - Search is ephemeral and bounded by the configured in-memory scrollback, so it
   does not change Phantom's session-data or no-network posture.

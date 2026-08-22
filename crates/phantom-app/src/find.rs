@@ -4,14 +4,15 @@
 //! feeds result summaries back after evaluating the current query and options.
 
 use egui::scroll_area::ScrollBarVisibility;
-use egui::{Area, Button, Color32, Frame, Id, Key, Margin, Order, ScrollArea, TextEdit, Ui};
+use egui::{Area, Button, Color32, Frame, Id, Key, Margin, Order, ScrollArea, Sense, TextEdit, Ui};
 
-use crate::ui_components::{with_alpha, DIVIDER, ELEVATED_SURFACE, FOCUS_ACCENT};
+use crate::ui_components::{with_alpha, DIVIDER, ELEVATED_SURFACE, FOCUS_ACCENT, TEXT_SECONDARY};
 
 const BAR_INSET: f32 = 8.0;
 const BAR_HEIGHT: f32 = 36.0;
 const CONTROL_SIZE: f32 = 28.0;
 const CONTROL_GAP: f32 = 4.0;
+const MATCH_COUNT_WIDTH: f32 = 72.0;
 const IDEAL_QUERY_WIDTH: f32 = 220.0;
 const MIN_QUERY_WIDTH: f32 = 72.0;
 
@@ -49,6 +50,21 @@ pub(crate) struct FindResultSummary {
 impl FindResultSummary {
     fn navigation_available(&self, query: &str) -> bool {
         !query.is_empty() && self.error.is_none() && self.match_count > 0
+    }
+
+    fn display_count(&self) -> String {
+        if self.match_count == 0 {
+            "0".to_string()
+        } else if self.capped {
+            format!("{}+", self.match_count)
+        } else if let Some(active) = self
+            .active_match
+            .filter(|active| *active < self.match_count)
+        {
+            format!("{} of {}", active + 1, self.match_count)
+        } else {
+            self.match_count.to_string()
+        }
     }
 }
 
@@ -174,8 +190,9 @@ impl FindState {
                         ui.set_max_width(content_width);
                         ui.set_height(BAR_HEIGHT - BAR_INSET * 2.0);
                         ui.spacing_mut().item_spacing.x = CONTROL_GAP;
-                        // Six 28px icon targets plus a useful text input cannot
-                        // fit every arbitrarily narrow native window. Keep the
+                        // Six 28px icon targets, the compact result count, and
+                        // a useful text input cannot fit every arbitrarily
+                        // narrow native window. Keep the
                         // surface clipped to the terminal pane and allow the
                         // single row to scroll horizontally at those extremes.
                         ScrollArea::horizontal()
@@ -310,6 +327,8 @@ impl FindState {
             self.results = FindResultSummary::default();
         }
 
+        result_count(ui, &self.results);
+
         let can_navigate = self.results.navigation_available(&self.query);
         if navigation_button(ui, FindNavigation::Previous, can_navigate) {
             outcome.navigation = Some(FindNavigation::Previous);
@@ -351,7 +370,7 @@ fn find_bar_layout(terminal_rect: egui::Rect, right_boundary: f32) -> FindBarLay
         .min(terminal_rect.right())
         .max(terminal_rect.left());
     let available_width = (right - terminal_rect.left() - BAR_INSET * 2.0).max(0.0);
-    let fixed_width = CONTROL_SIZE * 6.0 + CONTROL_GAP * 6.0 + BAR_INSET * 2.0;
+    let fixed_width = CONTROL_SIZE * 6.0 + MATCH_COUNT_WIDTH + CONTROL_GAP * 7.0 + BAR_INSET * 2.0;
     let flexible_width = (available_width - fixed_width).max(0.0);
     let query_width = flexible_width.clamp(MIN_QUERY_WIDTH, IDEAL_QUERY_WIDTH);
     FindBarLayout {
@@ -377,6 +396,26 @@ enum OptionIcon {
     WholeWord,
     Regex,
     Selection,
+}
+
+fn result_count(ui: &mut Ui, results: &FindResultSummary) {
+    let text = results.display_count();
+    let accessible_label = format!("Find results: {text}");
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(MATCH_COUNT_WIDTH, CONTROL_SIZE), Sense::hover());
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(12.0),
+        TEXT_SECONDARY,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, false, accessible_label.clone())
+    });
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label(accessible_label);
+    });
 }
 
 fn option_button(
@@ -569,6 +608,43 @@ mod tests {
     }
 
     #[test]
+    fn result_count_formats_zero_active_and_capped_states() {
+        assert_eq!(FindResultSummary::default().display_count(), "0");
+        assert_eq!(
+            FindResultSummary {
+                match_count: 41,
+                active_match: Some(2),
+                ..Default::default()
+            }
+            .display_count(),
+            "3 of 41"
+        );
+        assert_eq!(
+            FindResultSummary {
+                match_count: 10_000,
+                capped: true,
+                active_match: Some(2),
+                error: None,
+            }
+            .display_count(),
+            "10000+"
+        );
+    }
+
+    #[test]
+    fn result_count_does_not_claim_an_invalid_active_position() {
+        assert_eq!(
+            FindResultSummary {
+                match_count: 3,
+                active_match: Some(3),
+                ..Default::default()
+            }
+            .display_count(),
+            "3"
+        );
+    }
+
+    #[test]
     fn repeated_open_requests_focus_and_query_selection() {
         let mut state = FindState::default();
         state.open(true);
@@ -686,6 +762,9 @@ mod tests {
                 && node.label()
                     == Some("Selection only (no selection was captured when Find opened)")
                 && node.is_disabled()
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Label && node.label() == Some("Find results: 0")
         }));
     }
 }
