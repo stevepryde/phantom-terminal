@@ -57,6 +57,29 @@ expect_failure() {
 echo "==> repository's reviewed AccessKit graph passes"
 "$gate"
 
+echo "==> unreviewed egui-winit link features fail"
+feature_metadata="$scratch/feature-metadata.json"
+cargo metadata --locked --format-version 1 >"$feature_metadata"
+python3 - "$feature_metadata" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as metadata_file:
+    metadata = json.load(metadata_file)
+packages = {package["id"]: package for package in metadata["packages"]}
+for node in metadata["resolve"]["nodes"]:
+    if packages[node["id"]]["name"] == "egui-winit":
+        node["features"].append("links")
+with open(path, "w", encoding="utf-8") as metadata_file:
+    json.dump(metadata, metadata_file)
+PY
+if output=$(python3 "$script_dir/check-no-network.py" "$feature_metadata" 2>&1); then
+  echo "unreviewed egui-winit features unexpectedly passed" >&2
+  exit 1
+fi
+grep -q 'unreviewed features for egui-winit' <<<"$output"
+
 echo "==> harmless address types, comments, and strings pass"
 clean="$scratch/clean"
 new_fixture "$clean"
@@ -207,6 +230,29 @@ printf '%s\n' \
   >"$raw_ffi/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$raw_ffi/Cargo.toml"
 expect_failure "$raw_ffi" 'direct socket API:'
+
+echo "==> libc module aliases fail"
+libc_module_alias="$scratch/libc-module-alias"
+new_fixture "$libc_module_alias"
+printf '%s\n' \
+  'extern crate libc as c;' \
+  'use ::libc as native;' \
+  'pub fn aliases() { let _ = (c::socket, native::connect); }' \
+  >"$libc_module_alias/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$libc_module_alias/Cargo.toml"
+expect_failure "$libc_module_alias" 'direct socket API:'
+
+echo "==> raw FFI link-name aliases fail"
+link_name="$scratch/link-name"
+new_fixture "$link_name"
+printf '%s\n' \
+  'unsafe extern "C" {' \
+  '    #[link_name = "socket"]' \
+  '    fn open_socket(domain: i32, kind: i32, protocol: i32) -> i32;' \
+  '}' \
+  >"$link_name/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$link_name/Cargo.toml"
+expect_failure "$link_name" 'direct socket API:'
 
 echo "==> grouped and aliased libc socket imports fail"
 libc_alias="$scratch/libc-alias"

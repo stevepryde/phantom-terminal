@@ -43,7 +43,7 @@ PROTOCOL_CLIENTS = {
     "attohttpc", "awc", "curl", "ehttp", "fastwebsockets", "h2", "hyper",
     "hyper-util", "isahc", "libssh2-sys", "minreq", "quinn", "quinn-proto",
     "quinn-udp", "reqwest", "ssh2", "surf", "tokio-tungstenite", "tonic",
-    "tungstenite", "ureq", "websocket",
+    "tungstenite", "ureq", "webbrowser", "websocket",
 }
 
 LOW_LEVEL_TRANSPORTS = {
@@ -68,6 +68,50 @@ ACCESSKIT_EXCEPTIONS = {
     },
 }
 
+APPROVED_FEATURES = {
+    "alacritty_terminal": {"default", "serde"},
+    "arboard": {"core-graphics", "default", "image", "image-data", "windows-sys"},
+    "bytemuck": {"aarch64_simd", "bytemuck_derive", "derive", "extern_crate_alloc", "min_const_generics"},
+    "directories": set(),
+    "egui": {"default", "default_fonts"},
+    "egui-wgpu": {"default", "fragile-send-sync-non-atomic-wasm", "macos-window-resize-jitter-fix"},
+    "egui-winit": {"accesskit"},
+    "epaint_default_fonts": set(),
+    "fontique": {"default", "fontconfig-dlopen", "std", "system"},
+    "image": {"bmp", "png", "tiff", "webp"},
+    "libc": {"default", "extra_traits", "std"},
+    "noyalib": {"minimal", "std"},
+    "objc2": {"alloc", "default", "relax-sign-encoding", "std"},
+    "objc2-app-kit": {
+        "NSImage", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSView",
+        "NSWindow", "alloc", "bitflags", "objc2-core-graphics", "std",
+    },
+    "png": set(),
+    "pollster": set(),
+    "portable-pty": {"default"},
+    "regex-syntax": {
+        "default", "std", "unicode", "unicode-age", "unicode-bool", "unicode-case",
+        "unicode-gencat", "unicode-perl", "unicode-script", "unicode-segment",
+    },
+    "rusqlite": {"bundled", "cache", "default", "ffi-sqlite-wasm-rs", "hashlink", "modern_sqlite"},
+    "serde": {"alloc", "default", "derive", "rc", "serde_derive", "std"},
+    "serde_json": {"default", "std"},
+    "swash": {"default", "render", "scale", "std"},
+    "thiserror": {"default", "std"},
+    "unicode-width": {"cjk", "default"},
+    "wgpu": {
+        "default", "dx12", "fragile-send-sync-non-atomic-wasm", "gles", "metal",
+        "parking_lot", "std", "vulkan", "web", "webgl", "webgpu", "wgpu-core",
+        "wgsl",
+    },
+    "winit": {
+        "ahash", "bytemuck", "memmap2", "percent-encoding", "rwh_06", "sctk",
+        "sctk-adwaita", "wayland", "wayland-backend", "wayland-client",
+        "wayland-csd-adwaita-notitle", "wayland-dlopen", "wayland-protocols",
+        "wayland-protocols-plasma", "x11", "x11-dl", "x11rb",
+    },
+}
+
 SOCKET_PATTERNS = [
     re.compile(r"\bstd\s*::\s*net\s*::\s*(TcpStream|TcpListener|UdpSocket)\b"),
     re.compile(r"\bnet\s*::\s*(TcpStream|TcpListener|UdpSocket)\b"),
@@ -78,15 +122,16 @@ SOCKET_PATTERNS = [
     re.compile(r"\b(tokio|async_std|smol|mio)\s*::\s*net\b"),
     re.compile(r"\bsocket2\s*::"),
     re.compile(r"\bnix\s*::\s*sys\s*::\s*socket\b"),
-    re.compile(r"\buse\s+libc\s+as\b"),
-    re.compile(r"\buse\s+libc\s*::\s*\{[^}]*\bself\s+as\b", re.S),
+    re.compile(r"\bextern\s+crate\s+libc\s+as\b"),
+    re.compile(r"\buse\s+(?:::)?libc\s+as\b"),
+    re.compile(r"\buse\s+(?:::)?libc\s*::\s*\{[^}]*\bself\s+as\b", re.S),
     re.compile(r"\blibc\s*::\s*(socket|connect|bind)\b"),
     re.compile(r"\blibc\s*::\s*\{[^}]*\b(socket|connect|bind)\b", re.S),
     re.compile(r"\b(?:unsafe\s+)?extern\s*\{[^}]*\b(socket|connect|bind)\s*\(", re.S),
 ]
 
 
-def strip_comments_and_literals(source):
+def strip_comments_and_literals(source, strip_literals=True):
     """Replace Rust comments and string/char contents while preserving lines."""
     result = list(source)
     i = 0
@@ -125,9 +170,10 @@ def strip_comments_and_literals(source):
             end_marker = '"' + hashes
             end = source.find(end_marker, i)
             i = length if end < 0 else end + len(end_marker)
-            for offset in range(start, i):
-                if result[offset] != "\n":
-                    result[offset] = " "
+            if strip_literals:
+                for offset in range(start, i):
+                    if result[offset] != "\n":
+                        result[offset] = " "
             continue
 
         prefix = 1 if source.startswith(('b"', 'c"'), i) else 0
@@ -143,16 +189,18 @@ def strip_comments_and_literals(source):
                 escaped = char == "\\" and not escaped
                 if char != "\\":
                     escaped = False
-            for offset in range(start, i):
-                if result[offset] != "\n":
-                    result[offset] = " "
+            if strip_literals:
+                for offset in range(start, i):
+                    if result[offset] != "\n":
+                        result[offset] = " "
             continue
 
         char_literal = re.match(r"(?:b)?'(?:\\.|[^\\'\n])'", source[i:])
         if char_literal:
             end = i + char_literal.end()
-            for offset in range(i, end):
-                result[offset] = " "
+            if strip_literals:
+                for offset in range(i, end):
+                    result[offset] = " "
             i = end
             continue
         i += 1
@@ -210,6 +258,16 @@ def validate_graph(metadata):
                     f"{workspace_name} -> {dependency_name} {package['version']} "
                     f"({package['source'] or 'path'})"
                 )
+            expected_features = APPROVED_FEATURES.get(dependency_name)
+            if approved and dependency["pkg"] not in workspace_ids and expected_features is None:
+                blocked.add(f"missing reviewed feature policy for {dependency_name}")
+            elif expected_features is not None:
+                actual_features = set(nodes_by_id[dependency["pkg"]]["features"])
+                if actual_features != expected_features:
+                    blocked.add(
+                        f"unreviewed features for {dependency_name}: "
+                        f"{sorted(actual_features)}"
+                    )
 
     parents = {package_id: set() for package_id in nodes_by_id}
     for node in nodes_by_id.values():
@@ -324,6 +382,15 @@ def validate_sources(metadata):
             blocked.add(f"could not read Rust source {source_file}: {error}")
             continue
         code = strip_comments_and_literals(source)
+        comments_removed = strip_comments_and_literals(source, strip_literals=False)
+        link_name = re.search(
+            r'#\s*\[\s*link_name\s*=\s*"(socket|connect|bind)"\s*\]',
+            comments_removed,
+        )
+        if link_name:
+            line = comments_removed.count("\n", 0, link_name.start()) + 1
+            blocked.add(f"direct socket API: {source_file}:{line}")
+            continue
         for pattern in SOCKET_PATTERNS:
             match = pattern.search(code)
             if match:
