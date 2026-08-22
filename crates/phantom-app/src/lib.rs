@@ -2085,24 +2085,21 @@ impl App {
                     }
                     _ => None,
                 });
-        if let Some(section) = listed_section {
-            let stored_trust = self.config.trusted_spdeploy_projects.iter().any(|project| {
-                Path::new(&project.root) == section.root
-                    && project.sources == section.config_sources
-            });
-            if !stored_trust {
-                self.show_notice("spdeploy operations are not trusted");
-                self.schedule_context_discovery();
-                return;
-            }
-            if let Err(error) = context_actions::verify_spdeploy_sources(section) {
-                self.show_notice(format!("spdeploy configuration changed: {error}"));
-                self.schedule_context_discovery();
-                return;
-            }
+        let Some(listed_section) = listed_section else {
+            self.show_notice("The selected spdeploy action is stale or invalid");
+            self.schedule_context_discovery();
+            return;
+        };
+        let stored_trust = self.config.trusted_spdeploy_projects.iter().any(|project| {
+            Path::new(&project.root) == listed_section.root
+                && project.sources == listed_section.config_sources
+        });
+        if !stored_trust {
+            self.show_notice("spdeploy operations are not trusted");
+            self.schedule_context_discovery();
+            return;
         }
-        let valid = listed_section.is_some()
-            && self.context_snapshot.cwd == active_cwd
+        let valid = self.context_snapshot.cwd == active_cwd
             && config_path.starts_with(&active_cwd)
             && !operation.is_empty()
             && operation.len() <= 256
@@ -2112,14 +2109,6 @@ impl App {
             self.schedule_context_discovery();
             return;
         }
-        // spdeploy currently accepts only a pathname and resolves every stage
-        // path relative to that config's real parent. Moving the validated
-        // bytes to a private snapshot would change those semantics. The
-        // descriptor-safe verification above rejects symlinks, growth, and
-        // stale bytes, but any actor allowed to mutate the file or one of its
-        // parent directories can still replace it between this check and
-        // spdeploy reopening it. Closing that final gap requires an inherited-
-        // FD/config-bundle interface in spdeploy.
         let startup = match spdeploy_startup_command(&config_path, &operation, resolver) {
             Ok(startup) => startup,
             Err(error) => {
@@ -2127,6 +2116,39 @@ impl App {
                 return;
             }
         };
+        let current_active_cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| Path::new(&tab.cwd).canonicalize().ok());
+        let still_trusted = self.config.trusted_spdeploy_projects.iter().any(|project| {
+            Path::new(&project.root) == listed_section.root
+                && project.sources == listed_section.config_sources
+        });
+        let still_listed = listed_section
+            .operations
+            .iter()
+            .any(|item| item.config_path == config_path && item.name == operation);
+        if current_active_cwd.as_ref() != Some(&listed_section.root)
+            || !still_trusted
+            || !still_listed
+        {
+            self.show_notice("The selected spdeploy action is stale or invalid");
+            self.schedule_context_discovery();
+            return;
+        }
+        if let Err(error) = context_actions::verify_spdeploy_sources(listed_section) {
+            self.show_notice(format!("spdeploy configuration changed: {error}"));
+            self.schedule_context_discovery();
+            return;
+        }
+        // spdeploy currently accepts only a pathname and resolves every stage
+        // path relative to that config's real parent. Moving the validated
+        // bytes to a private snapshot would change those semantics. The final
+        // descriptor-safe verification follows executable resolution and
+        // rejects symlinks, growth, and stale bytes, but any actor allowed to
+        // mutate the file or one of its parent directories can still replace
+        // it between this check and spdeploy reopening it. Closing that final
+        // gap requires an inherited-FD/config-bundle interface in spdeploy.
         self.spawn_new_tab(NewTabRequest {
             profile_id: None,
             cwd: config_path
@@ -3821,13 +3843,17 @@ fn spdeploy_startup_command(
             "resolved spdeploy program is not an absolute path".to_string(),
         ));
     }
+    let config_path = config_path.to_str().ok_or_else(|| {
+        phantom_core::AppError::InvalidConfig(
+            "spdeploy config path must be valid UTF-8".to_string(),
+        )
+    })?;
     Ok(StartupCommand {
         program,
         args: vec![
             "--config".to_string(),
-            config_path.to_string_lossy().into_owned(),
-            "--operation".to_string(),
-            operation.to_string(),
+            config_path.to_string(),
+            format!("--operation={operation}"),
         ],
         env: Default::default(),
     })
@@ -5447,7 +5473,7 @@ mod tests {
         assert!(Path::new(&startup.program).is_absolute());
         assert_eq!(
             startup.args,
-            ["--config", "/project/deploy.yml", "--operation", "deploy"]
+            ["--config", "/project/deploy.yml", "--operation=deploy"]
         );
         assert!(!startup.args.iter().any(|arg| arg == "--no-ui"));
         assert!(!startup.args.iter().any(|arg| arg == "--yes"));
@@ -5463,6 +5489,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid config: resolved spdeploy program is not an absolute path"
+        );
+    }
+
+    #[test]
+    fn sidebar_spdeploy_preserves_leading_dash_operation_as_one_argument() {
+        let startup =
+            spdeploy_startup_command(Path::new("/project/deploy.yml"), "--emergency", |_| {
+                Ok("/trusted/bin/spdeploy".to_string())
+            })
+            .unwrap();
+
+        assert_eq!(
+            startup.args,
+            ["--config", "/project/deploy.yml", "--operation=--emergency"]
         );
     }
 
@@ -5600,7 +5640,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_trusted_spdeploy_source_blocks_dispatch_before_resolution() {
+    fn changed_trusted_spdeploy_source_blocks_dispatch_after_resolution() {
         use std::fs;
 
         let temp =
@@ -5633,11 +5673,14 @@ mod tests {
         };
         app.config.trusted_spdeploy_projects.push(trusted);
 
+        let resolved = std::cell::Cell::new(false);
         app.run_spdeploy_context_action_with_resolver(config_path, "deploy".to_string(), |_| {
-            panic!("changed-source dispatch must not resolve an executable")
+            resolved.set(true);
+            Ok("/trusted/bin/spdeploy".to_string())
         });
 
         assert_eq!(app.tabs.len(), 1);
+        assert!(resolved.get());
         assert!(app
             .notice_text()
             .is_some_and(|notice| notice.contains("configuration changed")));
