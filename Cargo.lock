@@ -2269,6 +2269,7 @@ name = "phantom-emu"
 version = "0.1.2"
 dependencies = [
  "alacritty_terminal",
+ "regex-automata",
  "regex-syntax",
 ]
 

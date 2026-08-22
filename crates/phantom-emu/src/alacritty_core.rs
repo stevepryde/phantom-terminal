@@ -8,20 +8,28 @@
 //! PTY reader hands bytes across a channel.
 
 use std::cell::RefCell;
+use std::mem;
+use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::grid::{BidirectionalIterator, Dimensions, GridIterator, Indexed, Scroll};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     self, Color as AnsiColor, CursorShape as AnsiCursorShape, CursorStyle as AnsiCursorStyle,
     NamedColor as AnsiNamed,
 };
+use regex_automata::hybrid::dfa::{
+    Builder as DfaBuilder, Cache as DfaCache, Config as DfaConfig, DFA,
+};
+use regex_automata::nfa::thompson::Config as ThompsonConfig;
+use regex_automata::util::syntax::Config as SyntaxConfig;
+use regex_automata::{Anchored, Input, MatchKind};
 
 use crate::{
     BufferPoint, CellAttrs, CellColor, CursorShape, CursorState, MouseMode, MouseProtocol,
@@ -30,7 +38,8 @@ use crate::{
 };
 
 const PHANTOM_SEMANTIC_ESCAPE_CHARS: &str = "\t !\"#$%&'()*+,./:;<=>?@[\\]^`{|}~│";
-const SEARCH_CHUNK_LINES: i32 = 256;
+const MAX_SEARCH_QUERY_BYTES: usize = 4_096;
+const SEARCH_CANCEL_CHECK_CELLS: usize = 1_024;
 
 /// Buffers bytes the terminal wants written back to the PTY. `send_event` takes
 /// `&self`, so interior mutability is required; `Rc<RefCell<…>>` is fine because
@@ -51,17 +60,29 @@ impl EventListener for ResponseSink {
 ///
 /// Workers can retain this across buffer snapshots; the DFA caches are reused
 /// only while the full key is unchanged.
-pub struct CompiledSearch {
+pub struct CancellableCompiledSearch {
     query: String,
     options: SearchOptions,
-    regex: RegexSearch,
+    regex: CancellableRegex,
 }
 
-impl CompiledSearch {
+impl CancellableCompiledSearch {
     pub fn new(query: &str, options: SearchOptions) -> Result<Self, SearchError> {
+        Self::new_cancellable(query, options, &AtomicBool::new(false))
+    }
+
+    pub fn new_cancellable(
+        query: &str,
+        options: SearchOptions,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, SearchError> {
+        if query.len() > MAX_SEARCH_QUERY_BYTES {
+            return Err(SearchError::InvalidRegex(format!(
+                "search query exceeds {MAX_SEARCH_QUERY_BYTES} bytes"
+            )));
+        }
         let pattern = search_pattern(query, options);
-        let regex = RegexSearch::new(&pattern)
-            .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
+        let regex = CancellableRegex::new(&pattern, cancelled)?;
         Ok(Self {
             query: query.to_owned(),
             options,
@@ -74,23 +95,92 @@ impl CompiledSearch {
     }
 }
 
+struct CancellableRegex {
+    forward: LazyDfa,
+    reverse: LazyDfa,
+}
+
+struct LazyDfa {
+    dfa: DFA,
+    cache: DfaCache,
+    direction: Direction,
+    match_all: bool,
+}
+
+impl CancellableRegex {
+    fn new(pattern: &str, cancelled: &AtomicBool) -> Result<Self, SearchError> {
+        let syntax = SyntaxConfig::new().case_insensitive(!pattern.chars().any(char::is_uppercase));
+        let config = DfaConfig::new()
+            .minimum_cache_clear_count(Some(3))
+            .minimum_bytes_per_state(Some(10));
+        let thompson = ThompsonConfig::new().nfa_size_limit(Some(config.get_cache_capacity()));
+        if cancelled.load(Ordering::Acquire) {
+            return Err(SearchError::InvalidRegex("search cancelled".into()));
+        }
+        let reverse = LazyDfa::new(
+            pattern,
+            config.clone(),
+            syntax,
+            thompson.clone(),
+            Direction::Left,
+            true,
+        )?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(SearchError::InvalidRegex("search cancelled".into()));
+        }
+        let has_empty = reverse.dfa.get_nfa().has_empty();
+        let forward = LazyDfa::new(
+            pattern,
+            config,
+            syntax,
+            thompson,
+            Direction::Right,
+            has_empty,
+        )?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(SearchError::InvalidRegex("search cancelled".into()));
+        }
+        Ok(Self { forward, reverse })
+    }
+}
+
+impl LazyDfa {
+    fn new(
+        pattern: &str,
+        mut config: DfaConfig,
+        syntax: SyntaxConfig,
+        mut thompson: ThompsonConfig,
+        direction: Direction,
+        match_all: bool,
+    ) -> Result<Self, SearchError> {
+        thompson = thompson.reverse(direction == Direction::Left);
+        config = config.match_kind(if match_all {
+            MatchKind::All
+        } else {
+            MatchKind::LeftmostFirst
+        });
+        let dfa = DfaBuilder::new()
+            .configure(config)
+            .syntax(syntax)
+            .thompson(thompson)
+            .build(pattern)
+            .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
+        let cache = dfa.create_cache();
+        Ok(Self {
+            dfa,
+            cache,
+            direction,
+            match_all,
+        })
+    }
+}
+
 fn search_term<T: EventListener>(
     term: &Term<T>,
     size: TermDimensions,
     range: SearchRange,
-    compiled: &mut CompiledSearch,
+    compiled: &mut CancellableCompiledSearch,
     cancelled: &AtomicBool,
-) -> Option<SearchOutcome> {
-    search_term_with_chunk_observer(term, size, range, compiled, cancelled, || {})
-}
-
-fn search_term_with_chunk_observer<T: EventListener, F: FnMut()>(
-    term: &Term<T>,
-    size: TermDimensions,
-    range: SearchRange,
-    compiled: &mut CompiledSearch,
-    cancelled: &AtomicBool,
-    mut on_chunk: F,
 ) -> Option<SearchOutcome> {
     let start = to_point(range.start);
     let end = to_point(range.end);
@@ -100,74 +190,279 @@ fn search_term_with_chunk_observer<T: EventListener, F: FnMut()>(
 
     let mut matches = Vec::new();
     let mut capped = false;
-    let mut chunk_start = start;
-    while chunk_start <= end {
-        on_chunk();
+    let mut origin = start;
+    while origin <= end {
         if cancelled.load(Ordering::Acquire) {
             return None;
         }
-        let chunk_end = search_chunk_end(term, size, chunk_start, end);
-        let mut origin = chunk_start;
-        while origin <= chunk_end {
-            if cancelled.load(Ordering::Acquire) {
-                return None;
-            }
-            let Some(found) = term.regex_search_right(&mut compiled.regex, origin, chunk_end)
-            else {
-                break;
-            };
-            let found_start = *found.start();
-            let found_end = *found.end();
-            if found_start < chunk_start || found_end > chunk_end {
-                break;
-            }
-            let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
-            if !compiled.options.whole_word || is_whole_word_match(term, size, found_range) {
-                // Only report the cap once a further real match exists.
-                if matches.len() >= MAX_SEARCH_MATCHES {
-                    capped = true;
-                    break;
-                }
-                matches.push(SearchMatch { range: found_range });
-            }
-
-            let Some(next) = point_after(size, found_end, chunk_end) else {
-                break;
-            };
-            origin = next;
-        }
-        if capped {
+        let found =
+            cancellable_regex_search_right(term, &mut compiled.regex, origin, end, cancelled)?;
+        let Some(found) = found else { break };
+        let found_start = *found.start();
+        let found_end = *found.end();
+        if found_start < start || found_end > end {
             break;
         }
-        let Some(next_chunk) = point_after(size, chunk_end, end) else {
+        let found_range = SearchRange::new(from_point(found_start), from_point(found_end));
+        if !compiled.options.whole_word || is_whole_word_match(term, size, found_range) {
+            if matches.len() >= MAX_SEARCH_MATCHES {
+                capped = true;
+                break;
+            }
+            matches.push(SearchMatch { range: found_range });
+        }
+
+        let Some(next) = point_after(size, found_end, end) else {
             break;
         };
-        chunk_start = next_chunk;
+        origin = next;
     }
 
     (!cancelled.load(Ordering::Acquire)).then_some(SearchOutcome { matches, capped })
 }
 
-fn search_chunk_end<T: EventListener>(
+fn cancellable_regex_search_right<T: EventListener>(
     term: &Term<T>,
-    size: TermDimensions,
+    regex: &mut CancellableRegex,
     start: Point,
     end: Point,
-) -> Point {
-    let mut line = Line((start.line.0 + SEARCH_CHUNK_LINES - 1).min(end.line.0));
-    let last_column = Column(size.columns.saturating_sub(1));
-    while line < end.line
-        && term.grid()[Point::new(line, last_column)]
-            .flags
-            .contains(Flags::WRAPLINE)
-    {
-        line += 1;
+    cancelled: &AtomicBool,
+) -> Option<Option<RangeInclusive<Point>>> {
+    let match_end = cancellable_regex_search(term, start, end, &mut regex.forward, cancelled)?;
+    let Some(match_end) = match_end else {
+        return Some(None);
+    };
+    let match_start =
+        cancellable_regex_search(term, match_end, start, &mut regex.reverse, cancelled)?;
+    Some(match_start.map(|match_start| match_start..=match_end))
+}
+
+fn cancellable_regex_search<T: EventListener>(
+    term: &Term<T>,
+    start: Point,
+    end: Point,
+    regex: &mut LazyDfa,
+    cancelled: &AtomicBool,
+) -> Option<Option<Point>> {
+    match cancellable_regex_search_internal(term, start, end, regex, cancelled) {
+        Ok(result) => Some(result),
+        Err(ScanError::Cancelled) => None,
+        Err(ScanError::Engine) => Some(None),
     }
-    if line == end.line {
-        end
+}
+
+enum ScanError {
+    Cancelled,
+    Engine,
+}
+
+// Adapted from alacritty_terminal 0.26's `Term::regex_search_internal` so the
+// worker can cooperatively cancel without changing its terminal semantics.
+fn cancellable_regex_search_internal<T: EventListener>(
+    term: &Term<T>,
+    start: Point,
+    end: Point,
+    regex: &mut LazyDfa,
+    cancelled: &AtomicBool,
+) -> Result<Option<Point>, ScanError> {
+    cancellable_regex_search_internal_with_observer(term, start, end, regex, cancelled, || {})
+}
+
+fn cancellable_regex_search_internal_with_observer<T: EventListener, F: FnMut()>(
+    term: &Term<T>,
+    start: Point,
+    end: Point,
+    regex: &mut LazyDfa,
+    cancelled: &AtomicBool,
+    mut on_checkpoint: F,
+) -> Result<Option<Point>, ScanError> {
+    let topmost_line = term.topmost_line();
+    let screen_lines = term.screen_lines() as i32;
+    let last_column = term.last_column();
+    let next = match regex.direction {
+        Direction::Right => GridIterator::next,
+        Direction::Left => GridIterator::prev,
+    };
+    let input = Input::new(&[]).anchored(if regex.match_all {
+        Anchored::Yes
     } else {
-        Point::new(line, last_column)
+        Anchored::No
+    });
+    let mut state = regex
+        .dfa
+        .start_state_forward(&mut regex.cache, &input)
+        .map_err(|_| ScanError::Engine)?;
+    let mut iter = term.grid().iter_from(start);
+    let mut cell = iter.cell();
+    skip_fullwidth(term, &mut iter, &mut cell, regex.direction);
+    let mut c = cell.c;
+    let mut last_wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
+    let mut point = iter.point();
+    let mut last_point = point;
+    let mut consumed_bytes = 0;
+    let mut scanned_cells = 0;
+    let mut regex_match = None;
+
+    macro_rules! reset_state {
+        () => {{
+            state = regex
+                .dfa
+                .start_state_forward(&mut regex.cache, &input)
+                .map_err(|_| ScanError::Engine)?;
+            consumed_bytes = 0;
+            regex_match = None;
+        }};
     }
+
+    let mut done = false;
+    'outer: loop {
+        if scanned_cells % SEARCH_CANCEL_CHECK_CELLS == 0 {
+            on_checkpoint();
+            if cancelled.load(Ordering::Acquire) {
+                return Err(ScanError::Cancelled);
+            }
+        }
+        scanned_cells += 1;
+
+        let mut buf = [0; 4];
+        let utf8_len = c.encode_utf8(&mut buf).len();
+        for i in 0..utf8_len {
+            let byte = match regex.direction {
+                Direction::Right => buf[i],
+                Direction::Left => buf[utf8_len - i - 1],
+            };
+            state = regex
+                .dfa
+                .next_state(&mut regex.cache, state, byte)
+                .map_err(|_| ScanError::Engine)?;
+            consumed_bytes += 1;
+            if i == 0 && state.is_match() {
+                regex_match = Some(last_point);
+            } else if state.is_dead() {
+                if consumed_bytes == 2 {
+                    reset_state!();
+                    if i == 0 {
+                        continue 'outer;
+                    }
+                } else {
+                    break 'outer;
+                }
+            }
+        }
+
+        if point == end || done {
+            state = regex
+                .dfa
+                .next_eoi_state(&mut regex.cache, state)
+                .map_err(|_| ScanError::Engine)?;
+            if state.is_match() {
+                regex_match = Some(point);
+            } else if state.is_dead() && consumed_bytes == 1 {
+                regex_match = None;
+            }
+            break;
+        }
+
+        let mut cell = match next(&mut iter) {
+            Some(Indexed { cell, .. }) => cell,
+            None => {
+                let line = topmost_line - point.line + screen_lines - 1;
+                let start = Point::new(line, last_column - point.column);
+                iter = term.grid().iter_from(start);
+                iter.cell()
+            }
+        };
+        done = iter.point() == end;
+        skip_fullwidth(term, &mut iter, &mut cell, regex.direction);
+        c = cell.c;
+        let wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
+        last_point = mem::replace(&mut point, iter.point());
+        if (last_point.column == last_column && point.column == Column(0) && !last_wrapped)
+            || (last_point.column == Column(0) && point.column == last_column && !wrapped)
+        {
+            state = regex
+                .dfa
+                .next_eoi_state(&mut regex.cache, state)
+                .map_err(|_| ScanError::Engine)?;
+            if state.is_match() {
+                regex_match = Some(last_point);
+            }
+            match regex_match {
+                Some(_) if (!state.is_dead() || consumed_bytes > 1) && consumed_bytes != 0 => break,
+                _ => reset_state!(),
+            }
+        }
+        last_wrapped = wrapped;
+    }
+    Ok(regex_match)
+}
+
+fn skip_fullwidth<'a, T: EventListener>(
+    term: &Term<T>,
+    iter: &mut GridIterator<'a, Cell>,
+    cell: &mut &'a Cell,
+    direction: Direction,
+) {
+    match direction {
+        Direction::Right
+            if cell.flags.contains(Flags::WIDE_CHAR)
+                && iter.point().column < term.last_column() =>
+        {
+            iter.next();
+        }
+        Direction::Right if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) => {
+            if let Some(Indexed { cell: new_cell, .. }) = iter.next() {
+                *cell = new_cell;
+            }
+            iter.next();
+        }
+        Direction::Left if cell.flags.contains(Flags::WIDE_CHAR_SPACER) => {
+            if let Some(Indexed { cell: new_cell, .. }) = iter.prev() {
+                *cell = new_cell;
+            }
+            let prev = iter
+                .point()
+                .sub(term, alacritty_terminal::index::Boundary::Grid, 1);
+            if term.grid()[prev]
+                .flags
+                .contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                iter.prev();
+            }
+        }
+        _ => (),
+    }
+}
+
+fn search_term_upstream<T: EventListener>(
+    term: &Term<T>,
+    size: TermDimensions,
+    range: SearchRange,
+    regex: &mut RegexSearch,
+    options: SearchOptions,
+) -> SearchOutcome {
+    let start = to_point(range.start);
+    let end = to_point(range.end);
+    let mut outcome = SearchOutcome::default();
+    let mut origin = start;
+    while origin <= end {
+        let Some(found) = term.regex_search_right(regex, origin, end) else {
+            break;
+        };
+        let found_range = SearchRange::new(from_point(*found.start()), from_point(*found.end()));
+        if !options.whole_word || is_whole_word_match(term, size, found_range) {
+            if outcome.matches.len() >= MAX_SEARCH_MATCHES {
+                outcome.capped = true;
+                break;
+            }
+            outcome.matches.push(SearchMatch { range: found_range });
+        }
+        let Some(next) = point_after(size, *found.end(), end) else {
+            break;
+        };
+        origin = next;
+    }
+    outcome
 }
 
 /// Cell dimensions handed to `Term` (scrollback depth comes from `Config`).
@@ -253,7 +548,7 @@ impl AlacrittyCore {
     /// thread while retaining the emulator's exact coordinate mapping.
     pub fn search_compiled(
         &self,
-        compiled: &mut CompiledSearch,
+        compiled: &mut CancellableCompiledSearch,
         range: Option<SearchRange>,
         cancelled: &AtomicBool,
     ) -> Option<SearchOutcome> {
@@ -427,16 +722,13 @@ impl VtCore for AlacrittyCore {
         if query.is_empty() {
             return Ok(SearchOutcome::default());
         }
-        let mut compiled = CompiledSearch::new(query, options)?;
+        let pattern = search_pattern(query, options);
+        let mut regex = RegexSearch::new(&pattern)
+            .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
         let range = self.clamp_search_range(range.unwrap_or_else(|| self.full_search_range()));
-        Ok(search_term(
-            &self.term,
-            self.size,
-            range,
-            &mut compiled,
-            &AtomicBool::new(false),
-        )
-        .unwrap_or_default())
+        Ok(search_term_upstream(
+            &self.term, self.size, range, &mut regex, options,
+        ))
     }
 
     fn set_active_search_match(&mut self, search_match: Option<SearchMatch>) {
@@ -1405,32 +1697,75 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_search_stops_at_the_next_logical_line_chunk() {
-        let mut term = core(4, 20, 1_000);
-        for _ in 0..600 {
-            term.advance(b"ordinary output\r\n");
-        }
+    fn cancelled_search_stops_inside_one_long_wrapped_line() {
+        let mut term = core(4, 4, 2_000);
+        term.advance("x".repeat(5_000).as_bytes());
         let range = term.full_search_range();
-        let mut compiled = CompiledSearch::new("not present", SearchOptions::default()).unwrap();
+        let mut compiled =
+            CancellableCompiledSearch::new("not present", SearchOptions::default()).unwrap();
         let cancelled = AtomicBool::new(false);
-        let mut chunks = 0;
+        let mut checkpoints = 0;
 
-        let result = search_term_with_chunk_observer(
+        let result = cancellable_regex_search_internal_with_observer(
             &term.term,
-            term.size,
-            range,
-            &mut compiled,
+            to_point(range.start),
+            to_point(range.end),
+            &mut compiled.regex.forward,
             &cancelled,
             || {
-                chunks += 1;
-                if chunks == 2 {
+                checkpoints += 1;
+                if checkpoints == 2 {
                     cancelled.store(true, Ordering::Release);
                 }
             },
         );
 
-        assert!(result.is_none());
-        assert_eq!(chunks, 2);
+        assert!(matches!(result, Err(ScanError::Cancelled)));
+        assert_eq!(checkpoints, 2);
+    }
+
+    #[test]
+    fn cancellable_worker_matcher_matches_the_upstream_oracle() {
+        let mut term = core(4, 8, 100);
+        term.advance("alpha 世界\r\nwrapped-target ALPHA\r\nitem-42 tail".as_bytes());
+        let cases = [
+            ("alpha", SearchOptions::default()),
+            ("世界", SearchOptions::default()),
+            ("wrapped-target", SearchOptions::default()),
+            (
+                r"item-\d+",
+                SearchOptions {
+                    regex: true,
+                    ..SearchOptions::default()
+                },
+            ),
+            (
+                "ALPHA",
+                SearchOptions {
+                    case_sensitive: true,
+                    whole_word: true,
+                    regex: false,
+                },
+            ),
+        ];
+
+        for (query, options) in cases {
+            let expected = term.search_scrollback(query, options, None).unwrap();
+            let mut compiled = CancellableCompiledSearch::new(query, options).unwrap();
+            let actual = term
+                .search_compiled(&mut compiled, None, &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(actual, expected, "query {query:?}");
+        }
+    }
+
+    #[test]
+    fn worker_regex_compile_has_a_bounded_query_input() {
+        let oversized = "x".repeat(MAX_SEARCH_QUERY_BYTES + 1);
+        assert!(matches!(
+            CancellableCompiledSearch::new(&oversized, SearchOptions::default()),
+            Err(SearchError::InvalidRegex(_))
+        ));
     }
 
     #[test]

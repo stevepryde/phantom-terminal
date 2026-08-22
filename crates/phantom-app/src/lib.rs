@@ -650,6 +650,7 @@ pub struct App {
     /// once detached, a coordinate-changing terminal mutation expires it.
     find_selection_scope: Option<SearchRange>,
     find_worker: FindWorker,
+    find_worker_failure_noticed: bool,
     find_request_generation: Option<u64>,
     find_request_key: Option<(String, SearchOptions, bool)>,
     find_pending: bool,
@@ -763,6 +764,7 @@ impl App {
             find_active: 0,
             find_selection_scope: None,
             find_worker,
+            find_worker_failure_noticed: false,
             find_request_generation: None,
             find_request_key: None,
             find_pending: false,
@@ -881,7 +883,9 @@ impl App {
                         self.show_notice(format!("Could not reply to terminal query: {error}"));
                     }
                 }
-                self.find_worker.advance(tab, bytes, active_tab);
+                if !self.find_worker.advance(tab, bytes, active_tab) {
+                    self.handle_find_worker_failure();
+                }
                 if active_tab {
                     // Debounced rather than refreshed inline: a full-history
                     // search per drained PTY chunk stalls the event loop.
@@ -1138,8 +1142,7 @@ impl App {
         else {
             self.find_request_generation = None;
             self.find_pending = false;
-            self.apply_find_result(Ok(SearchOutcome::default()));
-            self.show_notice("Scrollback find worker is unavailable");
+            self.handle_find_worker_failure();
             return;
         };
         self.find_request_generation = Some(generation);
@@ -1183,11 +1186,40 @@ impl App {
     }
 
     fn apply_find_response(&mut self, response: FindResponse) {
-        if !self.ui.find_open() || self.find_request_generation != Some(response.generation) {
-            return;
+        match response {
+            FindResponse::WorkerFailed => self.handle_find_worker_failure(),
+            FindResponse::Completed { generation, result } => {
+                if !self.ui.find_open() || self.find_request_generation != Some(generation) {
+                    return;
+                }
+                self.find_pending = false;
+                self.apply_find_result(result);
+                self.request_redraw();
+            }
         }
+    }
+
+    fn handle_find_worker_failure(&mut self) {
+        self.find_worker.mark_unavailable();
+        self.find_request_generation = None;
         self.find_pending = false;
-        self.apply_find_result(response.result);
+        self.find_refresh_deadline = None;
+        self.find_matches.clear();
+        self.find_active = 0;
+        self.find_capped = false;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.core.set_active_search_match(None);
+        }
+        self.ui.set_find_results(FindResultSummary {
+            match_count: 0,
+            active_match: None,
+            capped: false,
+            error: None,
+        });
+        if self.ui.find_open() && !self.find_worker_failure_noticed {
+            self.find_worker_failure_noticed = true;
+            self.show_notice("Scrollback find is unavailable for this session");
+        }
         self.request_redraw();
     }
 
@@ -1433,13 +1465,15 @@ impl App {
             self.config.scrollback_lines,
             cursor_shape(&self.config.cursor_style),
         );
-        self.find_worker.create(
+        if !self.find_worker.create(
             tab_id,
             rows,
             cols,
             self.config.scrollback_lines,
             cursor_shape(&self.config.cursor_style),
-        );
+        ) {
+            self.handle_find_worker_failure();
+        }
         self.tabs.push(Tab::new(
             tab_id,
             core,
@@ -1473,7 +1507,9 @@ impl App {
             self.close_find();
         }
         let tab = self.tabs.remove(index);
-        self.find_worker.remove(tab.id);
+        if !self.find_worker.remove(tab.id) {
+            self.handle_find_worker_failure();
+        }
         let _ = self.pty.kill(tab.pty_id);
         if self.tabs.is_empty() {
             self.request_exit();
@@ -2078,7 +2114,9 @@ impl App {
         );
         if self.applied_term_options != term_options {
             self.applied_term_options = term_options;
-            self.find_worker.set_options(term_options.0, term_options.1);
+            if !self.find_worker.set_options(term_options.0, term_options.1) {
+                self.handle_find_worker_failure();
+            }
             self.find_request_generation = None;
             self.find_pending = false;
             for tab in &mut self.tabs {
@@ -3181,8 +3219,11 @@ impl App {
             pty.resize(pty_id, rows, cols)
         });
         for tab in &self.tabs {
-            if !failures.iter().any(|(tab_id, _)| *tab_id == tab.id) {
-                self.find_worker.resize(tab.id, rows, cols);
+            if !failures.iter().any(|(tab_id, _)| *tab_id == tab.id)
+                && !self.find_worker.resize(tab.id, rows, cols)
+            {
+                self.handle_find_worker_failure();
+                break;
             }
         }
         self.find_request_generation = None;
@@ -5145,6 +5186,47 @@ mod tests {
         assert_eq!(app.tabs[0].core.selection_range(), selection);
         assert!(app.find_matches.is_empty());
         assert!(app.find_refresh_deadline.is_none());
+    }
+
+    #[test]
+    fn worker_failure_clears_pending_find_state_and_highlight() {
+        let mut app = test_app();
+        let mut tab = Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        );
+        tab.advance_pty(b"target");
+        let target = tab
+            .core
+            .search_scrollback("target", SearchOptions::default(), None)
+            .unwrap()
+            .matches[0];
+        tab.core.set_active_search_match(Some(target));
+        app.tabs.push(tab);
+        app.ui.open_find(false);
+        app.find_matches = vec![target];
+        app.find_request_generation = Some(7);
+        app.find_pending = true;
+
+        app.apply_find_response(FindResponse::WorkerFailed);
+
+        assert!(!app.find_pending);
+        assert!(app.find_request_generation.is_none());
+        assert!(app.find_matches.is_empty());
+        assert!(!app.tabs[0]
+            .core
+            .snapshot()
+            .cells
+            .iter()
+            .any(|cell| cell.search_match));
+        assert!(!app.find_worker.available());
+        assert_eq!(
+            app.notice_text(),
+            Some("Scrollback find is unavailable for this session")
+        );
     }
 
     #[test]

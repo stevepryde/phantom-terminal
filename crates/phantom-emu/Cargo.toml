@@ -16,3 +16,6 @@ alacritty_terminal = { workspace = true }
 # Already present through alacritty_terminal; used only for its Unicode `\w`
 # classification when enforcing whole-word boundaries around cell matches.
 regex-syntax = { workspace = true }
+# Matches alacritty_terminal's locked regex engine; used to add cooperative
+# cancellation checkpoints that its public terminal-search API does not expose.
+regex-automata = { workspace = true }

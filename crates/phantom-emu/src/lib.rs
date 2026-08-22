@@ -16,7 +16,7 @@ pub mod keys;
 
 use std::rc::Rc;
 
-pub use alacritty_core::{AlacrittyCore, CompiledSearch};
+pub use alacritty_core::{AlacrittyCore, CancellableCompiledSearch};
 pub use keys::{encode_key, encode_mouse_legacy, encode_mouse_sgr, Key, Modifiers};
 
 /// A terminal engine: feed it PTY output, resize it, and read back a renderable
