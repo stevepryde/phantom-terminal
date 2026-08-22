@@ -16,7 +16,7 @@ use phantom_core::{
 };
 
 use crate::context_actions::{
-    ContextRequest, ContextSection, ContextSectionContent, ContextSnapshot, DirectoryTarget,
+    ContextRequest, ContextSection, ContextSectionContent, ContextSnapshot,
     FrequentCommandsSection, ManifestSection, ManifestTab, ManifestTrustState,
     RecentDirectoriesSection, SpdeploySection,
 };
@@ -726,6 +726,14 @@ fn draw_recent_directories(
     recent: &RecentDirectoriesSection,
 ) -> Option<ContextRequest> {
     let mut request = None;
+    let new_tab_notice = ui.label(
+        RichText::new("Opens in new tabs")
+            .size(ACTION_TEXT_SIZE)
+            .color(muted_text_color()),
+    );
+    ui.ctx().accesskit_node_builder(new_tab_notice.id, |node| {
+        node.set_label("Directories open in new tabs")
+    });
     let home = default_home_dir();
     for directory in &recent.directories {
         let path = display_directory_path(&directory.path, home.as_deref().map(Path::new));
@@ -753,15 +761,21 @@ fn draw_recent_directories(
                 )
             })
             .inner;
-        if elided {
-            response = response.on_hover_text(&path);
-        }
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &path));
+        response = response.on_hover_text(if elided {
+            format!("{path}\nOpen in a new tab")
+        } else {
+            "Open in a new tab".to_string()
+        });
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                format!("Open {path} in a new tab"),
+            )
+        });
         if response.clicked() && request.is_none() {
-            let target = directory_target(ui.input(|input| input.modifiers.shift));
             request = Some(ContextRequest::OpenDirectory {
                 path: directory.path.clone(),
-                target,
             });
         }
     }
@@ -772,7 +786,14 @@ fn draw_frequent_commands(
     ui: &mut Ui,
     frequent: &FrequentCommandsSection,
 ) -> Option<ContextRequest> {
-    let mut request = None;
+    let manual_notice = ui.label(
+        RichText::new("Manual reference only — type commands in the terminal")
+            .size(ACTION_TEXT_SIZE)
+            .color(muted_text_color()),
+    );
+    ui.ctx().accesskit_node_builder(manual_notice.id, |node| {
+        node.set_label("Manual reference only — type commands in the terminal")
+    });
     for command in &frequent.commands {
         let text = elide_text_end(
             ui,
@@ -780,38 +801,36 @@ fn draw_frequent_commands(
             (ui.available_width() - 2.0 * ROW_TEXT_INSET).max(0.0),
         );
         let elided = text != *command;
-        let mut response = ui
+        let response = ui
             .push_id(("frequent_command", command), |ui| {
-                full_width_row(ui, Sense::click(), |ui, rect, color| {
+                full_width_row(ui, Sense::hover(), |ui, rect, _color| {
                     ui.painter().text(
                         egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         text,
                         FontId::monospace(DIRECTORY_TEXT_SIZE),
-                        color,
+                        muted_text_color(),
                     );
                 })
             })
-            .inner;
-        if elided {
-            response = response.on_hover_text(command);
-        }
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, command));
-        if response.clicked() && request.is_none() {
-            request = Some(ContextRequest::RunFrequentCommand {
-                command: command.clone(),
+            .inner
+            .on_hover_text(if elided {
+                format!("{command}\nType this command manually in the terminal")
+            } else {
+                "Type this command manually in the terminal".to_string()
             });
-        }
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                false,
+                format!("{command}; type manually"),
+            )
+        });
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_label(format!("{command}; type manually"));
+        });
     }
-    request
-}
-
-fn directory_target(shift: bool) -> DirectoryTarget {
-    if shift {
-        DirectoryTarget::NewTab
-    } else {
-        DirectoryTarget::CurrentTab
-    }
+    None
 }
 
 fn full_width_row(
@@ -1333,6 +1352,45 @@ mod tests {
     }
 
     #[test]
+    fn frequent_commands_are_presented_as_manual_reference_not_execution_buttons() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let mut config = AppConfig::default();
+        let mut state = ContextUi::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut outcome = None;
+        let output = ctx.run_ui(input, |ui| {
+            outcome = Some(state.draw_with_commands(
+                ui,
+                &mut config,
+                &ContextSnapshot::empty("/projects/soulfire".into()),
+                &["cargo test".to_string()],
+                42.0,
+                220,
+            ));
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(outcome.unwrap().request.is_none());
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Label
+                && node.label() == Some("Manual reference only — type commands in the terminal")
+        }));
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Button
+                && node
+                    .label()
+                    .is_some_and(|label| label.contains("cargo test"))
+        }));
+    }
+
+    #[test]
     fn sidebar_resize_handles_accesskit_increment_actions() {
         let ctx = Context::default();
         let mut config = AppConfig::default();
@@ -1677,12 +1735,6 @@ mod tests {
         let outcome = outcome.unwrap();
         assert!(outcome.rect.is_some());
         assert_eq!(outcome.reserved_width_points, 0.0);
-    }
-
-    #[test]
-    fn directory_click_modifier_selects_target() {
-        assert_eq!(directory_target(false), DirectoryTarget::CurrentTab);
-        assert_eq!(directory_target(true), DirectoryTarget::NewTab);
     }
 
     #[test]

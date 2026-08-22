@@ -618,7 +618,7 @@ impl UiState {
                                 config,
                                 FREQUENT_COMMANDS_PLUGIN_ID,
                                 "Frequent commands",
-                                "Show this tab's three most frequently submitted commands.",
+                                "Show this tab's three most frequent commands for manual reuse.",
                             );
                             ui.separator();
                             changed |= context_plugin_toggle(

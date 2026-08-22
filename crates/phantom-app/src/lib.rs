@@ -1578,7 +1578,6 @@ impl App {
             | ContextRequest::OpenManifestTab { .. } => context_actions::MANIFEST_PROVIDER_ID,
             ContextRequest::RunSpdeploy { .. } => context_actions::SPDEPLOY_PROVIDER_ID,
             ContextRequest::OpenDirectory { .. } => phantom_core::RECENT_DIRECTORIES_PLUGIN_ID,
-            ContextRequest::RunFrequentCommand { .. } => phantom_core::FREQUENT_COMMANDS_PLUGIN_ID,
         };
         if !self.config.context_actions.enabled
             || !self
@@ -1612,46 +1611,11 @@ impl App {
                 config_path,
                 operation,
             } => self.run_spdeploy_context_action(config_path, operation),
-            ContextRequest::OpenDirectory { path, target } => {
-                self.open_context_directory(path, target)
-            }
-            ContextRequest::RunFrequentCommand { command } => self.run_frequent_command(&command),
+            ContextRequest::OpenDirectory { path } => self.open_context_directory(path),
         }
     }
 
-    fn run_frequent_command(&mut self, command: &str) {
-        let Some(tab) = self.tabs.get(self.active) else {
-            self.show_notice("No active terminal session");
-            return;
-        };
-        if !tab.frequent_commands.contains_top(command) {
-            self.show_notice("That command is no longer frequent in this tab");
-            return;
-        }
-        // Never inject into a foreground program (vim, an SSH password
-        // prompt, ...): terminal output is forgeable, so this also requires
-        // the spawned shell to own the kernel's PTY foreground process group.
-        if !self.active_tab_at_shell_prompt() {
-            self.show_notice("Cannot run the command: the tab is running a program");
-            return;
-        }
-        let pty_id = tab.pty_id;
-        // Clear any partially typed shell line first so the clicked action
-        // executes exactly the displayed command instead of concatenating it.
-        let input = frequent_command_input(command);
-        if let Err(error) = self.pty.write_shell_input(pty_id, &input) {
-            self.show_notice(format!("Could not run command: {error}"));
-            return;
-        }
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.frequent_commands.reset_input_line();
-            tab.frequent_commands.record_executed(command);
-        }
-        self.arm_cwd_polling(CWD_POLL_WINDOW);
-        self.request_redraw();
-    }
-
-    fn open_context_directory(&mut self, path: PathBuf, target: context_actions::DirectoryTarget) {
+    fn open_context_directory(&mut self, path: PathBuf) {
         let canonical = match path.canonicalize() {
             Ok(path) if path.is_dir() => path,
             Ok(_) => {
@@ -1679,36 +1643,7 @@ impl App {
             return;
         }
 
-        match target {
-            context_actions::DirectoryTarget::NewTab => {
-                self.spawn_tab(None, Some(canonical_text.to_string()));
-            }
-            context_actions::DirectoryTarget::CurrentTab => {
-                let Some(tab) = self.tabs.get(self.active) else {
-                    self.show_notice("No active terminal session");
-                    return;
-                };
-                if tab.return_to_shell {
-                    self.show_notice(
-                        "This tab is running a task; choose a shell tab or Shift-click",
-                    );
-                    return;
-                }
-                // Never inject `cd` into a foreground program; it would be
-                // submitted as input to that program, not the shell.
-                if !self.active_tab_at_shell_prompt() {
-                    self.show_notice("Cannot change directory: the tab is running a program");
-                    return;
-                }
-                let pty_id = tab.pty_id;
-                let command = posix_cd_command(canonical_text);
-                if let Err(error) = self.pty.write_shell_input(pty_id, command.as_bytes()) {
-                    self.show_notice(format!("Could not change directory: {error}"));
-                    return;
-                }
-                self.arm_cwd_polling(CWD_POLL_WINDOW);
-            }
-        }
+        self.spawn_tab(None, Some(canonical_text.to_string()));
     }
 
     fn flush_directory_visit(&mut self) {
@@ -3019,12 +2954,12 @@ impl App {
         let Some(tab) = self.tabs.get(self.active) else {
             return false;
         };
-        if !Self::terminal_reports_shell_prompt(&tab.core)
-            || !self.pty.shell_owns_foreground(tab.pty_id)
-        {
+        // Runs on every printable keypress/paste, so read just the cursor row
+        // instead of snapshotting the whole grid.
+        let Some(prefix) = tab.core.cursor_row_prefix() else {
             return false;
-        }
-        true
+        };
+        looks_like_shell_prompt(&prefix)
     }
 
     fn write_terminal_input(&mut self, pty_id: u32, bytes: &[u8], failure: &str) -> bool {
@@ -3035,25 +2970,6 @@ impl App {
                 false
             }
         }
-    }
-
-    /// Terminal-state half of the shell-injection gate. Full-screen and
-    /// mouse-reporting applications are rejected even if they paint a prompt
-    /// suffix. Bracketed paste alone remains allowed because interactive
-    /// readline/zle shells commonly enable it while waiting at a real prompt.
-    fn terminal_reports_shell_prompt(core: &AlacrittyCore) -> bool {
-        if core.alternate_screen()
-            || core.application_cursor_keys()
-            || core.mouse_mode().protocol != MouseProtocol::Off
-        {
-            return false;
-        }
-        // Runs on every printable keypress/paste, so read just the cursor row
-        // instead of snapshotting the whole grid.
-        let Some(prefix) = core.cursor_row_prefix() else {
-            return false;
-        };
-        looks_like_shell_prompt(&prefix)
     }
 
     /// Detect a copy/paste shortcut: Cmd+C/V on macOS, Ctrl+Shift+C/V elsewhere
@@ -3686,18 +3602,6 @@ fn context_discovery_config_changed(
     after: &phantom_core::ContextActionsConfig,
 ) -> bool {
     context_discovery_fingerprint(before) != context_discovery_fingerprint(after)
-}
-
-fn posix_cd_command(path: &str) -> String {
-    format!("cd '{}'\r", path.replace('\'', "'\\''"))
-}
-
-fn frequent_command_input(command: &str) -> Vec<u8> {
-    let mut input = Vec::with_capacity(command.len() + 2);
-    input.push(0x15); // Ctrl+U: readline/zle kill-whole-line.
-    input.extend_from_slice(command.as_bytes());
-    input.push(b'\r');
-    input
 }
 
 fn spdeploy_startup_command(
@@ -5245,42 +5149,22 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_injections_are_blocked_while_a_program_is_in_the_foreground() {
+    fn recent_directory_action_opens_a_new_tab_without_injecting_the_current_pty() {
         let mut app = test_app();
         let dir = std::env::temp_dir()
             .canonicalize()
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        app.tabs.push(Tab::new(
-            0,
-            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
-            u32::MAX,
-            dir.clone(),
-            None,
-        ));
-        // An empty grid has no shell-prompt-looking line before the cursor,
-        // which models a full-screen program or password prompt owning it.
-        app.tabs[0].frequent_commands.record_executed("cargo test");
-
-        app.run_frequent_command("cargo test");
-        assert_eq!(
-            app.notice_text(),
-            Some("Cannot run the command: the tab is running a program")
-        );
-
         app.config
             .context_actions
             .record_directory_visit(Path::new(&dir), 1)
             .unwrap();
-        app.open_context_directory(
-            PathBuf::from(&dir),
-            context_actions::DirectoryTarget::CurrentTab,
-        );
-        assert_eq!(
-            app.notice_text(),
-            Some("Cannot change directory: the tab is running a program")
-        );
+        app.open_context_directory(PathBuf::from(&dir));
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].cwd, dir);
+        app.close_tab(0);
     }
 
     #[test]
@@ -5293,20 +5177,6 @@ mod tests {
 
         after.plugins[0].enabled = false;
         assert!(context_discovery_config_changed(&before, &after));
-    }
-
-    #[test]
-    fn posix_cd_command_quotes_paths_and_submits_with_carriage_return() {
-        assert_eq!(
-            posix_cd_command("/projects/O'Brien/soul fire"),
-            "cd '/projects/O'\\''Brien/soul fire'\r"
-        );
-        assert_eq!(posix_cd_command("/"), "cd '/'\r");
-    }
-
-    #[test]
-    fn frequent_command_click_clears_partial_input_and_submits_exact_command() {
-        assert_eq!(frequent_command_input("cargo test"), b"\x15cargo test\r");
     }
 
     #[test]
@@ -5401,32 +5271,6 @@ mod tests {
         assert!(looks_like_shell_prompt("PS C:\\project> "));
         assert!(!looks_like_shell_prompt("Password: "));
         assert!(!looks_like_shell_prompt("Confirm token: "));
-    }
-
-    #[test]
-    fn shell_injection_terminal_state_rejects_spoofable_application_modes() {
-        fn core_with(bytes: &[u8]) -> AlacrittyCore {
-            let mut core = AlacrittyCore::new(4, 40, 100, CursorShape::Block);
-            core.advance(bytes);
-            core
-        }
-
-        assert!(App::terminal_reports_shell_prompt(&core_with(b"host$ ")));
-        assert!(App::terminal_reports_shell_prompt(&core_with(
-            b"\x1b[?2004hhost$ "
-        )));
-        assert!(!App::terminal_reports_shell_prompt(&core_with(
-            b"\x1b[?1hhost$ "
-        )));
-        assert!(!App::terminal_reports_shell_prompt(&core_with(
-            b"\x1b[?1049hhost$ "
-        )));
-        assert!(!App::terminal_reports_shell_prompt(&core_with(
-            b"\x1b[?1000hhost$ "
-        )));
-        assert!(!App::terminal_reports_shell_prompt(&core_with(
-            b"Password: "
-        )));
     }
 
     #[test]

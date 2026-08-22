@@ -172,17 +172,7 @@ pub enum ContextRequest {
     },
     OpenDirectory {
         path: PathBuf,
-        target: DirectoryTarget,
     },
-    RunFrequentCommand {
-        command: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirectoryTarget {
-    CurrentTab,
-    NewTab,
 }
 
 /// Run every enabled compiled-in provider for `cwd`. This function is

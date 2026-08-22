@@ -46,12 +46,10 @@ This is the project's defining characteristic. Preserve every item here.
   source and canonical root are explicitly trusted and stored as validated,
   structured program/args/env task records. A changed source invalidates trust.
   Built-in contextual providers may launch only a provider-owned fixed
-  executable/flag shape after an explicit user action. The only synthesized
-  PTY input is a user-selected, validated frequent command or recent-directory
-  `cd` line; both require a shell-like prompt, non-application terminal modes,
-  and the spawned shell owning the kernel's PTY foreground process group.
-  Config is read from disk, which a local attacker could tamper with, so treat
-  any change to profile/task validation or spawn resolution as
+  executable/flag shape after an explicit user action. The app never executes
+  shell command strings from discovery and never injects synthesized commands
+  into a PTY. Config is read from disk, which a local attacker could tamper
+  with, so treat any change to profile/task validation or spawn resolution as
   security-sensitive and keep validation exhaustive.
 - **All config is validated in Rust before use or storage.**
   `AppConfig::validate()` in `phantom-core/src/config.rs` bounds every field
