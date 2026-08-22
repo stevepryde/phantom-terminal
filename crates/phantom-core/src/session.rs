@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
+use crate::MAX_TABS;
 
-pub const MAX_TAB_RECORDS: usize = 128;
 pub const MAX_TAB_ID_LEN: usize = 128;
 pub const MAX_TAB_TITLE_LEN: usize = 256;
 pub const MAX_TAB_CWD_LEN: usize = 4096;
@@ -317,9 +317,9 @@ fn stable_tab_records(
 }
 
 fn validate_tab_records(tabs: &[TabRecord]) -> AppResult<()> {
-    if tabs.len() > MAX_TAB_RECORDS {
+    if tabs.len() > MAX_TABS {
         return Err(AppError::Other(format!(
-            "no more than {MAX_TAB_RECORDS} tabs can be remembered"
+            "no more than {MAX_TABS} tabs can be remembered"
         )));
     }
     for tab in tabs {
@@ -1040,6 +1040,31 @@ mod tests {
         let loaded = store.load_tabs().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].title, "new");
+    }
+
+    #[test]
+    fn save_tabs_accepts_shared_limit_and_rejects_excess_without_data_loss() {
+        let store = in_memory();
+        let mut tabs: Vec<_> = (0..MAX_TABS)
+            .map(|index| tab(&format!("tab-{index}"), "/known", index == 0))
+            .collect();
+
+        store.save_tabs(&tabs).unwrap();
+        assert_eq!(store.load_tabs().unwrap().len(), MAX_TABS);
+
+        tabs.push(tab("excess", "/known", false));
+        let error = store.save_tabs(&tabs).unwrap_err().to_string();
+
+        assert_eq!(
+            error,
+            format!("no more than {MAX_TABS} tabs can be remembered")
+        );
+        let loaded = store.load_tabs().unwrap();
+        assert_eq!(loaded.len(), MAX_TABS);
+        assert_eq!(
+            loaded.last().unwrap().title,
+            format!("tab-{}", MAX_TABS - 1)
+        );
     }
 
     #[test]
