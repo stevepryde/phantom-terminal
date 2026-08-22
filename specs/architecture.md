@@ -23,11 +23,11 @@ copy of the exact bounded manifest source to stored, validated task definitions.
 Changed bytes invalidate trust before any task can launch.
 
 Project tasks and built-in integrations launch direct executable/argument
-vectors. They never pass project text through `sh -c`. The sole PTY command
-injection is the Recent directories provider's fixed `cd '<canonical path>'`
-shape: the path comes from validated internal history, is re-canonicalized at
-dispatch, and is POSIX single-quoted before submission. Selecting an action is
-always explicit; discovery itself remains read-only.
+vectors. They never pass project text through `sh -c`. Context providers never
+inject synthesized commands into an existing PTY: directory navigation creates
+an ordinary shell tab rooted at a re-canonicalized history path, and frequent
+commands are non-interactive manual references. Selecting an action is always
+explicit; discovery itself remains read-only.
 
 The context validator is a read-only projection of this boundary. It calls the
 same `phantom-core` manifest loading and trust-binding validation used before

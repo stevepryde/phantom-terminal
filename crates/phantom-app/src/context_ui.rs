@@ -803,15 +803,18 @@ fn draw_frequent_commands(
         let elided = text != *command;
         let response = ui
             .push_id(("frequent_command", command), |ui| {
-                full_width_row(ui, Sense::hover(), |ui, rect, _color| {
-                    ui.painter().text(
-                        egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        text,
-                        FontId::monospace(DIRECTORY_TEXT_SIZE),
-                        muted_text_color(),
-                    );
-                })
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ACTION_ROW_HEIGHT),
+                    Sense::hover(),
+                );
+                ui.painter().text(
+                    egui::pos2(rect.left() + ROW_TEXT_INSET, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    text,
+                    FontId::monospace(DIRECTORY_TEXT_SIZE),
+                    muted_text_color(),
+                );
+                response
             })
             .inner
             .on_hover_text(if elided {
