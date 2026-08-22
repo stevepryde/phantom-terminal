@@ -536,6 +536,27 @@ enum MouseEvent {
     WheelDown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseUpAction {
+    Ignore,
+    EndSelection,
+    Report,
+}
+
+fn mouse_up_action(
+    terminal_press_forwarded: bool,
+    selecting: bool,
+    mouse_reporting: bool,
+) -> MouseUpAction {
+    if selecting {
+        MouseUpAction::EndSelection
+    } else if terminal_press_forwarded && mouse_reporting {
+        MouseUpAction::Report
+    } else {
+        MouseUpAction::Ignore
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WheelRoute {
     TabStrip,
@@ -2738,10 +2759,10 @@ impl App {
             self.handle_click();
             return;
         }
-        self.left_down = true;
         if self.active_mouse_mode().reports() {
-            self.report_mouse(px, py, MouseEvent::Press);
+            self.left_down = self.report_mouse(px, py, MouseEvent::Press);
         } else if let Some((row, col, side)) = self.viewport_cell(px, py) {
+            self.left_down = true;
             let click_count = self.terminal_click_count(row, col);
             let kind = match click_count {
                 1 => SelectionKind::Simple,
@@ -2790,11 +2811,17 @@ impl App {
             }
             return;
         }
-        self.left_down = false;
-        if self.selecting {
-            self.selecting = false;
-        } else if self.active_mouse_mode().reports() {
-            self.report_mouse(px, py, MouseEvent::Release);
+        let terminal_press_forwarded = std::mem::take(&mut self.left_down);
+        match mouse_up_action(
+            terminal_press_forwarded,
+            self.selecting,
+            self.active_mouse_mode().reports(),
+        ) {
+            MouseUpAction::Ignore => {}
+            MouseUpAction::EndSelection => self.selecting = false,
+            MouseUpAction::Report => {
+                self.report_mouse(px, py, MouseEvent::Release);
+            }
         }
     }
 
@@ -3077,16 +3104,16 @@ impl App {
     }
 
     /// Encode and send a mouse event to a mouse-aware application.
-    fn report_mouse(&mut self, px: f32, py: f32, event: MouseEvent) {
+    fn report_mouse(&mut self, px: f32, py: f32, event: MouseEvent) -> bool {
         let Some((row, col, _)) = self.viewport_cell(px, py) else {
-            return;
+            return false;
         };
         let (mode, pty_id) = match self.tabs.get(self.active) {
             Some(t) => (t.core.mouse_mode(), t.pty_id),
-            None => return,
+            None => return false,
         };
         if !mode.reports() {
-            return;
+            return false;
         }
         let (base, pressed) = match event {
             MouseEvent::Press => (0u8, true),
@@ -3112,7 +3139,7 @@ impl App {
         } else {
             encode_mouse_legacy(3 + (button & !3), col as u16, row as u16)
         };
-        self.write_terminal_input(pty_id, &bytes, "Could not send mouse input");
+        self.write_terminal_input(pty_id, &bytes, "Could not send mouse input")
     }
 
     fn copy_selection(&mut self) {
@@ -4882,6 +4909,29 @@ mod tests {
         assert_eq!(app.wheel_line_remainder, 0.0);
         assert_eq!(app.accumulate_wheel_delta(WheelRoute::MouseReport, 0.25), 0);
         assert_eq!(app.wheel_line_remainder, 0.25);
+    }
+
+    #[test]
+    fn terminal_mouse_release_requires_a_forwarded_press() {
+        assert_eq!(
+            mouse_up_action(false, false, true),
+            MouseUpAction::Ignore,
+            "an egui- or chrome-consumed press must not create a terminal release"
+        );
+        assert_eq!(mouse_up_action(true, false, true), MouseUpAction::Report);
+    }
+
+    #[test]
+    fn terminal_mouse_release_preserves_selection_and_mode_routing() {
+        assert_eq!(
+            mouse_up_action(true, true, true),
+            MouseUpAction::EndSelection
+        );
+        assert_eq!(
+            mouse_up_action(true, false, false),
+            MouseUpAction::Ignore,
+            "a mode disabled before release must not receive a mouse report"
+        );
     }
 
     #[test]
