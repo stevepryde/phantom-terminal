@@ -124,9 +124,11 @@ global provider enablement in **Settings → Context Actions**—is remembered a
 restarts. Directories stays first in the stable provider order. It combines the
 five most recently used and five most frequently used directories, removes
 duplicates, and displays them alphabetically in dense rows with the home prefix
-shown as `~`; click a row to `cd` in the current session or Shift-click it to
-open a new tab. The sidebar always remains translucent over the terminal
-backdrop. If the current directory contains
+shown as `~`; click a row to open that directory in a new tab. Frequent commands
+remain visible as a manual reference, but Phantom does not inject commands or
+synthetic `cd` lines into a PTY because terminal output cannot authenticate a
+shell prompt. The sidebar always remains translucent over the terminal backdrop.
+If the current directory contains
 `deploy.yml`, the spdeploy provider lists its runnable actions and can open a
 selected action in a new tab. Phantom parses the minimal listing fields from
 YAML itself, so discovery does not require or invoke the spdeploy CLI. Discovery

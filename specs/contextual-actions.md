@@ -65,17 +65,18 @@ validated-execution posture.
   five most recently visited directories and the five most frequently visited
   directories and remove duplicates. Selection uses recency and visit frequency;
   presentation order is defined separately by CTX-023.
-- **CTX-019 (confirmed):** Clicking a directory row sends a safely quoted `cd`
-  to the active terminal session. Shift-clicking opens a new tab rooted at that
-  directory. Directory rows elide the start of long paths so the basename stays
-  visible.
+- **CTX-019 (security):** Clicking a directory row opens a new tab rooted at the
+  re-canonicalized history path through the ordinary new-tab pipeline. Directory
+  actions never synthesize `cd` or other PTY input. Rows elide the start of long
+  paths so the basename stays visible.
 - **CTX-020 (confirmed):** Context sections are compact accordions separated by
   a single thin horizontal divider. Headers are fixed 26px rows with smaller
   labels and a leading chevron that points right when collapsed and down when
   expanded. Built-in headings are Tasks, Deploy, and Directories. Action rows
   are fixed at 28px and directory rows at 24px, with 12px primary text, no gaps,
-  a full-row hover state, and a full-row click target. The sidebar contains no
-  instructional help copy.
+  a full-row hover state, and a full-row click target. Concise labels may clarify
+  when an action opens a new tab or a non-interactive command reference requires
+  manual typing; other instructional help copy is omitted.
 - **CTX-021 (confirmed):** The sidebar's entire left divider is the resize
   handle. It must expose a horizontal-resize cursor, visibly emphasize hover and
   drag state, and update the persisted width continuously while dragging.
@@ -135,6 +136,10 @@ validated-execution posture.
   actions, palette actions, restored tabs, and all future new-tab features may
   add only typed request data; they must not spawn a PTY, push a `Tab`, or
   reproduce any part of tab construction through a parallel path.
+- **CTX-033 (security):** Frequent Commands may show at most three commands from
+  the active tab's in-memory submission counts as muted manual references. The
+  section must clearly say that commands require manual typing, expose no click
+  or pointer affordance, and never synthesize input into the PTY.
 
 ## `.phantom.yml` version 1
 
@@ -192,8 +197,9 @@ a shell command string. Omitting `run` opens the default validated shell.
   the sidebar and observe no reserved rail, then click its floating content-area
   icon and observe the sidebar return at its persisted width.
 - **AC-CTX-K:** Revisiting and repeatedly using fixture directories produces a
-  deduplicated combined recent/frequent list. A click changes the active shell's
-  directory; Shift-click creates a new tab at the same path.
+  deduplicated combined recent/frequent list. A click creates a new tab at the
+  revalidated path through the ordinary new-tab pipeline. Frequent Commands
+  rows are visibly manual-only and produce no contextual request or PTY input.
 - **AC-CTX-L:** Run `phantom context validate` against valid, missing, malformed,
   and path-escaping fixtures. Only the valid fixture exits zero, and none of the
   runs create a trust record, launch a process, or start a window.

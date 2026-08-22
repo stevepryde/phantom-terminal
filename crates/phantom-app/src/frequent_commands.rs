@@ -157,10 +157,6 @@ impl FrequentCommands {
         &self.top
     }
 
-    pub fn contains_top(&self, command: &str) -> bool {
-        self.top.iter().any(|candidate| candidate == command)
-    }
-
     pub fn reset_input_line(&mut self) {
         self.current_line.clear();
         self.current_line_reliable = true;
@@ -214,7 +210,7 @@ mod tests {
         commands.prepare_line(true);
         commands.observe_text("one\ntwo\nthree\nfour\n");
         assert_eq!(commands.top(), ["four", "three", "two"]);
-        assert!(!commands.contains_top("one"));
+        assert!(!commands.top().iter().any(|command| command == "one"));
     }
 
     #[test]
