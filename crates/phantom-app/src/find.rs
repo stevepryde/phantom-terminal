@@ -6,6 +6,8 @@
 use egui::scroll_area::ScrollBarVisibility;
 use egui::{Area, Button, Color32, Frame, Id, Key, Margin, Order, ScrollArea, TextEdit, Ui};
 
+use crate::ui_components::{with_alpha, DIVIDER, ELEVATED_SURFACE, FOCUS_ACCENT};
+
 const BAR_INSET: f32 = 8.0;
 const BAR_HEIGHT: f32 = 36.0;
 const CONTROL_SIZE: f32 = 28.0;
@@ -156,12 +158,15 @@ impl FindState {
             .fixed_pos(layout.position)
             .show(ctx, |ui| {
                 Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 35),
-                    ))
+                    .fill(with_alpha(ELEVATED_SURFACE, alpha))
+                    .stroke(egui::Stroke::new(1.0, DIVIDER))
                     .corner_radius(4)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 3],
+                        blur: 14,
+                        spread: 0,
+                        color: Color32::from_black_alpha(100),
+                    })
                     .inner_margin(Margin::same(BAR_INSET as i8))
                     .show(ui, |ui| {
                         let content_width = layout.width.shrink(BAR_INSET * 2.0);
@@ -205,7 +210,7 @@ impl FindState {
                 if invalid_tooltip.is_some() {
                     Color32::from_rgb(248, 113, 113)
                 } else if query_focused {
-                    Color32::from_rgb(56, 189, 248)
+                    FOCUS_ACCENT
                 } else {
                     ui.visuals().widgets.inactive.bg_stroke.color
                 },

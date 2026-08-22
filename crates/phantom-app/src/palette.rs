@@ -24,6 +24,25 @@ pub enum PaletteAction {
 struct Command {
     label: String,
     action: PaletteAction,
+    group: PaletteGroup,
+    shortcut: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaletteGroup {
+    Commands,
+    Profiles,
+    Appearance,
+}
+
+impl PaletteGroup {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Commands => "COMMANDS",
+            Self::Profiles => "PROFILES",
+            Self::Appearance => "APPEARANCE",
+        }
+    }
 }
 
 pub enum PaletteOutcome {
@@ -100,6 +119,8 @@ impl PaletteState {
                 filtered_index,
                 id: self.commands[command_index].action.stable_id(),
                 label: self.commands[command_index].label.clone(),
+                group: self.commands[command_index].group,
+                shortcut: self.commands[command_index].shortcut.clone(),
                 selected: filtered_index == self.selected,
             })
             .collect()
@@ -177,6 +198,8 @@ pub struct PaletteRow {
     pub filtered_index: usize,
     pub id: String,
     pub label: String,
+    pub group: PaletteGroup,
+    pub shortcut: Option<String>,
     pub selected: bool,
 }
 
@@ -194,34 +217,53 @@ impl PaletteAction {
 }
 
 fn build_commands(config: &AppConfig) -> Vec<Command> {
+    let shortcut = |action: &str| {
+        config
+            .keybindings
+            .iter()
+            .find(|binding| binding.action == action)
+            .map(|binding| binding.keys.clone())
+    };
     let mut commands = vec![
         Command {
             label: "New Tab".into(),
             action: PaletteAction::NewTab,
+            group: PaletteGroup::Commands,
+            shortcut: shortcut("tab.new"),
         },
         Command {
             label: "Close Tab".into(),
             action: PaletteAction::CloseTab,
+            group: PaletteGroup::Commands,
+            shortcut: shortcut("tab.close"),
         },
         Command {
             label: "Rename Tab".into(),
             action: PaletteAction::RenameTab,
+            group: PaletteGroup::Commands,
+            shortcut: shortcut("tab.rename"),
         },
         Command {
             label: "Open Settings".into(),
             action: PaletteAction::OpenSettings,
+            group: PaletteGroup::Commands,
+            shortcut: shortcut("settings.toggle"),
         },
     ];
     for profile in &config.shell_profiles {
         commands.push(Command {
             label: format!("New Tab: {}", profile.name),
             action: PaletteAction::NewTabWithProfile(profile.id.clone()),
+            group: PaletteGroup::Profiles,
+            shortcut: None,
         });
     }
     for theme in themes::UI_THEMES {
         commands.push(Command {
             label: format!("Theme: {theme}"),
             action: PaletteAction::SetUiTheme((*theme).to_string()),
+            group: PaletteGroup::Appearance,
+            shortcut: None,
         });
     }
     commands
@@ -309,5 +351,18 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].label, rows[1].label);
         assert_ne!(rows[0].id, rows[1].id);
+    }
+
+    #[test]
+    fn core_palette_rows_include_configured_shortcuts_and_groups() {
+        let config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        palette.open(&config);
+
+        let rows = palette.rows();
+        assert_eq!(rows[0].group, PaletteGroup::Commands);
+        assert_eq!(rows[0].shortcut.as_deref(), Some("CmdOrCtrl+T"));
+        assert!(rows.iter().any(|row| row.group == PaletteGroup::Profiles));
+        assert!(rows.iter().any(|row| row.group == PaletteGroup::Appearance));
     }
 }

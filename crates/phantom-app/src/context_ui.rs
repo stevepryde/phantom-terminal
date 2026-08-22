@@ -2,12 +2,12 @@
 
 use std::{
     collections::BTreeMap,
+    hash::Hash,
     path::{Path, PathBuf},
 };
 
 use egui::{
-    Align2, Area, Color32, ComboBox, FontId, Frame, Id, Margin, Order, RichText, Sense, Ui,
-    UiBuilder,
+    Align2, Area, Color32, FontId, Frame, Id, Margin, Order, RichText, Sense, Ui, UiBuilder,
 };
 use phantom_core::{
     default_home_dir, AppConfig, FREQUENT_COMMANDS_PLUGIN_ID, MANIFEST_PLUGIN_ID,
@@ -20,6 +20,7 @@ use crate::context_actions::{
     FrequentCommandsSection, ManifestSection, ManifestTab, ManifestTrustState,
     RecentDirectoriesSection, SpdeploySection,
 };
+use crate::ui_components::{with_alpha, CustomDropdown, DIVIDER, SIDEBAR_SURFACE};
 
 const ACTION_ROW_HEIGHT: f32 = 28.0;
 const ACTION_TEXT_SIZE: f32 = 12.0;
@@ -977,8 +978,15 @@ fn elide_text_end(ui: &Ui, text: &str, max_width: f32) -> String {
 
 fn sidebar_frame(alpha: u8, margin: i8) -> Frame {
     Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
-        .stroke(egui::Stroke::new(1.0, surface_border_color()))
+        .fill(with_alpha(SIDEBAR_SURFACE, alpha))
+        .stroke(egui::Stroke::new(1.0, DIVIDER))
+        .corner_radius(4)
+        .shadow(egui::epaint::Shadow {
+            offset: [-2, 0],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(80),
+        })
         .inner_margin(Margin::same(margin))
 }
 
@@ -1139,7 +1147,7 @@ fn task_start_label(title: &str) -> String {
 
 fn spdeploy_dropdown(
     ui: &mut Ui,
-    id_salt: impl egui::AsIdSalt,
+    id_salt: impl Hash + std::fmt::Debug,
     value: &mut SpdeploySelection,
     entries: &[SpdeployDropdownEntry],
 ) {
@@ -1160,8 +1168,7 @@ fn spdeploy_dropdown(
     let selected_fits = text_fits(ui, &selected_text, &button_font, width - 24.0);
     // Truncate instead of wrapping so the closed control keeps one fixed
     // height regardless of the selected operation or sidebar width.
-    let combo = ComboBox::from_id_salt(id_salt)
-        .selected_text(selected_text.as_str())
+    let combo = CustomDropdown::new(id_salt, selected_text.as_str())
         .width(width)
         .truncate()
         .show_ui(ui, |ui| {

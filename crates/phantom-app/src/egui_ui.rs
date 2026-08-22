@@ -5,8 +5,8 @@
 //! surfaces.
 
 use egui::{
-    Align2, Area, Button, Color32, ComboBox, Context, Frame, Id, Key as EguiKey, LayerId, Margin,
-    Order, Panel, RichText, Slider, TextEdit, Ui, ViewportId,
+    Align2, Area, Button, Color32, Context, Frame, Id, Key as EguiKey, LayerId, Margin, Order,
+    Panel, RichText, Slider, TextEdit, Ui, ViewportId,
 };
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use phantom_core::{
@@ -22,8 +22,12 @@ use crate::context_ui::ContextUi;
 use crate::find::{FindResultSummary, FindState, FindUiOutcome};
 use crate::gpu::{BlurRegion, FrameOverlay};
 use crate::keybindings::{parse_combo, Combo, ComboKey};
-use crate::palette::{PaletteAction, PaletteState};
+use crate::palette::{PaletteAction, PaletteGroup, PaletteRow, PaletteState};
 use crate::themes;
+use crate::ui_components::{
+    configure_phantom_style, with_alpha, CustomDropdown, APP_BACKGROUND, DIVIDER, ELEVATED_SURFACE,
+    FOCUS_ACCENT, SIDEBAR_SURFACE, TEXT_MUTED, TEXT_SECONDARY,
+};
 
 const PANEL_WIDTH_POINTS: f32 = 560.0;
 const PANEL_MIN_WIDTH_POINTS: f32 = 460.0;
@@ -306,7 +310,7 @@ impl UiState {
                 .frame(panel_frame(alpha))
                 .show(ui, |ui| {
                     self.panel_width_px = ui.max_rect().width() * ui.ctx().pixels_per_point();
-                    outcome.config_changed |= self.settings_panel(ui, config);
+                    outcome.config_changed |= self.settings_panel(ui, config, alpha);
                 });
             if transparent {
                 self.blur_regions.push(response.response.rect);
@@ -360,7 +364,7 @@ impl UiState {
         outcome
     }
 
-    fn settings_panel(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
+    fn settings_panel(&mut self, ui: &mut Ui, config: &mut AppConfig, alpha: u8) -> bool {
         let mut changed = false;
         let mut close_requested = false;
         let mut discard_requested = false;
@@ -403,11 +407,17 @@ impl UiState {
         }
 
         ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(SETTINGS_NAV_WIDTH_POINTS, ui.available_height()),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| self.settings_nav(ui),
-            );
+            Frame::new()
+                .fill(with_alpha(SIDEBAR_SURFACE, alpha))
+                .corner_radius(4)
+                .inner_margin(Margin::same(6))
+                .show(ui, |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SETTINGS_NAV_WIDTH_POINTS - 12.0, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| self.settings_nav(ui),
+                    );
+                });
 
             ui.separator();
 
@@ -884,8 +894,7 @@ impl UiState {
 
         let before = config.font_family.clone();
         let mut selected = before.clone();
-        ComboBox::from_id_salt("font_family")
-            .selected_text(selected.as_str())
+        CustomDropdown::new("font_family", selected.as_str())
             .width(ui.available_width())
             .show_ui(ui, |ui| {
                 for family in &self.font_families {
@@ -1046,7 +1055,7 @@ pub struct EguiLayer {
 impl EguiLayer {
     pub fn new(window: &Window, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let ctx = Context::default();
-        configure_style(&ctx);
+        configure_phantom_style(&ctx);
         let state = egui_winit::State::new(
             ctx.clone(),
             ViewportId::ROOT,
@@ -1273,27 +1282,6 @@ fn rect_to_region(rect: &egui::Rect, ppp: f32, width: u32, height: u32) -> Optio
     })
 }
 
-fn configure_style(ctx: &Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(17, 17, 22);
-    visuals.window_fill = Color32::from_rgb(17, 17, 22);
-    visuals.extreme_bg_color = Color32::from_rgb(11, 11, 14);
-    visuals.faint_bg_color = Color32::from_rgba_unmultiplied(255, 255, 255, 10);
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(56, 189, 248, 96);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 13);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 24);
-    visuals.widgets.active.bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 38);
-    visuals.widgets.noninteractive.fg_stroke.color =
-        Color32::from_rgba_unmultiplied(255, 255, 255, 150);
-
-    let mut style = (*ctx.global_style()).clone();
-    style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    style.spacing.slider_width = 160.0;
-    ctx.set_global_style(style);
-}
-
 /// Map a panel opacity percentage (50..=100) onto an 8-bit alpha. The renderer
 /// blurs whatever shows through whenever this is below fully opaque.
 fn panel_alpha(opacity_percent: u8) -> u8 {
@@ -1309,19 +1297,59 @@ fn context_panel_alpha(shared_panel_alpha: u8) -> u8 {
 
 fn panel_frame(alpha: u8) -> egui::Frame {
     egui::Frame::side_top_panel(&egui::Style::default())
-        .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
-        .stroke(egui::Stroke::new(
-            1.0,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 32),
-        ))
-        .inner_margin(egui::Margin::same(18))
+        .fill(with_alpha(APP_BACKGROUND, alpha))
+        .stroke(egui::Stroke::new(1.0, DIVIDER))
+        .corner_radius(4)
+        .shadow(egui::epaint::Shadow {
+            offset: [-3, 0],
+            blur: 16,
+            spread: 0,
+            color: Color32::from_black_alpha(100),
+        })
+        .inner_margin(egui::Margin::same(20))
 }
 
 fn settings_tab_button(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Response {
-    let text = RichText::new(tab.label()).size(13.0);
-    let button = Button::selectable(selected, text)
-        .min_size(egui::vec2(SETTINGS_NAV_WIDTH_POINTS - 18.0, 34.0));
-    ui.add(button)
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(SETTINGS_NAV_WIDTH_POINTS - 18.0, 36.0),
+        egui::Sense::click(),
+    );
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, tab.label())
+    });
+    let visuals = ui.style().interact(&response);
+    if selected || response.hovered() || response.has_focus() {
+        let fill = if selected {
+            ui.visuals().widgets.active.weak_bg_fill
+        } else {
+            visuals.weak_bg_fill
+        };
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, FOCUS_ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        tab.label(),
+        egui::FontId::proportional(13.0),
+        visuals.fg_stroke.color,
+    );
+    if selected {
+        ui.painter().vline(
+            rect.left() + 1.0,
+            (rect.top() + 7.0)..=(rect.bottom() - 7.0),
+            egui::Stroke::new(2.0, FOCUS_ACCENT),
+        );
+    }
+    response
 }
 
 fn section(ui: &mut Ui, title: &str) {
@@ -1329,7 +1357,7 @@ fn section(ui: &mut Ui, title: &str) {
     ui.label(
         RichText::new(title.to_ascii_uppercase())
             .size(11.0)
-            .color(Color32::from_rgba_unmultiplied(255, 255, 255, 140)),
+            .color(TEXT_SECONDARY),
     );
     ui.separator();
 }
@@ -1368,20 +1396,13 @@ fn context_plugin_toggle(
                 )
             });
             changed |= enabled.labelled_by(name_label.id).changed();
-            ui.label(
-                RichText::new(format!("Order {}", plugin.order))
-                    .size(11.0)
-                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 90)),
-            );
         });
     });
     changed
 }
 
 fn label(text: &str) -> RichText {
-    RichText::new(text)
-        .size(12.0)
-        .color(Color32::from_rgba_unmultiplied(255, 255, 255, 150))
+    RichText::new(text).size(12.0).color(TEXT_SECONDARY)
 }
 
 fn slider_u8(
@@ -1435,8 +1456,7 @@ fn slider_f32(
 fn combo(ui: &mut Ui, label_text: &str, value: &mut String, options: &[&str]) -> bool {
     let label = ui.label(label(label_text));
     let mut changed = false;
-    ComboBox::from_id_salt(label_text)
-        .selected_text(display_name(value))
+    CustomDropdown::new(label_text, display_name(value))
         .width(ui.available_width())
         .show_ui(ui, |ui| {
             for option in options {
@@ -1575,23 +1595,25 @@ fn command_palette_overlay(
         .fixed_pos(egui::pos2(x, y))
         .show(ctx, |ui| {
             let frame = Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(17, 17, 22, alpha))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    Color32::from_rgba_unmultiplied(255, 255, 255, 35),
-                ))
-                .inner_margin(Margin::same(14))
+                .fill(with_alpha(ELEVATED_SURFACE, alpha))
+                .stroke(egui::Stroke::new(1.0, DIVIDER))
+                .corner_radius(4)
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 5],
+                    blur: 20,
+                    spread: 0,
+                    color: Color32::from_black_alpha(130),
+                })
+                .inner_margin(Margin::same(16))
                 .show(ui, |ui| {
                     ui.set_width(width);
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(
-                            ui.min_rect().min,
-                            egui::vec2(ui.available_width(), 2.0),
-                        ),
-                        0.0,
-                        Color32::from_rgb(56, 189, 248),
+                    ui.label(
+                        RichText::new("COMMAND PALETTE")
+                            .size(11.0)
+                            .strong()
+                            .color(TEXT_SECONDARY),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
 
                     let previous_query = palette.query().to_string();
                     let mut query = previous_query.clone();
@@ -1628,12 +1650,25 @@ fn command_palette_overlay(
                         );
                         return;
                     }
+                    let show_groups = palette.query().is_empty();
+                    let mut previous_group = None;
                     for row in rows {
-                        let text = RichText::new(&row.label).size(13.0);
-                        let button = Button::selectable(row.selected, text)
-                            .min_size(egui::vec2(ui.available_width(), 32.0));
+                        if show_groups && previous_group != Some(row.group) {
+                            if previous_group.is_some() {
+                                ui.add_space(4.0);
+                            }
+                            ui.label(
+                                RichText::new(row.group.label())
+                                    .size(10.0)
+                                    .strong()
+                                    .color(TEXT_MUTED),
+                            );
+                            previous_group = Some(row.group);
+                        }
                         let clicked = ui
-                            .push_id(("palette_result", &row.id), |ui| ui.add(button).clicked())
+                            .push_id(("palette_result", &row.id), |ui| {
+                                palette_result_row(ui, &row).clicked()
+                            })
                             .inner;
                         if clicked {
                             action = palette.execute_filtered(row.filtered_index);
@@ -1664,6 +1699,59 @@ fn command_palette_overlay(
         action,
         rect: Some(area.inner),
     }
+}
+
+fn palette_result_row(ui: &mut Ui, row: &PaletteRow) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            true,
+            row.selected,
+            row.label.as_str(),
+        )
+    });
+    let visuals = ui.style().interact(&response);
+    if row.selected || response.hovered() || response.has_focus() {
+        let fill = if row.selected {
+            ui.visuals().widgets.active.weak_bg_fill
+        } else {
+            visuals.weak_bg_fill
+        };
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, FOCUS_ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let label_color = if row.group == PaletteGroup::Appearance && !row.selected {
+        TEXT_SECONDARY
+    } else {
+        visuals.fg_stroke.color
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        &row.label,
+        egui::FontId::proportional(13.0),
+        label_color,
+    );
+    if let Some(shortcut) = &row.shortcut {
+        ui.painter().text(
+            egui::pos2(rect.right() - 10.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            egui::FontId::monospace(11.0),
+            TEXT_MUTED,
+        );
+    }
+    response
 }
 
 /// Whether the parsed config combo is pressed in this egui frame. egui's
@@ -1935,6 +2023,10 @@ mod tests {
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == Role::CheckBox && node.label() == Some("Enable Frequent commands")
+        }));
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.label()
+                .is_some_and(|label| label.starts_with("Order "))
         }));
     }
 

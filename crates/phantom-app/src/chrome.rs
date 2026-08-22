@@ -520,6 +520,7 @@ pub struct ChromeAnimationState {
     close_hover: Vec<f32>,
     new_tab_hover: f32,
     settings_hover: f32,
+    window_control_hover: [f32; 3],
     last_tick: Option<Instant>,
 }
 
@@ -568,6 +569,22 @@ impl ChromeAnimationState {
             0.0
         };
         animating |= ease_value(&mut self.settings_hover, settings_target, amount);
+        for control in [
+            WindowControl::Minimize,
+            WindowControl::Maximize,
+            WindowControl::Close,
+        ] {
+            let target = if self.hover == ChromeHoverTarget::WindowControl(control) {
+                1.0
+            } else {
+                0.0
+            };
+            animating |= ease_value(
+                &mut self.window_control_hover[window_control_index(control)],
+                target,
+                amount,
+            );
+        }
         animating
     }
 
@@ -585,6 +602,18 @@ impl ChromeAnimationState {
 
     fn settings(&self) -> f32 {
         self.settings_hover
+    }
+
+    fn window_control(&self, control: WindowControl) -> f32 {
+        self.window_control_hover[window_control_index(control)]
+    }
+}
+
+fn window_control_index(control: WindowControl) -> usize {
+    match control {
+        WindowControl::Minimize => 0,
+        WindowControl::Maximize => 1,
+        WindowControl::Close => 2,
     }
 }
 
@@ -786,7 +815,7 @@ pub fn draw_tab_bar(
             draw_ephemeral_indicator(r, rect, colors);
         }
         draw_settings_button(r, settings, colors, settings_open, animations.settings());
-        draw_window_controls(r, queue, window_controls.as_slice(), colors);
+        draw_window_controls(r, queue, window_controls.as_slice(), colors, animations);
         let hits = TabBarHits {
             tabs,
             new_tab,
@@ -837,7 +866,7 @@ pub fn draw_tab_bar(
                     settings_hover: animations.settings(),
                 },
             );
-            draw_window_controls(r, queue, window_controls.as_slice(), colors);
+            draw_window_controls(r, queue, window_controls.as_slice(), colors, animations);
         }
         // Rows live in a vertically scrollable strip below the header row; the
         // "+ new tab" row scrolls with them.
@@ -1404,10 +1433,24 @@ fn draw_window_controls(
     queue: &wgpu::Queue,
     hits: &[WindowControlHit],
     colors: &ChromeColors,
+    animations: &ChromeAnimationState,
 ) {
     for hit in hits {
+        let hover = animations.window_control(hit.control).clamp(0.0, 1.0);
+        if hover > 0.0 {
+            let fill = match hit.control {
+                WindowControl::Close => [239, 68, 68, (76.0 * hover) as u8],
+                WindowControl::Minimize | WindowControl::Maximize => {
+                    with_alpha(colors.text, (22.0 * hover) as u8)
+                }
+            };
+            r.fill_rect(hit.rect.x, hit.rect.y, hit.rect.w, hit.rect.h, fill);
+        }
         let (glyph, color) = match hit.control {
-            WindowControl::Close => ("\u{00d7}", with_alpha(colors.text, 210)),
+            WindowControl::Close => (
+                "\u{00d7}",
+                mix(with_alpha(colors.text, 210), colors.text, hover),
+            ),
             WindowControl::Minimize => ("\u{2212}", with_alpha(colors.dim_text, 210)),
             WindowControl::Maximize => ("\u{25a1}", with_alpha(colors.dim_text, 210)),
         };
@@ -2390,9 +2433,14 @@ mod tests {
         assert!(state.advance(now + std::time::Duration::from_millis(16), 1));
         assert!(state.settings() > 0.0);
 
+        assert!(state.set_hover(ChromeHoverTarget::WindowControl(WindowControl::Close)));
+        assert!(state.advance(now + std::time::Duration::from_millis(32), 1));
+        assert!(state.window_control(WindowControl::Close) > 0.0);
+
         assert!(state.set_hover(ChromeHoverTarget::None));
         assert!(!state.advance(now + std::time::Duration::from_millis(500), 1));
         assert_eq!(state.settings(), 0.0);
+        assert_eq!(state.window_control(WindowControl::Close), 0.0);
     }
 
     #[test]
@@ -2402,6 +2450,7 @@ mod tests {
         assert!(ChromeHoverTarget::Close(0).is_clickable());
         assert!(ChromeHoverTarget::NewTab.is_clickable());
         assert!(ChromeHoverTarget::Settings.is_clickable());
+        assert!(ChromeHoverTarget::WindowControl(WindowControl::Close).is_clickable());
     }
 
     #[test]
