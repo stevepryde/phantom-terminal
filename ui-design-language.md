@@ -155,6 +155,7 @@ Prefer dividers and surface contrast over card-heavy layouts. Page sections shou
 | Destructive actions | Put delete actions in the detail/edit screen, not the list row, and use inline confirmation before deleting |
 | Back navigation | Detail screens should offer a clear back action near the title |
 | Editable rows | The primary row area should be clickable, with separate icon affordances for secondary actions |
+| Keybindings | Separate validated, editable configured shortcuts from a read-only list of app-owned built-in shortcuts. Built-in labels must reflect the active platform (`Cmd` on macOS, `Ctrl` on Linux) and share their action/shortcut authority with runtime input and command-palette entries. |
 | Terminal tabs | Horizontal tabs fill the full space between vertical separators; selected tabs use only a bottom underline, while inactive tabs stay transparent except for temporary hover fill. Vertical tabs live in a left sidebar, use horizontal separators, and show selection with a right-aligned border. |
 | Window chrome | Offer `system` and `custom` window chrome modes in Terminal settings. Custom chrome uses theme-tinted gradient backfill, `14px` window rounding where the platform supports transparent windows, and a subtle Linux border highlight; system chrome leaves the OS titlebar and frame untouched. |
 | Window restoration | Remember the last settled normal-window size in logical pixels and restore it on launch. Debounce live resize updates; maximized, fullscreen, and minimized zero-size transitions must not replace the preferred normal size. |
@@ -203,7 +204,7 @@ Use Lucide icons for actions and navigation. Icons inside buttons should have an
 | Pattern | Rule |
 | --- | --- |
 | Control plane | egui is the default UI for all non-terminal native surfaces |
-| Command palette | Render as a centered egui foreground overlay with a dimmed terminal backdrop, search input, keyboard selection, and clickable command rows. Keep command execution in app state; the terminal renderer should not own palette widgets. |
+| Command palette | Render as a centered egui foreground overlay with a dimmed terminal backdrop, search input, keyboard selection, and clickable command rows. Include app-owned Find in Scrollback and Toggle Fullscreen commands with their built-in shortcut labels. Keep command execution in app state; the terminal renderer should not own palette widgets. |
 | Panel placement | Settings float above the terminal. Persistent contextual workflows may use an edge-attached sidebar that intentionally reserves terminal grid space while preserving the full-window backdrop. |
 | Panel navigation | Multi-section panels use a fixed vertical tab rail at the left of the panel. Keep the rail wide enough for readable labels and keep the active tab visually selected. |
 | Styling | Use Phantom dark surfaces, compact spacing, low rounding, and cyan accent focus/selection states via egui `Visuals` and `Style`. Settings panels may be subtly translucent, but stay near-opaque enough for form readability. |

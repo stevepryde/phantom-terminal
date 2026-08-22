@@ -7,7 +7,7 @@
 use phantom_core::AppConfig;
 use phantom_emu::Key;
 
-use crate::themes;
+use crate::{keybindings::BuiltinShortcut, themes};
 
 const MAX_ROWS: usize = 10;
 
@@ -17,6 +17,8 @@ pub enum PaletteAction {
     CloseTab,
     RenameTab,
     OpenSettings,
+    FindInScrollback,
+    ToggleFullscreen,
     NewTabWithProfile(String),
     SetUiTheme(String),
 }
@@ -210,6 +212,8 @@ impl PaletteAction {
             Self::CloseTab => "close_tab".to_string(),
             Self::RenameTab => "rename_tab".to_string(),
             Self::OpenSettings => "open_settings".to_string(),
+            Self::FindInScrollback => "find_in_scrollback".to_string(),
+            Self::ToggleFullscreen => "toggle_fullscreen".to_string(),
             Self::NewTabWithProfile(id) => format!("new_tab_profile:{id}"),
             Self::SetUiTheme(theme) => format!("set_ui_theme:{theme}"),
         }
@@ -248,6 +252,18 @@ fn build_commands(config: &AppConfig) -> Vec<Command> {
             action: PaletteAction::OpenSettings,
             group: PaletteGroup::Commands,
             shortcut: shortcut("settings.toggle"),
+        },
+        Command {
+            label: BuiltinShortcut::FindInScrollback.label().into(),
+            action: PaletteAction::FindInScrollback,
+            group: PaletteGroup::Commands,
+            shortcut: Some(BuiltinShortcut::FindInScrollback.keys().into()),
+        },
+        Command {
+            label: BuiltinShortcut::ToggleFullscreen.label().into(),
+            action: PaletteAction::ToggleFullscreen,
+            group: PaletteGroup::Commands,
+            shortcut: Some(BuiltinShortcut::ToggleFullscreen.keys().into()),
         },
     ];
     for profile in &config.shell_profiles {
@@ -364,5 +380,30 @@ mod tests {
         assert_eq!(rows[0].shortcut.as_deref(), Some("CmdOrCtrl+T"));
         assert!(rows.iter().any(|row| row.group == PaletteGroup::Profiles));
         assert!(rows.iter().any(|row| row.group == PaletteGroup::Appearance));
+    }
+
+    #[test]
+    fn palette_exposes_builtin_find_and_fullscreen_commands() {
+        let mut palette = PaletteState::default();
+        palette.open(&AppConfig::default());
+
+        palette.set_query("find scrollback".to_string());
+        let find = palette.rows();
+        assert_eq!(find.len(), 1);
+        assert_eq!(find[0].label, "Find in Scrollback");
+        assert_eq!(
+            find[0].shortcut.as_deref(),
+            Some(BuiltinShortcut::FindInScrollback.keys())
+        );
+        assert_eq!(
+            palette.execute_selected(),
+            Some(PaletteAction::FindInScrollback)
+        );
+
+        palette.set_query("fullscreen".to_string());
+        assert_eq!(
+            palette.execute_selected(),
+            Some(PaletteAction::ToggleFullscreen)
+        );
     }
 }

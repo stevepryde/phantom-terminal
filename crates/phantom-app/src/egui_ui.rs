@@ -21,7 +21,7 @@ use crate::context_actions::{ContextRequest, ContextSnapshot};
 use crate::context_ui::ContextUi;
 use crate::find::{FindResultSummary, FindState, FindUiOutcome};
 use crate::gpu::{BlurRegion, FrameOverlay};
-use crate::keybindings::{parse_combo, Combo, ComboKey};
+use crate::keybindings::{parse_combo, BuiltinShortcut, Combo, ComboKey};
 use crate::palette::{PaletteAction, PaletteGroup, PaletteRow, PaletteState};
 use crate::themes;
 use crate::ui_components::{
@@ -651,6 +651,16 @@ impl UiState {
                             config.keybindings = AppConfig::default().keybindings;
                             changed = true;
                         }
+                        ui.add_space(20.0);
+                        section(ui, "Built-in shortcuts");
+                        ui.label(
+                            RichText::new(
+                                "These app shortcuts are always available and cannot be changed.",
+                            )
+                            .size(11.0)
+                            .color(TEXT_MUTED),
+                        );
+                        builtin_shortcuts(ui);
                     }
                 });
         });
@@ -1514,6 +1524,41 @@ fn keybindings_editor(ui: &mut Ui, keybindings: &mut [Keybinding]) -> bool {
     changed
 }
 
+fn builtin_shortcuts(ui: &mut Ui) {
+    for shortcut in BuiltinShortcut::ALL {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(shortcut.label()).size(13.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let response = ui.add_sized(
+                    egui::vec2(140.0, 20.0),
+                    egui::Label::new(
+                        RichText::new(shortcut.keys())
+                            .monospace()
+                            .size(12.0)
+                            .color(TEXT_SECONDARY),
+                    ),
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Label,
+                        true,
+                        format!("{} shortcut: {}", shortcut.label(), shortcut.keys()),
+                    )
+                });
+                ui.ctx().accesskit_node_builder(response.id, |node| {
+                    node.set_label(format!(
+                        "{} shortcut: {}",
+                        shortcut.label(),
+                        shortcut.keys()
+                    ));
+                });
+            });
+        });
+        ui.separator();
+    }
+}
+
 fn action_label(action: &str) -> String {
     match action {
         "tab.new" => "New Tab".to_string(),
@@ -2068,6 +2113,53 @@ mod tests {
                 && node.label() == Some("Background")
                 && node.value() == Some("#0b0b0e")
         }));
+    }
+
+    #[test]
+    fn keybindings_settings_expose_read_only_builtin_shortcuts() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run_ui(test_raw_input(), builtin_shortcuts);
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        for shortcut in BuiltinShortcut::ALL {
+            let expected = format!("{} shortcut: {}", shortcut.label(), shortcut.keys());
+            assert!(update.nodes.iter().any(|(_, node)| {
+                node.role() == Role::Label && node.label() == Some(expected.as_str())
+            }));
+        }
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::Button
+                && BuiltinShortcut::ALL
+                    .iter()
+                    .any(|shortcut| node.label() == Some(shortcut.label()))
+        }));
+    }
+
+    #[test]
+    fn builtin_shortcuts_stay_within_a_narrow_settings_column() {
+        let ctx = Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(300.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut used_rect = egui::Rect::NOTHING;
+        let output = ctx.run_ui(input, |ui| {
+            used_rect = ui.scope(builtin_shortcuts).response.rect;
+        });
+
+        assert!(used_rect.right() <= 300.0);
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .map(|shape| red_stroke_count(&shape.shape))
+                .sum::<usize>(),
+            0
+        );
     }
 
     #[test]

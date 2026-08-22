@@ -9,6 +9,126 @@ use phantom_emu::Key;
 
 use crate::event::Mods;
 
+/// App-owned shortcuts that are intentionally fixed rather than stored in
+/// `AppConfig`. This is also the authority used to describe them in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltinShortcut {
+    FindInScrollback,
+    ToggleFullscreen,
+    ScrollPageUp,
+    ScrollPageDown,
+    SwitchTabs,
+    Copy,
+    Paste,
+}
+
+impl BuiltinShortcut {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::FindInScrollback,
+        Self::ToggleFullscreen,
+        Self::ScrollPageUp,
+        Self::ScrollPageDown,
+        Self::SwitchTabs,
+        Self::Copy,
+        Self::Paste,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::FindInScrollback => "Find in Scrollback",
+            Self::ToggleFullscreen => "Toggle Fullscreen",
+            Self::ScrollPageUp => "Scroll Page Up",
+            Self::ScrollPageDown => "Scroll Page Down",
+            Self::SwitchTabs => "Switch to Tabs 1–9",
+            Self::Copy => "Copy",
+            Self::Paste => "Paste",
+        }
+    }
+
+    pub(crate) fn keys(self) -> &'static str {
+        self.keys_for(cfg!(target_os = "macos"))
+    }
+
+    fn keys_for(self, mac: bool) -> &'static str {
+        match self {
+            Self::FindInScrollback => {
+                if mac {
+                    "Cmd+F"
+                } else {
+                    "Ctrl+F"
+                }
+            }
+            Self::ToggleFullscreen => "F11",
+            Self::ScrollPageUp => "Shift+PageUp",
+            Self::ScrollPageDown => "Shift+PageDown",
+            Self::SwitchTabs => {
+                if mac {
+                    "Cmd+1–9"
+                } else {
+                    "Ctrl+1–9"
+                }
+            }
+            Self::Copy => {
+                if mac {
+                    "Cmd+C"
+                } else {
+                    "Ctrl+Shift+C"
+                }
+            }
+            Self::Paste => {
+                if mac {
+                    "Cmd+V"
+                } else {
+                    "Ctrl+Shift+V"
+                }
+            }
+        }
+    }
+
+    pub(crate) fn matches(self, key: Key, mods: Mods) -> bool {
+        let primary = if cfg!(target_os = "macos") {
+            mods.sup
+        } else {
+            mods.ctrl
+        };
+        match self {
+            Self::FindInScrollback => {
+                matches!(key, Key::Char('f' | 'F'))
+                    && (mods.ctrl || mods.sup)
+                    && !mods.alt
+                    && !mods.shift
+            }
+            Self::ToggleFullscreen => key == Key::F(11),
+            Self::ScrollPageUp => mods.shift && key == Key::PageUp,
+            Self::ScrollPageDown => mods.shift && key == Key::PageDown,
+            Self::SwitchTabs => tab_switch_index(key, mods).is_some(),
+            Self::Copy | Self::Paste => {
+                if !primary || (!cfg!(target_os = "macos") && !mods.shift) {
+                    return false;
+                }
+                let expected = if self == Self::Copy { 'c' } else { 'v' };
+                matches!(key, Key::Char(c) if c.to_ascii_lowercase() == expected)
+            }
+        }
+    }
+}
+
+pub(crate) fn tab_switch_index(key: Key, mods: Mods) -> Option<u8> {
+    let primary = if cfg!(target_os = "macos") {
+        mods.sup
+    } else {
+        mods.ctrl
+    };
+    if !primary || mods.alt || mods.shift || (cfg!(target_os = "macos") && mods.ctrl) {
+        return None;
+    }
+    let Key::Char(c) = key else {
+        return None;
+    };
+    let digit = c.to_digit(10)?;
+    (1..=9).contains(&digit).then_some(digit as u8)
+}
+
 /// A bound action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -183,6 +303,9 @@ impl Keymap {
 
     /// Resolve a logical key press to an action, if bound.
     pub fn lookup(&self, key: Key, mods: Mods) -> Option<Action> {
+        if let Some(index) = tab_switch_index(key, mods) {
+            return Some(Action::SwitchTab(index));
+        }
         self.action_for(&combo_from_key(key, mods)?)
     }
 }
@@ -298,5 +421,39 @@ mod tests {
             None,
             "plain digit press must not switch tabs"
         );
+    }
+
+    #[test]
+    fn builtin_descriptions_match_platform_input() {
+        let primary = if cfg!(target_os = "macos") {
+            Mods {
+                sup: true,
+                ..Mods::default()
+            }
+        } else {
+            Mods {
+                ctrl: true,
+                ..Mods::default()
+            }
+        };
+        assert!(BuiltinShortcut::FindInScrollback.matches(Key::Char('f'), primary));
+        assert_eq!(tab_switch_index(Key::Char('9'), primary), Some(9));
+        assert!(BuiltinShortcut::ToggleFullscreen.matches(Key::F(11), Mods::default()));
+        assert!(BuiltinShortcut::ScrollPageUp.matches(
+            Key::PageUp,
+            Mods {
+                shift: true,
+                ..Mods::default()
+            }
+        ));
+
+        assert_eq!(BuiltinShortcut::FindInScrollback.keys_for(true), "Cmd+F");
+        assert_eq!(BuiltinShortcut::Copy.keys_for(true), "Cmd+C");
+        assert_eq!(BuiltinShortcut::Paste.keys_for(true), "Cmd+V");
+        assert_eq!(BuiltinShortcut::SwitchTabs.keys_for(true), "Cmd+1–9");
+        assert_eq!(BuiltinShortcut::FindInScrollback.keys_for(false), "Ctrl+F");
+        assert_eq!(BuiltinShortcut::Copy.keys_for(false), "Ctrl+Shift+C");
+        assert_eq!(BuiltinShortcut::Paste.keys_for(false), "Ctrl+Shift+V");
+        assert_eq!(BuiltinShortcut::SwitchTabs.keys_for(false), "Ctrl+1–9");
     }
 }
