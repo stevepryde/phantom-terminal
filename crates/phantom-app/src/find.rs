@@ -79,6 +79,7 @@ pub(crate) struct FindUiOutcome {
     pub query_or_options_changed: bool,
     pub navigation: Option<FindNavigation>,
     pub close_requested: bool,
+    pub surface_rect: Option<egui::Rect>,
 }
 
 #[derive(Debug, Default)]
@@ -208,7 +209,9 @@ impl FindState {
                     })
                     .inner
             });
-        frame.inner
+        let mut outcome = frame.inner;
+        outcome.surface_rect = Some(frame.response.rect);
+        outcome
     }
 
     fn draw_row(&mut self, ui: &mut Ui, query_width: f32) -> FindUiOutcome {

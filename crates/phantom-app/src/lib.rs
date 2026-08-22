@@ -3686,6 +3686,11 @@ impl App {
             .map(|tab| tab.frequent_commands.top())
             .unwrap_or(&[]);
         let global_notice = self.notice.as_ref().map(|notice| notice.text.as_str());
+        let ephemeral_indicator_hovered = self.ephemeral
+            && self.cursor_seen
+            && self.last_hits.as_ref().is_some_and(|hits| {
+                hits.ephemeral_indicator_contains(self.cursor_pos.0, self.cursor_pos.1)
+            });
         let ui_outcome = match (self.gpu.as_ref(), self.egui.as_mut()) {
             (Some(gpu), Some(egui)) => egui.run_with_context(
                 &gpu.window,
@@ -3699,6 +3704,7 @@ impl App {
                     terminal_left_points,
                     terminal_right_points,
                     global_notice,
+                    ephemeral_indicator_hovered,
                 },
             ),
             _ => Default::default(),

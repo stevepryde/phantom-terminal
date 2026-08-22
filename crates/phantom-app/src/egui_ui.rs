@@ -25,8 +25,8 @@ use crate::keybindings::{parse_combo, BuiltinShortcut, Combo, ComboKey};
 use crate::palette::{PaletteAction, PaletteGroup, PaletteRow, PaletteState};
 use crate::themes;
 use crate::ui_components::{
-    configure_phantom_style, with_alpha, CustomDropdown, APP_BACKGROUND, DIVIDER, ELEVATED_SURFACE,
-    FOCUS_ACCENT, SIDEBAR_SURFACE, TEXT_MUTED, TEXT_SECONDARY,
+    configure_phantom_style, with_alpha, CustomDropdown, APP_BACKGROUND, DANGER_TEXT, DIVIDER,
+    ELEVATED_SURFACE, FOCUS_ACCENT, SIDEBAR_SURFACE, TEXT_MUTED, TEXT_SECONDARY,
 };
 
 const PANEL_WIDTH_POINTS: f32 = 560.0;
@@ -131,6 +131,7 @@ pub(crate) struct UiFrameContext<'a> {
     pub terminal_left_points: f32,
     pub terminal_right_points: f32,
     pub global_notice: Option<&'a str>,
+    pub ephemeral_indicator_hovered: bool,
 }
 
 impl UiState {
@@ -362,6 +363,9 @@ impl UiState {
             outcome.find =
                 self.find
                     .draw(ui.ctx(), terminal_rect, find_right_boundary, context_alpha);
+            if let Some(rect) = outcome.find.surface_rect {
+                self.blur_regions.push(rect);
+            }
         }
         let toggle_combo = config
             .keybindings
@@ -378,6 +382,7 @@ impl UiState {
         if let Some(notice) = frame.global_notice {
             global_notice_overlay(ui.ctx(), notice);
         }
+        ephemeral_indicator_tooltip(ui.ctx(), frame.ephemeral_indicator_hovered);
         outcome
     }
 
@@ -419,7 +424,7 @@ impl UiState {
             ui.add_space(8.0);
         }
         if let Some(notice) = &self.notice {
-            ui.colored_label(Color32::from_rgb(125, 211, 252), notice);
+            ui.colored_label(DANGER_TEXT, notice);
             ui.add_space(8.0);
         }
 
@@ -1737,6 +1742,17 @@ fn command_palette_overlay(
                             action = palette.execute_filtered(row.filtered_index);
                         }
                     }
+                    if let Some(window) = palette.visible_window() {
+                        let hint = format!(
+                            "Showing {}–{} of {} · Use ↑/↓ to browse",
+                            window.first, window.last, window.total
+                        );
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(&hint).size(11.0).color(TEXT_MUTED));
+                        ui.ctx().accesskit_node_builder(response.id, |node| {
+                            node.set_description(hint.as_str());
+                        });
+                    }
                 });
             frame.response.rect
         });
@@ -1762,6 +1778,17 @@ fn command_palette_overlay(
         action,
         rect: Some(area.inner),
     }
+}
+
+fn ephemeral_indicator_tooltip(ctx: &Context, hovered: bool) {
+    if !hovered {
+        return;
+    }
+    let id = Id::new("phantom_ephemeral_indicator_tooltip");
+    let layer = LayerId::new(Order::Foreground, Id::new("phantom_native_chrome"));
+    egui::Tooltip::always_open(ctx.clone(), layer, id, egui::PopupAnchor::Pointer).show(|ui| {
+        ui.label("Temporary session — tabs will not be saved or restored");
+    });
 }
 
 fn palette_result_row(ui: &mut Ui, row: &PaletteRow) -> egui::Response {
@@ -1985,6 +2012,24 @@ mod tests {
         }
     }
 
+    fn text_uses_color(shape: &egui::Shape, expected: &str, color: Color32) -> bool {
+        match shape {
+            egui::Shape::Text(text) => {
+                text.galley.job.text == expected
+                    && text
+                        .galley
+                        .job
+                        .sections
+                        .iter()
+                        .any(|section| section.format.color == color)
+            }
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| text_uses_color(shape, expected, color)),
+            _ => false,
+        }
+    }
+
     fn run_settings_frame(
         ctx: &Context,
         state: &mut UiState,
@@ -2010,6 +2055,7 @@ mod tests {
                     terminal_left_points: 0.0,
                     terminal_right_points: 1280.0,
                     global_notice: None,
+                    ephemeral_indicator_hovered: false,
                 },
             );
         });
@@ -2048,6 +2094,7 @@ mod tests {
                     terminal_left_points: 0.0,
                     terminal_right_points: 1280.0,
                     global_notice: None,
+                    ephemeral_indicator_hovered: false,
                 },
             );
         });
@@ -2074,6 +2121,7 @@ mod tests {
                     terminal_left_points: 0.0,
                     terminal_right_points: 1280.0,
                     global_notice: None,
+                    ephemeral_indicator_hovered: false,
                 },
             );
         })
@@ -2197,6 +2245,44 @@ mod tests {
                 && node.label() == Some("New Tab")
                 && node.toggled() == Some(Toggled::True)
         }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == Role::TextInput
+                && node
+                    .description()
+                    .is_some_and(|description| description.starts_with("Showing 1–10 of "))
+        }));
+    }
+
+    #[test]
+    fn settings_validation_notice_uses_the_danger_text_token() {
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+        state.notice = Some("Invalid settings draft".to_string());
+
+        let output = ctx.run_ui(test_raw_input(), |ui| {
+            state.draw(
+                ui,
+                &mut config,
+                &mut palette,
+                UiFrameContext {
+                    snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    frequent_commands: &[],
+                    top_inset_points: 0.0,
+                    terminal_left_points: 0.0,
+                    terminal_right_points: 1280.0,
+                    global_notice: None,
+                    ephemeral_indicator_hovered: false,
+                },
+            );
+        });
+
+        assert!(output
+            .shapes
+            .iter()
+            .any(|shape| { text_uses_color(&shape.shape, "Invalid settings draft", DANGER_TEXT) }));
     }
 
     #[test]
@@ -2221,6 +2307,7 @@ mod tests {
                     terminal_left_points: 0.0,
                     terminal_right_points: 1280.0,
                     global_notice: None,
+                    ephemeral_indicator_hovered: false,
                 },
             );
         });
@@ -2399,6 +2486,7 @@ mod tests {
                     terminal_left_points: 0.0,
                     terminal_right_points: 1280.0,
                     global_notice: None,
+                    ephemeral_indicator_hovered: false,
                 },
             );
         });
@@ -2430,6 +2518,7 @@ mod tests {
                     terminal_left_points: 0.0,
                     terminal_right_points: 1280.0,
                     global_notice: None,
+                    ephemeral_indicator_hovered: false,
                 },
             );
         });
@@ -2525,6 +2614,50 @@ mod tests {
     #[test]
     fn global_notices_use_the_topmost_egui_layer() {
         assert_eq!(global_notice_order(), Order::Tooltip);
+    }
+
+    #[test]
+    fn translucent_find_surface_registers_for_backdrop_blur() {
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        config.context_actions.enabled = false;
+        let mut palette = PaletteState::default();
+        let mut state = UiState::new(&config);
+        state.open_find(false);
+
+        run_ui_frame(&ctx, &mut state, &mut config, &mut palette);
+
+        assert_eq!(state.blur_regions.len(), 1);
+        assert!(state.blur_regions[0].width() > 0.0);
+        assert!(state.blur_regions[0].height() > 0.0);
+    }
+
+    #[test]
+    fn ephemeral_indicator_hover_draws_an_explanation_without_a_widget_hit_target() {
+        let ctx = Context::default();
+        let mut input = test_raw_input();
+        input
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(20.0, 20.0)));
+
+        let _ = ctx.run_ui(input, |_ui| ephemeral_indicator_tooltip(&ctx, true));
+        let output = ctx.run_ui(test_raw_input(), |_ui| {
+            ephemeral_indicator_tooltip(&ctx, true)
+        });
+
+        assert!(output.shapes.iter().any(|shape| {
+            match &shape.shape {
+                egui::Shape::Text(text) => text
+                    .galley
+                    .job
+                    .text
+                    .contains("tabs will not be saved or restored"),
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| {
+                    matches!(shape, egui::Shape::Text(text) if text.galley.job.text.contains("tabs will not be saved or restored"))
+                }),
+                _ => false,
+            }
+        }));
     }
 
     #[test]

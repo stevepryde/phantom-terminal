@@ -625,6 +625,17 @@ fn window_control_index(control: WindowControl) -> usize {
 }
 
 impl TabBarHits {
+    pub fn ephemeral_indicator_contains(&self, px: f32, py: f32) -> bool {
+        let width = self.settings.w * (EPHEMERAL_W / SETTINGS_W);
+        Rect {
+            x: (self.settings.x - width).max(0.0),
+            y: self.settings.y,
+            w: width,
+            h: self.settings.h,
+        }
+        .contains(px, py)
+    }
+
     pub fn hover_target(&self, px: f32, py: f32) -> ChromeHoverTarget {
         for hit in &self.window_controls {
             if hit.rect.contains(px, py) {
@@ -2361,6 +2372,7 @@ mod tests {
         };
 
         assert_eq!(indicator.x + indicator.w, settings.x);
+        assert!(hits.ephemeral_indicator_contains(indicator.x + 1.0, indicator.y + 1.0));
         assert!(hits.titlebar_drag_region_contains(indicator.x + 1.0, indicator.y + 1.0));
     }
 

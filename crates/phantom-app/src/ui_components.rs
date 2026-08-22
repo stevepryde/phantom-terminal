@@ -19,6 +19,7 @@ pub const TEXT_PRIMARY: Color32 = Color32::from_rgba_unmultiplied_const(255, 255
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 140);
 pub const TEXT_MUTED: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 90);
 pub const FOCUS_ACCENT: Color32 = Color32::from_rgba_unmultiplied_const(56, 189, 248, 153);
+pub const DANGER_TEXT: Color32 = Color32::from_rgb(248, 113, 113);
 
 pub fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
