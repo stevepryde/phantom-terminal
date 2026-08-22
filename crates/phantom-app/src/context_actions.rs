@@ -4,27 +4,22 @@
 //! it inspects bounded local files, but never launches a project task, deploy
 //! operation, or discovery subprocess.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use noyalib::Value;
 use phantom_core::{
-    load_context_manifest_source, parse_context_manifest, read_bounded_regular_file,
-    trust_context_manifest, ContextActionsConfig, ContextRun, TrustedProject,
-    BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE, RECENT_DIRECTORIES_PLUGIN_ID,
+    load_context_manifest_source, load_spdeploy_graph, parse_context_manifest,
+    trust_context_manifest, verify_spdeploy_graph, ContextActionsConfig, ContextRun, SpdeployGraph,
+    TrustedProject, TrustedSpdeployProject, TrustedSpdeploySource, BUILT_IN_CONTEXT_PLUGIN_IDS,
+    CONTEXT_MANIFEST_FILE, RECENT_DIRECTORIES_PLUGIN_ID,
 };
 
 pub const MANIFEST_PROVIDER_ID: &str = "phantom-manifest";
 pub const SPDEPLOY_PROVIDER_ID: &str = "spdeploy";
 
-const DEPLOY_FILE: &str = "deploy.yml";
-const MAX_CONFIG_SOURCE_BYTES: usize = 1024 * 1024;
-const MAX_CONFIGS: usize = 32;
-const MAX_DEPTH: usize = 8;
-const MAX_OPERATIONS: usize = 256;
-const MAX_NAME_BYTES: usize = 256;
-const MAX_DESCRIPTION_BYTES: usize = 1024;
-const MAX_PATH_BYTES: usize = 4096;
+#[cfg(test)]
+const DEPLOY_FILE: &str = phantom_core::SPDEPLOY_CONFIG_FILE;
+#[cfg(test)]
+const MAX_CONFIG_SOURCE_BYTES: usize = phantom_core::MAX_SPDEPLOY_SOURCE_BYTES;
 const MAX_ERROR_BYTES: usize = 512;
 
 /// A complete discovery result for one active-tab working directory.
@@ -118,18 +113,20 @@ pub struct ManifestTask {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpdeploySection {
+    pub root: PathBuf,
     pub config_path: PathBuf,
     pub project_name: String,
+    pub trust: SpdeployTrustState,
     pub operations: Vec<SpdeployOperation>,
-    /// Exact bounded bytes of every config used to construct `operations`.
-    /// Dispatch re-reads and compares all of them before launching spdeploy.
-    pub config_sources: Vec<ConfigSourceStamp>,
+    /// Sorted root-relative full transitive config graph and exact bounded
+    /// source used to derive operations and compare persisted trust.
+    pub config_sources: Vec<TrustedSpdeploySource>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigSourceStamp {
-    pub path: PathBuf,
-    pub source: Vec<u8>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpdeployTrustState {
+    NeedsTrust,
+    Trusted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +138,7 @@ pub struct SpdeployOperation {
     pub description: Option<String>,
     /// Exact config declaring this leaf operation.
     pub config_path: PathBuf,
+    pub config_relative_path: String,
 }
 
 /// User intent returned by egui. `App` must revalidate manifest trust or use
@@ -168,6 +166,10 @@ pub enum ContextRequest {
         config_path: PathBuf,
         operation: String,
     },
+    TrustSpdeploy {
+        root: PathBuf,
+        sources: Vec<TrustedSpdeploySource>,
+    },
     OpenDirectory {
         path: PathBuf,
     },
@@ -180,6 +182,7 @@ pub fn discover_context(
     cwd: &Path,
     config: &ContextActionsConfig,
     trusted_projects: &[TrustedProject],
+    trusted_spdeploy_projects: &[TrustedSpdeployProject],
 ) -> ContextSnapshot {
     let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut snapshot = ContextSnapshot::empty(canonical_cwd.clone());
@@ -200,7 +203,9 @@ pub fn discover_context(
         }
         let section = match provider {
             MANIFEST_PROVIDER_ID => discover_manifest(&canonical_cwd, trusted_projects),
-            SPDEPLOY_PROVIDER_ID => discover_spdeploy(&canonical_cwd),
+            SPDEPLOY_PROVIDER_ID => {
+                discover_spdeploy_with_trust(&canonical_cwd, trusted_spdeploy_projects)
+            }
             RECENT_DIRECTORIES_PLUGIN_ID => discover_recent_directories(config),
             _ => None,
         };
@@ -315,335 +320,74 @@ fn manifest_error(message: String, source: Option<(PathBuf, String)>) -> Context
     }
 }
 
+#[cfg(test)]
 pub fn discover_spdeploy(cwd: &Path) -> Option<ContextSection> {
-    let candidate = cwd.join(DEPLOY_FILE);
-    match candidate.symlink_metadata() {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            return Some(spdeploy_error(format!(
-                "Could not inspect deploy.yml: {error}"
-            )))
-        }
-    }
-
-    let root = match cwd.canonicalize() {
-        Ok(root) => root,
-        Err(error) => {
-            return Some(spdeploy_error(format!(
-                "Could not resolve working directory: {error}"
-            )))
-        }
-    };
-    let config_path = root.join(DEPLOY_FILE);
-
-    match discover_spdeploy_tree(&root, &config_path) {
-        Ok((project_name, operations, config_sources)) => Some(ContextSection {
-            id: SPDEPLOY_PROVIDER_ID.to_string(),
-            title: "spdeploy".to_string(),
-            content: ContextSectionContent::Spdeploy(SpdeploySection {
-                config_path,
-                project_name,
-                operations,
-                config_sources,
-            }),
-        }),
-        Err(error) => Some(spdeploy_error(error)),
-    }
+    discover_spdeploy_with_trust(cwd, &[])
 }
 
-fn discover_spdeploy_tree(
-    root: &Path,
-    config_path: &Path,
-) -> Result<(String, Vec<SpdeployOperation>, Vec<ConfigSourceStamp>), String> {
-    let mut operations = Vec::new();
-    let mut config_sources = Vec::new();
-    let mut active_configs = HashSet::new();
-    let mut config_count = 0;
-    let project_name = collect_spdeploy_config(
-        root,
-        config_path,
-        0,
-        &[],
-        &mut active_configs,
-        &mut config_count,
-        &mut operations,
-        &mut config_sources,
-    )?;
-    validate_spdeploy_config_sources(&config_sources)?;
-    Ok((project_name, operations, config_sources))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_spdeploy_config(
-    root: &Path,
-    config_path: &Path,
-    depth: usize,
-    breadcrumbs: &[String],
-    active_configs: &mut HashSet<PathBuf>,
-    config_count: &mut usize,
-    operations: &mut Vec<SpdeployOperation>,
-    config_sources: &mut Vec<ConfigSourceStamp>,
-) -> Result<String, String> {
-    if depth > MAX_DEPTH {
-        return Err(format!("spdeploy submenu depth exceeds {MAX_DEPTH}"));
-    }
-    *config_count += 1;
-    if *config_count > MAX_CONFIGS {
-        return Err(format!("spdeploy config count exceeds {MAX_CONFIGS}"));
-    }
-    if !active_configs.insert(config_path.to_path_buf()) {
-        return Err("spdeploy submenu cycle detected".to_string());
-    }
-
-    let result = (|| {
-        stamp_config_source(config_path, config_sources)?;
-        let source = config_sources
-            .iter()
-            .find(|stamp| stamp.path == config_path)
-            .map(|stamp| stamp.source.as_slice())
-            .ok_or_else(|| "spdeploy config source stamp is missing".to_string())?;
-        let value: Value = noyalib::from_slice(source)
-            .map_err(|error| format!("Could not parse {}: {error}", config_path.display()))?;
-        let object = value
-            .as_mapping()
-            .ok_or_else(|| "spdeploy config must be a YAML mapping".to_string())?;
-        let project_name =
-            required_bounded_string(object.get("name"), "project name", MAX_NAME_BYTES)?;
-        let listed = object
-            .get("operation")
-            .and_then(Value::as_mapping)
-            .ok_or_else(|| "spdeploy config has no operation mapping".to_string())?;
-
-        for (name, operation) in listed {
-            validate_tool_text(name, "operation name", MAX_NAME_BYTES)?;
-            let operation = operation
-                .as_mapping()
-                .ok_or_else(|| "spdeploy operation must be an object".to_string())?;
-            let description = optional_bounded_string(
-                operation.get("description"),
-                "operation description",
-                MAX_DESCRIPTION_BYTES,
-            )?;
-            let stages = operation
-                .get("stage")
-                .and_then(Value::as_sequence)
-                .ok_or_else(|| format!("spdeploy operation '{name}' has no stages array"))?;
-
-            if let Some(child) = submenu_path(stages)? {
-                let child_path = resolve_child_config(root, config_path, &child)?;
-                let mut child_breadcrumbs = breadcrumbs.to_vec();
-                child_breadcrumbs.push(name.clone());
-                collect_spdeploy_config(
-                    root,
-                    &child_path,
-                    depth + 1,
-                    &child_breadcrumbs,
-                    active_configs,
-                    config_count,
+pub fn discover_spdeploy_with_trust(
+    cwd: &Path,
+    trusted_projects: &[TrustedSpdeployProject],
+) -> Option<ContextSection> {
+    match load_spdeploy_graph(cwd) {
+        Ok(None) => None,
+        Ok(Some(graph)) => {
+            let trusted = trusted_projects
+                .iter()
+                .any(|project| project.matches_graph(&graph));
+            let config_path = graph.root.join(phantom_core::SPDEPLOY_CONFIG_FILE);
+            let operations = graph
+                .operations
+                .iter()
+                .map(|operation| SpdeployOperation {
+                    name: operation.name.clone(),
+                    breadcrumbs: operation.breadcrumbs.clone(),
+                    description: operation.description.clone(),
+                    config_path: graph.root.join(&operation.config_relative_path),
+                    config_relative_path: operation.config_relative_path.clone(),
+                })
+                .collect();
+            Some(ContextSection {
+                id: SPDEPLOY_PROVIDER_ID.to_string(),
+                title: "spdeploy".to_string(),
+                content: ContextSectionContent::Spdeploy(SpdeploySection {
+                    root: graph.root,
+                    config_path,
+                    project_name: graph.project_name,
+                    trust: if trusted {
+                        SpdeployTrustState::Trusted
+                    } else {
+                        SpdeployTrustState::NeedsTrust
+                    },
                     operations,
-                    config_sources,
-                )?;
-                continue;
-            }
-
-            if operations.len() >= MAX_OPERATIONS {
-                return Err(format!("spdeploy operation count exceeds {MAX_OPERATIONS}"));
-            }
-            operations.push(SpdeployOperation {
-                name: name.clone(),
-                breadcrumbs: breadcrumbs.to_vec(),
-                description,
-                config_path: config_path.to_path_buf(),
-            });
+                    config_sources: graph.sources,
+                }),
+            })
         }
-        Ok(project_name)
-    })();
-
-    active_configs.remove(config_path);
-    result
+        Err(error) => Some(spdeploy_error(error.to_string())),
+    }
 }
 
-fn submenu_path(stages: &[Value]) -> Result<Option<String>, String> {
-    if stages.len() != 1 {
-        return Ok(None);
-    }
-    let Some(stage) = stages[0].as_mapping() else {
-        return Err("spdeploy stage must be an object".to_string());
-    };
-    if stage.get("type").and_then(Value::as_str) != Some("deploy")
-        || stage.get("operation").is_some_and(|value| !value.is_null())
-    {
-        return Ok(None);
-    }
-    let path = required_bounded_string(stage.get("path"), "submenu path", MAX_PATH_BYTES)?;
-    Ok(Some(path))
-}
-
-fn resolve_child_config(root: &Path, parent: &Path, child: &str) -> Result<PathBuf, String> {
-    if child.contains('\0') {
-        return Err("spdeploy submenu path contains a NUL byte".to_string());
-    }
-    let child = Path::new(child);
-    let candidate = if child.is_absolute() {
-        child.to_path_buf()
-    } else {
-        parent.parent().unwrap_or(root).join(child)
-    };
-    let candidate = normalize_path(&candidate)?;
-    if !candidate.starts_with(root) {
-        return Err(format!(
-            "spdeploy submenu '{}' resolves outside the active directory",
-            child.display()
-        ));
-    }
-    Ok(candidate)
-}
-
-fn normalize_path(path: &Path) -> Result<PathBuf, String> {
-    use std::path::Component;
-
-    if !path.is_absolute() {
-        return Err("spdeploy config path must be absolute".to_string());
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err("spdeploy config path escapes its filesystem root".to_string());
-                }
-            }
-            Component::Normal(name) => normalized.push(name),
-        }
-    }
-    Ok(normalized)
-}
-
-fn stamp_config_source(
-    config_path: &Path,
-    sources: &mut Vec<ConfigSourceStamp>,
-) -> Result<(), String> {
-    if sources.iter().any(|stamp| stamp.path == config_path) {
-        return verify_config_source(config_path, sources);
-    }
-    let used = sources.iter().try_fold(0usize, |total, stamp| {
-        total
-            .checked_add(stamp.source.len())
-            .ok_or_else(|| "spdeploy config sources are too large".to_string())
-    })?;
-    let remaining = MAX_CONFIG_SOURCE_BYTES
-        .checked_sub(used)
-        .ok_or_else(|| "spdeploy config sources are too large".to_string())?;
-    let source = read_file_bounded(config_path, remaining)?;
-    sources.push(ConfigSourceStamp {
-        path: config_path.to_path_buf(),
-        source,
-    });
-    Ok(())
-}
-
-/// Re-read every bounded config source used by discovery. App calls this at
-/// dispatch so a changed root or nested config cannot reuse stale operations.
 pub fn verify_spdeploy_sources(section: &SpdeploySection) -> Result<(), String> {
-    let stamped = |path: &Path| {
-        section
-            .config_sources
-            .iter()
-            .any(|stamp| stamp.path == path)
-    };
-    if !stamped(&section.config_path)
-        || section
+    verify_spdeploy_graph(&section_graph(section)).map_err(|error| error.to_string())
+}
+
+pub fn section_graph(section: &SpdeploySection) -> SpdeployGraph {
+    SpdeployGraph {
+        root: section.root.clone(),
+        project_name: section.project_name.clone(),
+        operations: section
             .operations
             .iter()
-            .any(|operation| !stamped(&operation.config_path))
-    {
-        return Err("spdeploy config source stamps are incomplete".to_string());
+            .map(|operation| phantom_core::SpdeployOperation {
+                name: operation.name.clone(),
+                breadcrumbs: operation.breadcrumbs.clone(),
+                description: operation.description.clone(),
+                config_relative_path: operation.config_relative_path.clone(),
+            })
+            .collect(),
+        sources: section.config_sources.clone(),
     }
-    validate_spdeploy_config_sources(&section.config_sources)
-}
-
-fn validate_spdeploy_config_sources(sources: &[ConfigSourceStamp]) -> Result<(), String> {
-    if sources.is_empty() || sources.len() > MAX_CONFIGS {
-        return Err("spdeploy config source stamps are incomplete".to_string());
-    }
-    let total = sources.iter().try_fold(0usize, |total, stamp| {
-        total
-            .checked_add(stamp.source.len())
-            .ok_or_else(|| "spdeploy config sources are too large".to_string())
-    })?;
-    if total > MAX_CONFIG_SOURCE_BYTES {
-        return Err(format!(
-            "spdeploy config sources exceed {MAX_CONFIG_SOURCE_BYTES} bytes"
-        ));
-    }
-    let mut paths = HashSet::new();
-    for stamp in sources {
-        if !paths.insert(&stamp.path) {
-            return Err("spdeploy config source stamps contain duplicate paths".to_string());
-        }
-        verify_config_source(&stamp.path, sources)?;
-    }
-    Ok(())
-}
-
-fn verify_config_source(config_path: &Path, sources: &[ConfigSourceStamp]) -> Result<(), String> {
-    let stamp = sources
-        .iter()
-        .find(|stamp| stamp.path == config_path)
-        .ok_or_else(|| "spdeploy config source stamp is missing".to_string())?;
-    let current = read_file_bounded(config_path, stamp.source.len())?;
-    if current != stamp.source {
-        return Err(format!(
-            "{} changed since spdeploy discovery; refresh and try again",
-            config_path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
-    read_bounded_regular_file(path, max_bytes)
-        .map_err(|error| format!("Could not securely read {}: {error}", path.display()))
-}
-
-fn required_bounded_string(
-    value: Option<&Value>,
-    field: &str,
-    max: usize,
-) -> Result<String, String> {
-    let value = value
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("spdeploy {field} must be a string"))?;
-    validate_tool_text(value, field, max)?;
-    Ok(value.to_string())
-}
-
-fn optional_bounded_string(
-    value: Option<&Value>,
-    field: &str,
-    max: usize,
-) -> Result<Option<String>, String> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => required_bounded_string(Some(value), field, max).map(Some),
-    }
-}
-
-fn validate_tool_text(value: &str, field: &str, max: usize) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("spdeploy {field} cannot be empty"));
-    }
-    if value.len() > max {
-        return Err(format!("spdeploy {field} exceeds {max} bytes"));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(format!("spdeploy {field} contains control characters"));
-    }
-    Ok(())
 }
 
 fn spdeploy_error(message: String) -> ContextSection {
@@ -719,7 +463,7 @@ mod tests {
             .record_directory_visit(Path::new("/projects/recent"), 20)
             .unwrap();
 
-        let snapshot = discover_context(temp.path(), &config, &[]);
+        let snapshot = discover_context(temp.path(), &config, &[], &[]);
         let section = snapshot
             .sections
             .iter()
@@ -801,7 +545,7 @@ tabs:
             .record_directory_visit(Path::new("/projects/alpha"), 1)
             .unwrap();
 
-        let snapshot = discover_context(temp.path(), &config, &[]);
+        let snapshot = discover_context(temp.path(), &config, &[], &[]);
         let ids: Vec<_> = snapshot
             .sections
             .iter()
@@ -841,7 +585,7 @@ tabs:
             ..ContextActionsConfig::default()
         };
 
-        let snapshot = discover_context(temp.path(), &config, &[]);
+        let snapshot = discover_context(temp.path(), &config, &[], &[]);
         assert!(snapshot.sections.is_empty());
     }
 
@@ -852,7 +596,7 @@ tabs:
         let mut config = ContextActionsConfig::default();
         config.plugin_mut(SPDEPLOY_PROVIDER_ID).unwrap().enabled = false;
 
-        let snapshot = discover_context(temp.path(), &config, &[]);
+        let snapshot = discover_context(temp.path(), &config, &[], &[]);
         assert!(snapshot.sections.is_empty());
     }
 
@@ -881,7 +625,7 @@ operation:
         assert_eq!(section.project_name, "Soulfire");
         assert_eq!(section.operations.len(), 1);
         assert_eq!(section.config_sources.len(), 1);
-        assert_eq!(section.config_sources[0].source, source.as_bytes());
+        assert_eq!(section.config_sources[0].source, source);
         assert_eq!(section.operations[0].name, "deploy");
         assert!(section.operations[0].breadcrumbs.is_empty());
         assert_eq!(
@@ -923,7 +667,7 @@ operation:
         let ContextSectionContent::Error { message } = section.content else {
             panic!("expected error section");
         };
-        assert!(message.contains("Could not parse"));
+        assert!(message.contains("could not parse"));
     }
 
     #[cfg(unix)]
@@ -945,7 +689,7 @@ operation:
         let ContextSectionContent::Error { message } = section.content else {
             panic!("expected error section");
         };
-        assert!(message.contains("securely read"), "{message}");
+        assert!(message.contains("could not read"), "{message}");
     }
 
     #[test]
@@ -981,7 +725,37 @@ operation:
 
         fs::write(config_path, "name: changed\noperation: {}\n").unwrap();
         let error = verify_spdeploy_sources(&section).unwrap_err();
-        assert!(error.contains("changed since spdeploy discovery"));
+        assert!(error.contains("configuration changed"));
+    }
+
+    #[test]
+    fn exact_graph_trust_is_recognized_and_source_change_invalidates_it() {
+        let temp = TestDir::new();
+        let config_path = temp.path().join(DEPLOY_FILE);
+        fs::write(
+            &config_path,
+            "name: Project\noperation:\n  deploy:\n    stage: []\n",
+        )
+        .unwrap();
+        let graph = load_spdeploy_graph(temp.path()).unwrap().unwrap();
+        let trusted = phantom_core::trust_spdeploy_graph(&graph).unwrap();
+        let section =
+            discover_spdeploy_with_trust(temp.path(), std::slice::from_ref(&trusted)).unwrap();
+        let ContextSectionContent::Spdeploy(section) = section.content else {
+            panic!("expected spdeploy section");
+        };
+        assert_eq!(section.trust, SpdeployTrustState::Trusted);
+
+        fs::write(
+            &config_path,
+            "name: Project\noperation:\n  release:\n    stage: []\n",
+        )
+        .unwrap();
+        let changed = discover_spdeploy_with_trust(temp.path(), &[trusted]).unwrap();
+        let ContextSectionContent::Spdeploy(changed) = changed.content else {
+            panic!("expected spdeploy section");
+        };
+        assert_eq!(changed.trust, SpdeployTrustState::NeedsTrust);
     }
 
     #[cfg(unix)]
@@ -1004,7 +778,7 @@ operation:
 
         let error = verify_spdeploy_sources(&section).unwrap_err();
 
-        assert!(error.contains("securely read"), "{error}");
+        assert!(error.contains("could not read"), "{error}");
     }
 
     #[test]
@@ -1013,6 +787,11 @@ operation:
         fs::write(
             temp.path().join(DEPLOY_FILE),
             "name: Root\noperation:\n  deploy-child:\n    stage:\n      - type: deploy\n        path: child.yml\n        operation: release\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("child.yml"),
+            "name: Child\noperation:\n  release:\n    stage: []\n",
         )
         .unwrap();
 
@@ -1045,6 +824,6 @@ operation:
         let ContextSectionContent::Error { message } = section.content else {
             panic!("expected error section");
         };
-        assert!(message.contains("outside the active directory"));
+        assert!(message.contains("outside the project root"));
     }
 }

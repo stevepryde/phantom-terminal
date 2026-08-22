@@ -19,6 +19,7 @@ pub mod launch;
 pub mod pty;
 pub mod session;
 pub mod spawn;
+pub mod spdeploy;
 
 /// Maximum number of terminal tabs that may be live or persisted at once.
 pub const MAX_TABS: usize = 128;
@@ -45,3 +46,8 @@ pub use session::{
     MAX_TAB_PROFILE_ID_LEN, MAX_TAB_TITLE_LEN,
 };
 pub use spawn::{default_home_dir, resolve_launch_opts};
+pub use spdeploy::{
+    load_spdeploy_graph, trust_spdeploy_graph, verify_spdeploy_graph, SpdeployGraph,
+    SpdeployOperation, TrustedSpdeployProject, TrustedSpdeploySource, MAX_SPDEPLOY_CONFIGS,
+    MAX_SPDEPLOY_SOURCE_BYTES, SPDEPLOY_CONFIG_FILE,
+};

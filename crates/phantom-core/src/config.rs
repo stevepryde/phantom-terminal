@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{ContextActionsConfig, TrustedProject, MAX_TRUSTED_PROJECTS};
 use crate::error::{AppError, AppResult};
+use crate::spdeploy::TrustedSpdeployProject;
 
 const MIN_FONT_SIZE: u16 = 8;
 const MAX_FONT_SIZE: u16 = 48;
@@ -259,6 +260,9 @@ pub struct AppConfig {
     /// Project manifests explicitly trusted by their canonical root and exact
     /// source. A source edit invalidates trust until it is reviewed again.
     pub trusted_projects: Vec<TrustedProject>,
+    /// spdeploy config graphs explicitly trusted by canonical root and exact
+    /// bounded source. Any source-graph change makes operations inert again.
+    pub trusted_spdeploy_projects: Vec<TrustedSpdeployProject>,
 }
 
 impl Default for AppConfig {
@@ -290,6 +294,7 @@ impl Default for AppConfig {
             scrollback_lines: 10_000,
             context_actions: ContextActionsConfig::default(),
             trusted_projects: Vec::new(),
+            trusted_spdeploy_projects: Vec::new(),
         }
     }
 }
@@ -375,6 +380,7 @@ impl AppConfig {
         validate_keybindings(&self.keybindings)?;
         self.context_actions.validate()?;
         validate_trusted_projects(&self.trusted_projects)?;
+        validate_trusted_spdeploy_projects(&self.trusted_spdeploy_projects)?;
         validate_serialized_size(self)?;
         Ok(())
     }
@@ -447,6 +453,25 @@ fn validate_trusted_projects(projects: &[TrustedProject]) -> AppResult<()> {
         if !roots.insert(project.root.as_str()) {
             return Err(AppError::InvalidConfig(format!(
                 "duplicate trusted project root '{}'",
+                project.root
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_trusted_spdeploy_projects(projects: &[TrustedSpdeployProject]) -> AppResult<()> {
+    if projects.len() > MAX_TRUSTED_PROJECTS {
+        return Err(AppError::InvalidConfig(format!(
+            "no more than {MAX_TRUSTED_PROJECTS} trusted spdeploy projects are allowed"
+        )));
+    }
+    let mut roots = HashSet::new();
+    for project in projects {
+        project.validate()?;
+        if !roots.insert(project.root.as_str()) {
+            return Err(AppError::InvalidConfig(format!(
+                "duplicate trusted spdeploy project root '{}'",
                 project.root
             )));
         }
@@ -754,6 +779,36 @@ mod tests {
             .collect();
 
         assert_eq!(orders, [0, 50, 100, 200]);
+    }
+
+    #[test]
+    fn trusted_spdeploy_graph_is_validated_and_defaults_for_old_configs() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("trusted_spdeploy_projects");
+        let old: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(old.trusted_spdeploy_projects.is_empty());
+
+        let mut config = AppConfig::default();
+        config
+            .trusted_spdeploy_projects
+            .push(TrustedSpdeployProject {
+                root: "/project".to_string(),
+                sources: vec![crate::TrustedSpdeploySource {
+                    relative_path: "deploy.yml".to_string(),
+                    source: "name: Project\noperation:\n  deploy:\n    stage: []\n".to_string(),
+                }],
+            });
+        config.validate().unwrap();
+        config.trusted_spdeploy_projects[0]
+            .sources
+            .push(crate::TrustedSpdeploySource {
+                relative_path: "unused.yml".to_string(),
+                source: "name: Unused\noperation: {}\n".to_string(),
+            });
+        assert!(config.validate().is_err());
     }
 
     #[test]
