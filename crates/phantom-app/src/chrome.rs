@@ -28,6 +28,10 @@ const SCROLLBAR_HOVER_W: f32 = 10.0;
 const SCROLLBAR_HIT_W: f32 = 14.0;
 const SCROLLBAR_INSET: f32 = 4.0;
 const SCROLLBAR_MIN_THUMB_H: f32 = 24.0;
+#[cfg(any(test, target_os = "linux"))]
+const WINDOW_RESIZE_EDGE_W: f32 = 5.0;
+#[cfg(any(test, target_os = "linux"))]
+const WINDOW_RESIZE_CORNER_LEN: f32 = 12.0;
 const HOVER_FADE_SECONDS: f32 = 0.14;
 const HOVER_EPSILON: f32 = 0.01;
 
@@ -107,6 +111,77 @@ pub struct Layout {
 pub enum WindowChrome {
     System,
     Custom,
+}
+
+/// Edge or corner owned by an invisible custom-chrome resize handle.
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowResizeHandle {
+    East,
+    North,
+    NorthEast,
+    NorthWest,
+    South,
+    SouthEast,
+    SouthWest,
+    West,
+}
+
+/// Return the thin, DPI-scaled custom-chrome resize handle under a physical
+/// window pixel. `excluded` regions retain priority over window resizing.
+#[cfg(any(test, target_os = "linux"))]
+pub fn window_resize_handle_at(
+    width: f32,
+    height: f32,
+    scale_factor: f32,
+    window_chrome: WindowChrome,
+    excluded: Option<Rect>,
+    px: f32,
+    py: f32,
+) -> Option<WindowResizeHandle> {
+    if !window_chrome.is_custom()
+        || width <= 0.0
+        || height <= 0.0
+        || px < 0.0
+        || py < 0.0
+        || px >= width
+        || py >= height
+        || excluded.is_some_and(|rect| rect.contains(px, py))
+    {
+        return None;
+    }
+
+    let scale_factor = scale_factor.max(1.0);
+    let edge = WINDOW_RESIZE_EDGE_W * scale_factor;
+    let corner = WINDOW_RESIZE_CORNER_LEN * scale_factor;
+    let left = px < edge;
+    let right = px >= width - edge;
+    let top = py < edge;
+    let bottom = py >= height - edge;
+    let near_left_corner = px < corner;
+    let near_right_corner = px >= width - corner;
+    let near_top_corner = py < corner;
+    let near_bottom_corner = py >= height - corner;
+
+    match () {
+        _ if (left && near_top_corner) || (top && near_left_corner) => {
+            Some(WindowResizeHandle::NorthWest)
+        }
+        _ if (right && near_top_corner) || (top && near_right_corner) => {
+            Some(WindowResizeHandle::NorthEast)
+        }
+        _ if (left && near_bottom_corner) || (bottom && near_left_corner) => {
+            Some(WindowResizeHandle::SouthWest)
+        }
+        _ if (right && near_bottom_corner) || (bottom && near_right_corner) => {
+            Some(WindowResizeHandle::SouthEast)
+        }
+        _ if top => Some(WindowResizeHandle::North),
+        _ if bottom => Some(WindowResizeHandle::South),
+        _ if left => Some(WindowResizeHandle::West),
+        _ if right => Some(WindowResizeHandle::East),
+        _ => None,
+    }
 }
 
 impl WindowChrome {
@@ -1726,6 +1801,89 @@ mod tests {
 
         assert!(l.bar.w < VERTICAL_BAR_W);
         assert_eq!(l.viewport.w, MIN_VERTICAL_VIEWPORT_W);
+    }
+
+    #[test]
+    fn custom_window_resize_handles_cover_edges_and_corners() {
+        use WindowResizeHandle::*;
+
+        let hit =
+            |x, y| window_resize_handle_at(800.0, 600.0, 1.0, WindowChrome::Custom, None, x, y);
+        assert_eq!(hit(400.0, 2.0), Some(North));
+        assert_eq!(hit(797.0, 300.0), Some(East));
+        assert_eq!(hit(400.0, 597.0), Some(South));
+        assert_eq!(hit(2.0, 300.0), Some(West));
+        assert_eq!(hit(2.0, 8.0), Some(NorthWest));
+        assert_eq!(hit(792.0, 2.0), Some(NorthEast));
+        assert_eq!(hit(2.0, 592.0), Some(SouthWest));
+        assert_eq!(hit(797.0, 592.0), Some(SouthEast));
+        assert_eq!(hit(400.0, 300.0), None);
+    }
+
+    #[test]
+    fn window_resize_handles_are_custom_only_and_dpi_scaled() {
+        assert_eq!(
+            window_resize_handle_at(800.0, 600.0, 1.0, WindowChrome::System, None, 2.0, 300.0,),
+            None
+        );
+        assert_eq!(
+            window_resize_handle_at(
+                1600.0,
+                1200.0,
+                2.0,
+                WindowChrome::Custom,
+                None,
+                1591.0,
+                600.0,
+            ),
+            Some(WindowResizeHandle::East)
+        );
+        assert_eq!(
+            window_resize_handle_at(
+                1600.0,
+                1200.0,
+                2.0,
+                WindowChrome::Custom,
+                None,
+                1589.0,
+                600.0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_scrollbar_corridor_keeps_priority_over_right_resize_handle() {
+        let layout = compute_layout(800.0, 600.0, 20.0, true, WindowChrome::Custom);
+        let scrollbar = terminal_scrollbar_hit_track(&layout);
+        let scrollbar_x = scrollbar.x + scrollbar.w - 1.0;
+        let scrollbar_y = scrollbar.y + scrollbar.h / 2.0;
+
+        assert!(scrollbar.contains(scrollbar_x, scrollbar_y));
+        assert_eq!(
+            window_resize_handle_at(
+                800.0,
+                600.0,
+                1.0,
+                WindowChrome::Custom,
+                Some(scrollbar),
+                scrollbar_x,
+                scrollbar_y,
+            ),
+            None
+        );
+        assert_eq!(
+            window_resize_handle_at(
+                800.0,
+                600.0,
+                1.0,
+                WindowChrome::Custom,
+                Some(scrollbar),
+                797.0,
+                scrollbar_y,
+            ),
+            Some(WindowResizeHandle::East)
+        );
     }
 
     #[test]
