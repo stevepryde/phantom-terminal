@@ -243,6 +243,17 @@ printf '%s\n' \
 cargo generate-lockfile --offline --manifest-path "$libc_module_alias/Cargo.toml"
 expect_failure "$libc_module_alias" 'direct socket API:'
 
+echo "==> grouped and qualified libc module aliases fail"
+qualified_libc_alias="$scratch/qualified-libc-alias"
+new_fixture "$qualified_libc_alias"
+printf '%s\n' \
+  'use {libc as c};' \
+  'use self::libc as native;' \
+  'pub fn aliases() { let _ = (c::socket, native::connect); }' \
+  >"$qualified_libc_alias/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$qualified_libc_alias/Cargo.toml"
+expect_failure "$qualified_libc_alias" 'direct socket API:'
+
 echo "==> libc glob imports and local re-exports fail"
 libc_glob="$scratch/libc-glob"
 new_fixture "$libc_glob"
