@@ -78,7 +78,10 @@ pub struct AlacrittyCore {
     parser: ansi::Processor,
     responses: Rc<RefCell<Vec<u8>>>,
     size: TermDimensions,
+    terminal_options: (u32, CursorShape),
     active_search_match: Option<SearchRange>,
+    snapshot_generation: u64,
+    snapshot_cache: RefCell<Option<(u64, Rc<Snapshot>)>>,
 }
 
 impl AlacrittyCore {
@@ -96,7 +99,10 @@ impl AlacrittyCore {
             parser: ansi::Processor::new(),
             responses,
             size,
+            terminal_options: (scrollback_lines, default_cursor),
             active_search_match: None,
+            snapshot_generation: 0,
+            snapshot_cache: RefCell::new(None),
         }
     }
 
@@ -104,11 +110,17 @@ impl AlacrittyCore {
     /// cursor shape (used until an application overrides it via DECSCUSR) and
     /// the scrollback depth (`Term::set_options` resizes history in place).
     pub fn set_terminal_options(&mut self, scrollback_lines: u32, default_cursor: CursorShape) {
+        let options = (scrollback_lines, default_cursor);
+        if self.terminal_options == options {
+            return;
+        }
         // Shrinking history rotates absolute grid coordinates; the app will
         // recompute live search results against the new layout.
         self.active_search_match = None;
         self.term
             .set_options(term_config(scrollback_lines, default_cursor));
+        self.terminal_options = options;
+        self.invalidate_snapshot();
     }
 }
 
@@ -128,87 +140,43 @@ fn term_config(scrollback_lines: u32, default_cursor: CursorShape) -> Config {
 
 impl VtCore for AlacrittyCore {
     fn advance(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         // Keep the last active range painted while the app coalesces streamed
         // output into its debounced search refresh. The refresh replaces this
         // potentially rotated range shortly; clearing it here makes the active
         // highlight blink off between every pair of PTY chunks.
         self.parser.advance(&mut self.term, bytes);
+        self.invalidate_snapshot();
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
+        let size = TermDimensions::new(cols as usize, rows as usize);
+        if self.size.columns == size.columns && self.size.screen_lines == size.screen_lines {
+            return;
+        }
         // Reflow changes the coordinate mapping even when the text is stable.
         self.active_search_match = None;
-        self.size = TermDimensions::new(cols as usize, rows as usize);
+        self.size = size;
         self.term.resize(self.size);
+        self.invalidate_snapshot();
     }
 
     fn size(&self) -> (u16, u16) {
         (self.size.screen_lines as u16, self.size.columns as u16)
     }
 
-    fn snapshot(&self) -> Snapshot {
-        let (rows, cols) = self.size();
-        let (rows_us, cols_us) = (rows as usize, cols as usize);
-        let mut cells = vec![SnapCell::default(); rows_us * cols_us];
-
-        let content = self.term.renderable_content();
-        // `display_iter` yields absolute grid lines; viewport row 0 sits at
-        // line `-display_offset`, so add the offset to get a 0-based row.
-        let offset = content.display_offset as i32;
-        let selection = content.selection;
-
-        for indexed in content.display_iter {
-            let cell = indexed.cell;
-            // The trailing half of a wide character carries no glyph of its own.
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
+    fn snapshot(&self) -> Rc<Snapshot> {
+        if let Some((generation, snapshot)) = self.snapshot_cache.borrow().as_ref() {
+            if *generation == self.snapshot_generation {
+                return Rc::clone(snapshot);
             }
-            let row = indexed.point.line.0 + offset;
-            let col = indexed.point.column.0;
-            if row < 0 || row as usize >= rows_us || col >= cols_us {
-                continue;
-            }
-            let width = if cell.flags.contains(Flags::WIDE_CHAR) {
-                2
-            } else {
-                1
-            };
-            let selected = selection.is_some_and(|range| range.contains(indexed.point));
-            let search_match = self
-                .active_search_match
-                .is_some_and(|range| range.contains(from_point(indexed.point)));
-            cells[row as usize * cols_us + col] = SnapCell {
-                c: cell.c,
-                fg: map_color(cell.fg),
-                bg: map_color(cell.bg),
-                attrs: map_attrs(cell.flags),
-                width,
-                selected,
-                search_match,
-            };
         }
 
-        let cur = content.cursor;
-        let crow = cur.point.line.0 + offset;
-        let ccol = cur.point.column.0;
-        let visible = !matches!(cur.shape, AnsiCursorShape::Hidden)
-            && crow >= 0
-            && (crow as usize) < rows_us
-            && ccol < cols_us;
-        let cursor = CursorState {
-            row: crow.clamp(0, rows_us.saturating_sub(1) as i32) as usize,
-            col: ccol.min(cols_us.saturating_sub(1)),
-            shape: map_cursor_shape(cur.shape),
-            visible,
-        };
-
-        Snapshot {
-            rows,
-            cols,
-            cells,
-            cursor,
-            scroll: self.scroll_state(),
-        }
+        let snapshot = Rc::new(self.build_snapshot());
+        *self.snapshot_cache.borrow_mut() = Some((self.snapshot_generation, Rc::clone(&snapshot)));
+        snapshot
     }
 
     fn cursor_row_prefix(&self) -> Option<String> {
@@ -253,7 +221,11 @@ impl VtCore for AlacrittyCore {
     }
 
     fn scroll(&mut self, delta: i32) {
+        let offset = self.term.grid().display_offset();
         self.term.scroll_display(Scroll::Delta(delta));
+        if self.term.grid().display_offset() != offset {
+            self.invalidate_snapshot();
+        }
     }
 
     fn scroll_to_offset(&mut self, offset: usize) {
@@ -261,26 +233,39 @@ impl VtCore for AlacrittyCore {
         let delta = offset as i64 - current as i64;
         let delta = delta.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         self.term.scroll_display(Scroll::Delta(delta));
+        if self.term.grid().display_offset() != current {
+            self.invalidate_snapshot();
+        }
     }
 
     fn selection_start_kind(&mut self, row: usize, col: usize, side: SelSide, kind: SelectionKind) {
+        let previous = self.selection_range();
         let point = self.viewport_point(row, col);
         self.term.selection = Some(Selection::new(
             map_selection_kind(kind),
             point,
             map_side(side),
         ));
+        if self.selection_range() != previous {
+            self.invalidate_snapshot();
+        }
     }
 
     fn selection_update(&mut self, row: usize, col: usize, side: SelSide) {
+        let previous = self.selection_range();
         let point = self.viewport_point(row, col);
         if let Some(selection) = self.term.selection.as_mut() {
             selection.update(point, map_side(side));
+            if self.selection_range() != previous {
+                self.invalidate_snapshot();
+            }
         }
     }
 
     fn selection_clear(&mut self) {
-        self.term.selection = None;
+        if self.term.selection.take().is_some() {
+            self.invalidate_snapshot();
+        }
     }
 
     fn selection_text(&self) -> Option<String> {
@@ -348,11 +333,18 @@ impl VtCore for AlacrittyCore {
     }
 
     fn set_active_search_match(&mut self, search_match: Option<SearchMatch>) {
+        let previous_match = self.active_search_match;
+        let previous_offset = self.term.grid().display_offset();
         self.active_search_match = search_match.map(|search_match| {
             let range = self.clamp_search_range(search_match.range);
             self.scroll_range_into_view(range);
             range
         });
+        if self.active_search_match != previous_match
+            || self.term.grid().display_offset() != previous_offset
+        {
+            self.invalidate_snapshot();
+        }
     }
 
     fn mouse_mode(&self) -> MouseMode {
@@ -378,6 +370,75 @@ impl VtCore for AlacrittyCore {
 }
 
 impl AlacrittyCore {
+    fn build_snapshot(&self) -> Snapshot {
+        let (rows, cols) = self.size();
+        let (rows_us, cols_us) = (rows as usize, cols as usize);
+        let mut cells = vec![SnapCell::default(); rows_us * cols_us];
+
+        let content = self.term.renderable_content();
+        // `display_iter` yields absolute grid lines; viewport row 0 sits at
+        // line `-display_offset`, so add the offset to get a 0-based row.
+        let offset = content.display_offset as i32;
+        let selection = content.selection;
+
+        for indexed in content.display_iter {
+            let cell = indexed.cell;
+            // The trailing half of a wide character carries no glyph of its own.
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let row = indexed.point.line.0 + offset;
+            let col = indexed.point.column.0;
+            if row < 0 || row as usize >= rows_us || col >= cols_us {
+                continue;
+            }
+            let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+            let selected = selection.is_some_and(|range| range.contains(indexed.point));
+            let search_match = self
+                .active_search_match
+                .is_some_and(|range| range.contains(from_point(indexed.point)));
+            cells[row as usize * cols_us + col] = SnapCell {
+                c: cell.c,
+                fg: map_color(cell.fg),
+                bg: map_color(cell.bg),
+                attrs: map_attrs(cell.flags),
+                width,
+                selected,
+                search_match,
+            };
+        }
+
+        let cur = content.cursor;
+        let crow = cur.point.line.0 + offset;
+        let ccol = cur.point.column.0;
+        let visible = !matches!(cur.shape, AnsiCursorShape::Hidden)
+            && crow >= 0
+            && (crow as usize) < rows_us
+            && ccol < cols_us;
+        let cursor = CursorState {
+            row: crow.clamp(0, rows_us.saturating_sub(1) as i32) as usize,
+            col: ccol.min(cols_us.saturating_sub(1)),
+            shape: map_cursor_shape(cur.shape),
+            visible,
+        };
+
+        Snapshot {
+            rows,
+            cols,
+            cells,
+            cursor,
+            scroll: self.scroll_state(),
+        }
+    }
+
+    fn invalidate_snapshot(&mut self) {
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+    }
+
     /// Convert a viewport cell `(row, col)` into an absolute grid point,
     /// accounting for the current scrollback offset.
     fn viewport_point(&self, row: usize, col: usize) -> Point {
@@ -643,6 +704,109 @@ mod tests {
 
     fn core(rows: u16, cols: u16, scrollback: u32) -> AlacrittyCore {
         AlacrittyCore::new(rows, cols, scrollback, CursorShape::Block)
+    }
+
+    fn assert_snapshot_rebuilt(term: &AlacrittyCore, previous: &Rc<Snapshot>) -> Rc<Snapshot> {
+        let next = term.snapshot();
+        assert!(!Rc::ptr_eq(previous, &next));
+        assert!(Rc::ptr_eq(&next, &term.snapshot()));
+        next
+    }
+
+    #[test]
+    fn snapshot_reuses_cached_grid_until_terminal_state_changes() {
+        let term = core(24, 80, 1000);
+        let first = term.snapshot();
+        let second = term.snapshot();
+
+        assert!(Rc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn output_and_resize_invalidate_the_snapshot_cache() {
+        let mut term = core(4, 20, 100);
+        let initial = term.snapshot();
+
+        term.advance(b"hello");
+        let after_output = assert_snapshot_rebuilt(&term, &initial);
+        assert_eq!(after_output.row_text(0), "hello");
+
+        term.resize(5, 30);
+        let after_resize = assert_snapshot_rebuilt(&term, &after_output);
+        assert_eq!((after_resize.rows, after_resize.cols), (5, 30));
+    }
+
+    #[test]
+    fn viewport_scroll_methods_invalidate_the_snapshot_cache() {
+        let mut term = core(2, 20, 100);
+        term.advance(b"one\r\ntwo\r\nthree");
+        let live = term.snapshot();
+
+        term.scroll(1);
+        let scrolled = assert_snapshot_rebuilt(&term, &live);
+        assert_eq!(scrolled.scroll.offset, 1);
+
+        term.scroll_to_offset(0);
+        let restored = assert_snapshot_rebuilt(&term, &scrolled);
+        assert_eq!(restored.scroll.offset, 0);
+    }
+
+    #[test]
+    fn selection_lifecycle_invalidates_the_snapshot_cache() {
+        let mut term = core(4, 20, 100);
+        term.advance(b"hello world");
+        let unselected = term.snapshot();
+
+        term.selection_start(0, 0, SelSide::Left);
+        // A simple selection anchor has no visible range until it is extended.
+        assert!(Rc::ptr_eq(&unselected, &term.snapshot()));
+
+        term.selection_update(0, 4, SelSide::Right);
+        let extended = assert_snapshot_rebuilt(&term, &unselected);
+        assert!(extended.cell(0, 0).unwrap().selected);
+
+        term.selection_clear();
+        let cleared = assert_snapshot_rebuilt(&term, &extended);
+        assert!(!cleared.cell(0, 0).unwrap().selected);
+    }
+
+    #[test]
+    fn search_highlight_and_terminal_options_invalidate_the_snapshot_cache() {
+        let mut term = core(2, 20, 100);
+        term.advance(b"selected");
+        let target = term
+            .search_scrollback("selected", SearchOptions::default(), None)
+            .unwrap()
+            .matches[0];
+        let plain = term.snapshot();
+
+        term.set_active_search_match(Some(target));
+        let highlighted = assert_snapshot_rebuilt(&term, &plain);
+        assert!(highlighted.cells.iter().any(|cell| cell.search_match));
+
+        term.set_active_search_match(None);
+        let cleared = assert_snapshot_rebuilt(&term, &highlighted);
+        assert!(!cleared.cells.iter().any(|cell| cell.search_match));
+
+        term.set_terminal_options(200, CursorShape::Beam);
+        let reconfigured = assert_snapshot_rebuilt(&term, &cleared);
+        assert_eq!(reconfigured.cursor.shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn no_op_mutations_keep_the_cached_snapshot() {
+        let mut term = core(4, 20, 100);
+        let initial = term.snapshot();
+
+        term.advance(b"");
+        term.resize(4, 20);
+        term.scroll(-1);
+        term.scroll_to_offset(0);
+        term.selection_clear();
+        term.set_active_search_match(None);
+        term.set_terminal_options(100, CursorShape::Block);
+
+        assert!(Rc::ptr_eq(&initial, &term.snapshot()));
     }
 
     #[test]
