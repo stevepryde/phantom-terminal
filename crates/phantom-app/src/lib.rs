@@ -532,6 +532,21 @@ enum ClipAction {
     Paste,
 }
 
+trait ClipboardAccess {
+    fn set_text(&mut self, text: String) -> Result<(), arboard::Error>;
+    fn get_text(&mut self) -> Result<String, arboard::Error>;
+}
+
+impl ClipboardAccess for arboard::Clipboard {
+    fn set_text(&mut self, text: String) -> Result<(), arboard::Error> {
+        arboard::Clipboard::set_text(self, text)
+    }
+
+    fn get_text(&mut self) -> Result<String, arboard::Error> {
+        arboard::Clipboard::get_text(self)
+    }
+}
+
 struct Notice {
     text: String,
     until: Instant,
@@ -586,7 +601,7 @@ pub struct App {
     scroll_drag: Option<ScrollDrag>,
     wheel_line_remainder: f32,
 
-    clipboard: Option<arboard::Clipboard>,
+    clipboard: Option<Box<dyn ClipboardAccess>>,
     left_down: bool,
     selecting: bool,
     last_click: Option<LastClick>,
@@ -705,7 +720,9 @@ impl App {
             tab_drag: None,
             scroll_drag: None,
             wheel_line_remainder: 0.0,
-            clipboard: arboard::Clipboard::new().ok(),
+            clipboard: arboard::Clipboard::new()
+                .ok()
+                .map(|clipboard| Box::new(clipboard) as Box<dyn ClipboardAccess>),
             left_down: false,
             selecting: false,
             last_click: None,
@@ -2900,22 +2917,37 @@ impl App {
     }
 
     fn copy_selection(&mut self) {
-        let text = self
+        let Some(text) = self
             .tabs
             .get(self.active)
-            .and_then(|t| t.core.selection_text());
-        if let (Some(text), Some(clipboard)) = (text, self.clipboard.as_mut()) {
-            let _ = clipboard.set_text(text);
+            .and_then(|t| t.core.selection_text())
+        else {
+            return;
+        };
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            self.show_notice("Clipboard is unavailable");
+            return;
+        };
+        if let Err(error) = clipboard.set_text(text) {
+            self.show_notice(format!("Could not copy: {error}"));
         }
     }
 
     fn paste_clipboard(&mut self) {
-        let text = match self.clipboard.as_mut() {
-            Some(clipboard) => clipboard.get_text().ok(),
-            None => None,
-        };
-        let Some(text) = text.filter(|t| !t.is_empty()) else {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            self.show_notice("Clipboard is unavailable");
             return;
+        };
+        let text = match clipboard.get_text() {
+            Ok(text) if !text.is_empty() => text,
+            Ok(_) => {
+                self.show_notice("Clipboard is empty");
+                return;
+            }
+            Err(error) => {
+                self.show_notice(format!("Could not paste: {error}"));
+                return;
+            }
         };
         let at_shell_prompt = self.active_tab_at_shell_prompt();
         let Some(tab) = self.tabs.get(self.active) else {
@@ -4264,6 +4296,31 @@ mod tests {
         }
     }
 
+    enum TestClipboardMode {
+        Empty,
+        ReadFailure,
+        WriteFailure,
+    }
+
+    struct TestClipboard(TestClipboardMode);
+
+    impl ClipboardAccess for TestClipboard {
+        fn set_text(&mut self, _text: String) -> Result<(), arboard::Error> {
+            match self.0 {
+                TestClipboardMode::WriteFailure => Err(arboard::Error::ClipboardOccupied),
+                TestClipboardMode::Empty | TestClipboardMode::ReadFailure => Ok(()),
+            }
+        }
+
+        fn get_text(&mut self) -> Result<String, arboard::Error> {
+            match self.0 {
+                TestClipboardMode::ReadFailure => Err(arboard::Error::ContentNotAvailable),
+                TestClipboardMode::Empty => Ok(String::new()),
+                TestClipboardMode::WriteFailure => Ok("paste".to_string()),
+            }
+        }
+    }
+
     fn test_app() -> App {
         App::new(
             Arc::new(NoopOutbox),
@@ -4294,6 +4351,81 @@ mod tests {
             "unrelated AppKit window behavior must be preserved"
         );
         assert_eq!(macos_window_style_mask(custom, false), base);
+    }
+
+    fn test_app_with_selection() -> App {
+        let mut app = test_app();
+        let mut tab = Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        );
+        tab.advance_pty(b"copy");
+        tab.core.selection_start(0, 0, SelSide::Left);
+        tab.core.selection_update(0, 3, SelSide::Right);
+        assert!(tab.core.selection_text().is_some());
+        app.tabs.push(tab);
+        app
+    }
+
+    #[test]
+    fn unavailable_clipboard_is_reported_for_copy_and_paste() {
+        let mut copy_app = test_app_with_selection();
+        copy_app.clipboard = None;
+
+        copy_app.copy_selection();
+
+        assert_eq!(copy_app.notice_text(), Some("Clipboard is unavailable"));
+
+        let mut paste_app = test_app();
+        paste_app.clipboard = None;
+
+        paste_app.paste_clipboard();
+
+        assert_eq!(paste_app.notice_text(), Some("Clipboard is unavailable"));
+    }
+
+    #[test]
+    fn clipboard_operation_failures_are_reported() {
+        let mut copy_app = test_app_with_selection();
+        copy_app.clipboard = Some(Box::new(TestClipboard(TestClipboardMode::WriteFailure)));
+
+        copy_app.copy_selection();
+
+        assert!(copy_app
+            .notice_text()
+            .is_some_and(|notice| notice.starts_with("Could not copy: ")));
+
+        let mut paste_app = test_app();
+        paste_app.clipboard = Some(Box::new(TestClipboard(TestClipboardMode::ReadFailure)));
+
+        paste_app.paste_clipboard();
+
+        assert!(paste_app
+            .notice_text()
+            .is_some_and(|notice| notice.starts_with("Could not paste: ")));
+    }
+
+    #[test]
+    fn empty_clipboard_is_reported() {
+        let mut app = test_app();
+        app.clipboard = Some(Box::new(TestClipboard(TestClipboardMode::Empty)));
+
+        app.paste_clipboard();
+
+        assert_eq!(app.notice_text(), Some("Clipboard is empty"));
+    }
+
+    #[test]
+    fn copying_without_a_selection_remains_a_no_op() {
+        let mut app = test_app();
+        app.clipboard = None;
+
+        app.copy_selection();
+
+        assert_eq!(app.notice_text(), None);
     }
 
     #[test]
