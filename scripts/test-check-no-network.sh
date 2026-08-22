@@ -146,6 +146,19 @@ cargo generate-lockfile --offline --manifest-path "$mixed_imports/Cargo.toml"
 cargo check --offline --manifest-path "$mixed_imports/Cargo.toml" >/dev/null 2>&1
 run_gate "$mixed_imports"
 
+echo "==> raw keyword identifiers are not parsed as Rust syntax"
+raw_keywords="$scratch/raw-keywords"
+new_fixture "$raw_keywords"
+printf '%s\n' \
+  'pub fn r#use() {}' \
+  'mod foo { pub fn r#as() {} }' \
+  'use foo::r#as;' \
+  'pub fn call() { r#use(); r#as(); }' \
+  >"$raw_keywords/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$raw_keywords/Cargo.toml"
+cargo check --offline --manifest-path "$raw_keywords/Cargo.toml" >/dev/null 2>&1
+run_gate "$raw_keywords"
+
 for client in reqwest minreq; do
   echo "==> renamed $client dependency fails"
   renamed="$scratch/renamed-$client"
@@ -535,6 +548,7 @@ printf '%s\n' '' '[dependencies]' \
 printf '%s\n' \
   'pub fn open() {' \
   '    let _ = unsafe { libc::syscall(libc::SYS_socket, 0, 0, 0) };' \
+  '    let _ = unsafe { libc::r#syscall(libc::SYS_socket, 0, 0, 0) };' \
   '    let _ = unsafe { libc::dlsym(0, 0) };' \
   '}' >"$syscall_fixture/crates/app/src/lib.rs"
 cargo generate-lockfile --offline --manifest-path "$syscall_fixture/Cargo.toml"
@@ -594,7 +608,7 @@ for macro_case in unknown-macro inline-assembly; do
 done
 
 echo "==> macro definitions, authority aliases, and Unicode macros fail and compile"
-for macro_case in shadow-format aliased-assembly unicode-macro; do
+for macro_case in shadow-format aliased-assembly unicode-macro raw-keyword-macro; do
   macro_fixture="$scratch/$macro_case"
   new_fixture "$macro_fixture"
   case "$macro_case" in
@@ -620,6 +634,12 @@ for macro_case in shadow-format aliased-assembly unicode-macro; do
       printf '%s\n' \
         'macro_rules! réseau { () => { 1 }; }' \
         'pub fn value() -> i32 { réseau!() }' \
+        >"$macro_fixture/crates/app/src/lib.rs"
+      ;;
+    raw-keyword-macro)
+      printf '%s\n' \
+        'macro_rules! r#if { () => { 1 }; }' \
+        'pub fn value() -> i32 { r#if!() }' \
         >"$macro_fixture/crates/app/src/lib.rs"
       ;;
   esac

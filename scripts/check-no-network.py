@@ -131,6 +131,16 @@ APPROVED_FEATURES = {
 
 TOKEN_RE = re.compile(r"r#[^\W\d]\w*|[^\W\d]\w*|::|->|=>|[^\s]")
 IDENTIFIER_RE = re.compile(r"[^\W\d]\w*")
+RAW_MARKER = "\0raw:"
+RUST_KEYWORDS = {
+    "Self", "abstract", "as", "async", "await", "become", "box", "break",
+    "const", "continue", "crate", "do", "dyn", "else", "enum", "extern",
+    "false", "final", "fn", "for", "gen", "if", "impl", "in", "let",
+    "loop", "macro", "macro_rules", "match", "mod", "move", "mut", "override",
+    "priv", "pub", "ref", "return", "self", "static", "struct", "super",
+    "trait", "true", "try", "type", "typeof", "union", "unsafe", "unsized",
+    "use", "virtual", "where", "while", "yield",
+}
 SOCKET_TYPES = {"TcpStream", "TcpListener", "UdpSocket", "ToSocketAddrs"}
 SOCKET_FUNCTIONS = {
     "accept", "accept4", "bind", "connect", "dlopen", "dlsym", "getaddrinfo",
@@ -283,8 +293,18 @@ def rust_tokens(source):
         value = match.group(0)
         if value.startswith("r#"):
             value = value[2:]
+            if value in RUST_KEYWORDS:
+                value = RAW_MARKER + value
         tokens.append((value, match.start()))
     return tokens
+
+
+def identifier_name(token):
+    if token.startswith(RAW_MARKER):
+        return token[len(RAW_MARKER) :]
+    if IDENTIFIER_RE.fullmatch(token):
+        return token
+    return None
 
 
 def sequence_at(values, start, sequence):
@@ -346,8 +366,8 @@ def expand_use_tree(values):
             if token == "as":
                 if not path or position + 1 >= len(values):
                     raise ValueError("malformed use alias")
-                alias = values[position + 1]
-                if not IDENTIFIER_RE.fullmatch(alias):
+                alias = identifier_name(values[position + 1])
+                if alias is None:
                     raise ValueError("malformed use alias")
                 emit(path, alias=alias)
                 return position + 2
@@ -356,9 +376,10 @@ def expand_use_tree(values):
                     raise ValueError("incomplete use path")
                 emit(path)
                 return position
-            if not need_segment or not IDENTIFIER_RE.fullmatch(token):
+            segment = identifier_name(token)
+            if not need_segment or segment is None:
                 raise ValueError("malformed use path")
-            path.append(token)
+            path.append(segment)
             position += 1
             need_segment = False
             if position < len(values) and values[position] == "::":
@@ -405,8 +426,8 @@ def source_violation(tokens, approved_custom_macros):
     for index in range(len(values) - 2):
         if values[index + 1] != "!" or values[index + 2] not in {"(", "[", "{"}:
             continue
-        macro_name = values[index]
-        if not IDENTIFIER_RE.fullmatch(macro_name) or macro_name in {"if", "while"}:
+        macro_name = identifier_name(values[index])
+        if macro_name is None or values[index] in {"if", "while"}:
             continue
         if macro_name not in BUILTIN_MACROS and macro_name not in approved_custom_macros:
             return index
