@@ -1,10 +1,11 @@
 //! Backdrop blur for translucent egui panels.
 //!
 //! After the terminal has been rendered to the surface but before egui paints
-//! its panels, [`BlurPass`] copies the rendered frame, runs a separable Gaussian
-//! over it, and writes the blurred result back into just the panel regions. The
-//! panel's translucent fill then composites over a frosted backdrop instead of
-//! the sharp terminal underneath.
+//! its panels, [`BlurPass`] snapshots the bounded source area needed by its
+//! separable Gaussian, runs the two passes over the bounded intermediate area,
+//! and writes the blurred result back into just the panel regions. The panel's
+//! translucent fill then composites over a frosted backdrop instead of the
+//! sharp terminal underneath.
 
 use crate::gpu::BlurRegion;
 
@@ -285,12 +286,10 @@ impl BlurPass {
         if regions.is_empty() {
             return;
         }
-        // The vertical pass samples up to `reach` pixels outside each region, so
-        // the horizontal pass must populate that margin in the temp texture.
         let reach = (BLUR_STRIDE_PX * (TAP_COUNT - 1) as f32).ceil() as u32;
         // All regions degenerate (clamped to zero size): nothing to frost —
         // skip the snapshot copy and both passes entirely.
-        let Some(bounds) = union_bounds(regions, width, height, reach) else {
+        let Some(work) = blur_work_bounds(regions, width, height, reach) else {
             return;
         };
         self.ensure_sized(device, queue, width, height);
@@ -299,28 +298,28 @@ impl BlurPass {
             .as_ref()
             .expect("blur resources created in ensure_sized");
 
-        // Snapshot the freshly-rendered surface so we can sample it.
+        // Keep source and destination coordinates identical so the full-surface
+        // UVs remain valid. The snapshot includes exactly the horizontal
+        // kernel support needed by every pixel written to the temp texture.
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: surface,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: work.snapshot.origin(),
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
                 texture: &sized.copy_tex,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: work.snapshot.origin(),
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::Extent3d {
-                width: sized.width,
-                height: sized.height,
-                depth_or_array_layers: 1,
-            },
+            work.snapshot.extent(),
         );
 
-        // Horizontal pass: copy_tex -> tmp, limited to the (expanded) bounds.
+        // Horizontal pass: copy_tex -> tmp. Its vertical margin supplies every
+        // texel sampled by the vertical pass. Loading preserves irrelevant
+        // pixels outside the scissor instead of clearing the full attachment.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("phantom-blur-h"),
@@ -329,7 +328,7 @@ impl BlurPass {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -340,7 +339,12 @@ impl BlurPass {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &sized.bg_horizontal, &[]);
-            pass.set_scissor_rect(bounds.0, bounds.1, bounds.2, bounds.3);
+            pass.set_scissor_rect(
+                work.horizontal.x,
+                work.horizontal.y,
+                work.horizontal.width,
+                work.horizontal.height,
+            );
             pass.draw(0..3, 0..1);
         }
 
@@ -402,14 +406,62 @@ fn clamp_rect(region: &BlurRegion, width: u32, height: u32) -> (u32, u32, u32, u
     (x, y, w, h)
 }
 
-/// Bounding box of all regions, expanded by `reach` and clamped to the
-/// surface. `None` when every region clamps to zero size (nothing to blur).
-fn union_bounds(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl Rect {
+    fn origin(self) -> wgpu::Origin3d {
+        wgpu::Origin3d {
+            x: self.x,
+            y: self.y,
+            z: 0,
+        }
+    }
+
+    fn extent(self) -> wgpu::Extent3d {
+        wgpu::Extent3d {
+            width: self.width,
+            height: self.height,
+            depth_or_array_layers: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlurWorkBounds {
+    /// Temp-texture pixels produced by the horizontal pass.
+    horizontal: Rect,
+    /// Surface pixels copied into the source texture.
+    snapshot: Rect,
+}
+
+/// Plan the minimal bounding rectangles needed by the separable kernel.
+///
+/// The horizontal pass needs a vertical margin because the vertical pass
+/// samples it above and below each output pixel. The snapshot needs a
+/// horizontal margin because the horizontal pass samples it left and right.
+fn blur_work_bounds(
     regions: &[BlurRegion],
     width: u32,
     height: u32,
     reach: u32,
-) -> Option<(u32, u32, u32, u32)> {
+) -> Option<BlurWorkBounds> {
+    let output = union_bounds(regions, width, height)?;
+    let horizontal = expand_bounds(output, 0, reach, width, height);
+    let snapshot = expand_bounds(horizontal, reach, 0, width, height);
+    Some(BlurWorkBounds {
+        horizontal,
+        snapshot,
+    })
+}
+
+/// Bounding box of all non-degenerate regions, clamped to the surface.
+fn union_bounds(regions: &[BlurRegion], width: u32, height: u32) -> Option<Rect> {
     let mut min_x = width;
     let mut min_y = height;
     let mut max_x = 0u32;
@@ -427,11 +479,33 @@ fn union_bounds(
     if max_x <= min_x || max_y <= min_y {
         return None;
     }
-    let min_x = min_x.saturating_sub(reach);
-    let min_y = min_y.saturating_sub(reach);
-    let max_x = (max_x + reach).min(width);
-    let max_y = (max_y + reach).min(height);
-    Some((min_x, min_y, max_x - min_x, max_y - min_y))
+    Some(Rect {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    })
+}
+
+fn expand_bounds(rect: Rect, reach_x: u32, reach_y: u32, width: u32, height: u32) -> Rect {
+    let x = rect.x.saturating_sub(reach_x);
+    let y = rect.y.saturating_sub(reach_y);
+    let right = rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_add(reach_x)
+        .min(width);
+    let bottom = rect
+        .y
+        .saturating_add(rect.height)
+        .saturating_add(reach_y)
+        .min(height);
+    Rect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    }
 }
 
 #[cfg(test)]
@@ -454,29 +528,83 @@ mod tests {
     }
 
     #[test]
-    fn union_bounds_expands_by_reach_and_clamps() {
+    fn blur_work_bounds_include_each_kernel_axis_and_clamp() {
         let regions = [region(900, 100, 100, 100)];
-        let bounds = union_bounds(&regions, 1000, 600, 20);
-        // x: 900-20=880, y: 100-20=80, right: min(1000, 1000+20)=1000 -> w=120,
-        // bottom: 200+20=220 -> h=220-80=140
-        assert_eq!(bounds, Some((880, 80, 120, 140)));
+        let bounds = blur_work_bounds(&regions, 1000, 600, 20);
+        assert_eq!(
+            bounds,
+            Some(BlurWorkBounds {
+                // Vertical samples need twenty pixels above and below.
+                horizontal: Rect {
+                    x: 900,
+                    y: 80,
+                    width: 100,
+                    height: 140,
+                },
+                // Horizontal samples additionally need twenty pixels left;
+                // the right edge clamps to the surface.
+                snapshot: Rect {
+                    x: 880,
+                    y: 80,
+                    width: 120,
+                    height: 140,
+                },
+            })
+        );
     }
 
     #[test]
     fn union_bounds_is_none_when_nothing_to_blur() {
         // No regions, and regions that clamp to zero size, both mean the
         // whole blur pass can be skipped.
-        assert_eq!(union_bounds(&[], 800, 480, 10), None);
-        assert_eq!(union_bounds(&[region(800, 0, 50, 50)], 800, 480, 10), None);
-        assert_eq!(union_bounds(&[region(10, 10, 0, 50)], 800, 480, 10), None);
+        assert_eq!(blur_work_bounds(&[], 800, 480, 10), None);
+        assert_eq!(
+            blur_work_bounds(&[region(800, 0, 50, 50)], 800, 480, 10),
+            None
+        );
+        assert_eq!(
+            blur_work_bounds(&[region(10, 10, 0, 50)], 800, 480, 10),
+            None
+        );
     }
 
     #[test]
     fn union_bounds_ignores_degenerate_regions_in_a_mix() {
         let regions = [region(10, 10, 0, 50), region(100, 100, 50, 50)];
         assert_eq!(
-            union_bounds(&regions, 800, 480, 0),
-            Some((100, 100, 50, 50))
+            union_bounds(&regions, 800, 480),
+            Some(Rect {
+                x: 100,
+                y: 100,
+                width: 50,
+                height: 50,
+            })
         );
+    }
+
+    #[test]
+    fn blur_work_bounds_cover_disjoint_region_union_without_full_surface_work() {
+        let regions = [region(100, 120, 40, 30), region(300, 220, 50, 60)];
+        let bounds = blur_work_bounds(&regions, 1920, 1080, 13).unwrap();
+        assert_eq!(
+            bounds.horizontal,
+            Rect {
+                x: 100,
+                y: 107,
+                width: 250,
+                height: 186,
+            }
+        );
+        assert_eq!(
+            bounds.snapshot,
+            Rect {
+                x: 87,
+                y: 107,
+                width: 276,
+                height: 186,
+            }
+        );
+        assert!(bounds.snapshot.width < 1920);
+        assert!(bounds.snapshot.height < 1080);
     }
 }
