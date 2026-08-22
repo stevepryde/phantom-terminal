@@ -110,6 +110,7 @@ pub struct UiState {
     settings_draft: Option<AppConfig>,
     profile_editor_index: Option<usize>,
     confirm_profile_delete: bool,
+    confirm_settings_discard: bool,
     settings_focus_requested: bool,
     context_ui: ContextUi,
     find: FindState,
@@ -140,6 +141,7 @@ impl UiState {
             settings_draft: None,
             profile_editor_index: None,
             confirm_profile_delete: false,
+            confirm_settings_discard: false,
             settings_focus_requested: false,
             context_ui: ContextUi::default(),
             find: FindState::default(),
@@ -152,12 +154,20 @@ impl UiState {
     }
 
     pub fn open_settings(&mut self, config: &AppConfig) {
+        if self.settings_open() {
+            // The command palette can temporarily cover Settings. Selecting
+            // Settings again must reveal the existing draft, not replace a
+            // potentially invalid edit with the live config.
+            self.settings_focus_requested = true;
+            return;
+        }
         self.active_panel = Some(PanelKind::Settings);
         self.font_families = font_families_with_current(&config.font_family);
         self.notice = None;
         self.settings_draft = Some(config.clone());
         self.profile_editor_index = None;
         self.confirm_profile_delete = false;
+        self.confirm_settings_discard = false;
         self.settings_focus_requested = true;
     }
 
@@ -169,13 +179,30 @@ impl UiState {
         }
     }
 
-    pub fn close_panel(&mut self) {
+    /// Request that the settings panel close. Invalid widget drafts are kept
+    /// open until the user explicitly discards them through the inline prompt.
+    pub fn close_panel(&mut self) -> bool {
+        if self
+            .settings_draft
+            .as_ref()
+            .is_some_and(|draft| validate_settings_draft(draft).is_err())
+        {
+            self.confirm_settings_discard = true;
+            return false;
+        }
+
+        self.finish_close_panel();
+        true
+    }
+
+    fn finish_close_panel(&mut self) {
         self.active_panel = None;
         self.panel_width_px = 0.0;
         self.notice = None;
         self.settings_draft = None;
         self.profile_editor_index = None;
         self.confirm_profile_delete = false;
+        self.confirm_settings_discard = false;
         self.settings_focus_requested = false;
     }
 
@@ -326,6 +353,8 @@ impl UiState {
 
     fn settings_panel(&mut self, ui: &mut Ui, config: &mut AppConfig) -> bool {
         let mut changed = false;
+        let mut close_requested = false;
+        let mut discard_requested = false;
         // Widgets edit a draft, not the live config: a value is only applied
         // (and persisted) once the whole draft round-trips through
         // `AppConfig::validate()`. The draft persists while the panel is open
@@ -337,11 +366,28 @@ impl UiState {
             ui.heading("Settings");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Close").clicked() {
-                    self.close_panel();
+                    close_requested = true;
                 }
             });
         });
         ui.add_space(8.0);
+        if self.confirm_settings_discard {
+            Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(
+                    "Your latest edit is invalid and has not been applied. Keep editing or discard it?",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Keep editing").clicked() {
+                        self.confirm_settings_discard = false;
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        discard_requested = true;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
         if let Some(notice) = &self.notice {
             ui.colored_label(Color32::from_rgb(125, 211, 252), notice);
             ui.add_space(8.0);
@@ -369,6 +415,11 @@ impl UiState {
         // full-config validation pass.
         if !changed {
             self.settings_draft = Some(draft);
+            if discard_requested {
+                self.finish_close_panel();
+            } else if close_requested {
+                self.close_panel();
+            }
             return false;
         }
 
@@ -379,32 +430,33 @@ impl UiState {
         draft.context_actions.directory_history = config.context_actions.directory_history.clone();
         draft.trusted_projects = config.trusted_projects.clone();
 
+        // Discard is authoritative even if the same input frame also made the
+        // draft valid. Never let a confirmation action accidentally autosave.
+        if discard_requested {
+            self.settings_draft = Some(draft);
+            self.finish_close_panel();
+            return false;
+        }
+
         // Core bounds validation plus the app-level rule that every binding
         // parses to a usable combo (core can't know the combo grammar).
-        let validation = draft.validate().map_err(|e| e.to_string()).and_then(|()| {
-            match draft
-                .keybindings
-                .iter()
-                .find(|kb| parse_combo(&kb.keys).is_none())
-            {
-                Some(bad) => Err(format!(
-                    "keybinding '{}' is not a valid key combination \
-                     (letter keys need Cmd/Ctrl/Alt)",
-                    bad.keys
-                )),
-                None => Ok(()),
-            }
-        });
-        match validation {
+        match validate_settings_draft(&draft) {
             Ok(()) => {
                 self.notice = None;
+                self.confirm_settings_discard = false;
                 *config = draft.clone();
                 self.settings_draft = Some(draft);
+                if close_requested {
+                    self.close_panel();
+                }
                 true
             }
             Err(error) => {
                 self.notice = Some(error);
                 self.settings_draft = Some(draft);
+                if close_requested {
+                    self.close_panel();
+                }
                 false
             }
         }
@@ -1434,6 +1486,22 @@ fn action_label(action: &str) -> String {
     }
 }
 
+fn validate_settings_draft(config: &AppConfig) -> Result<(), String> {
+    config.validate().map_err(|error| error.to_string())?;
+    match config
+        .keybindings
+        .iter()
+        .find(|keybinding| parse_combo(&keybinding.keys).is_none())
+    {
+        Some(bad) => Err(format!(
+            "keybinding '{}' is not a valid key combination \
+             (letter keys need Cmd/Ctrl/Alt)",
+            bad.keys
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Outcome of drawing the command palette: the action to run (if any) and the
 /// palette frame's rect (in points) when it is translucent enough to frost.
 #[derive(Default)]
@@ -1978,8 +2046,138 @@ mod tests {
         state.open_settings(&config);
         state.panel_width_px = 320.0;
 
-        state.close_panel();
+        assert!(state.close_panel());
         assert_eq!(state.panel_width_px, 0.0);
+    }
+
+    #[test]
+    fn invalid_settings_draft_requires_explicit_discard() {
+        let config = AppConfig::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+        state.settings_draft.as_mut().unwrap().keybindings[0].keys = "T".to_string();
+
+        assert!(!state.close_panel());
+        assert!(state.settings_open());
+        assert!(state.confirm_settings_discard);
+        assert_eq!(config.keybindings[0].keys, "CmdOrCtrl+T");
+
+        state.finish_close_panel();
+        assert!(!state.settings_open());
+        assert!(state.settings_draft.is_none());
+        assert_eq!(config.keybindings[0].keys, "CmdOrCtrl+T");
+    }
+
+    #[test]
+    fn settings_toggle_uses_guarded_close_for_invalid_drafts() {
+        let config = AppConfig::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+        state.settings_draft.as_mut().unwrap().keybindings[0].keys = "T".to_string();
+
+        state.toggle_settings(&config);
+
+        assert!(state.settings_open());
+        assert!(state.confirm_settings_discard);
+    }
+
+    #[test]
+    fn reopening_settings_preserves_an_existing_invalid_draft() {
+        let config = AppConfig::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+        state.settings_draft.as_mut().unwrap().keybindings[0].keys = "T".to_string();
+
+        state.open_settings(&config);
+
+        assert_eq!(
+            state.settings_draft.as_ref().unwrap().keybindings[0].keys,
+            "T"
+        );
+    }
+
+    #[test]
+    fn valid_settings_draft_closes_without_confirmation() {
+        let config = AppConfig::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+
+        assert!(state.close_panel());
+        assert!(!state.settings_open());
+        assert!(!state.confirm_settings_discard);
+    }
+
+    #[test]
+    fn escape_requests_confirmation_for_an_invalid_settings_draft() {
+        let ctx = Context::default();
+        let mut config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+        state.settings_draft.as_mut().unwrap().keybindings[0].keys = "T".to_string();
+        let mut input = test_raw_input();
+        input.events.push(egui::Event::Key {
+            key: EguiKey::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+
+        let _ = ctx.run_ui(input, |ui| {
+            state.draw(
+                ui,
+                &mut config,
+                &mut palette,
+                UiFrameContext {
+                    snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    frequent_commands: &[],
+                    top_inset_points: 0.0,
+                    terminal_left_points: 0.0,
+                    terminal_right_points: 1280.0,
+                    global_notice: None,
+                },
+            );
+        });
+
+        assert!(state.settings_open());
+        assert!(state.confirm_settings_discard);
+    }
+
+    #[test]
+    fn discard_confirmation_actions_are_accessible() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let mut config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        let mut state = UiState::new(&config);
+        state.open_settings(&config);
+        state.settings_draft.as_mut().unwrap().keybindings[0].keys = "T".to_string();
+        assert!(!state.close_panel());
+
+        let output = ctx.run_ui(test_raw_input(), |ui| {
+            state.draw(
+                ui,
+                &mut config,
+                &mut palette,
+                UiFrameContext {
+                    snapshot: &ContextSnapshot::empty(std::path::PathBuf::from("/tmp")),
+                    frequent_commands: &[],
+                    top_inset_points: 0.0,
+                    terminal_left_points: 0.0,
+                    terminal_right_points: 1280.0,
+                    global_notice: None,
+                },
+            );
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        for label in ["Keep editing", "Discard changes"] {
+            assert!(update
+                .nodes
+                .iter()
+                .any(|(_, node)| { node.role() == Role::Button && node.label() == Some(label) }));
+        }
     }
 
     #[test]
@@ -1989,7 +2187,7 @@ mod tests {
         state.open_settings(&config);
         state.settings_tab = SettingsTab::Terminal;
 
-        state.close_panel();
+        assert!(state.close_panel());
         state.open_settings(&config);
 
         assert_eq!(state.settings_tab, SettingsTab::Terminal);

@@ -935,7 +935,10 @@ impl App {
         }
 
         self.palette.close();
-        self.ui.close_panel();
+        if !self.ui.close_panel() {
+            self.request_redraw();
+            return;
+        }
         self.rename = None;
         let selection_available = self
             .tabs
