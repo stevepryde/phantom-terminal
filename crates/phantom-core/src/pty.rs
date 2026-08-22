@@ -114,12 +114,21 @@ struct WriterQueue {
 
 enum WriterMessage {
     Input(Vec<u8>),
+    ShellInput(Vec<u8>),
     Reply(Vec<u8>),
 }
 
 impl WriterQueue {
     /// Queue one logical input operation, accepting or rejecting it whole.
     fn enqueue(&self, data: &[u8]) -> AppResult<()> {
+        self.enqueue_input(data, false)
+    }
+
+    fn enqueue_shell(&self, data: &[u8]) -> AppResult<()> {
+        self.enqueue_input(data, true)
+    }
+
+    fn enqueue_input(&self, data: &[u8], shell_guarded: bool) -> AppResult<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -139,7 +148,11 @@ impl WriterQueue {
             return Err(AppError::Pty("terminal is not accepting input".to_string()));
         }
         self.send_reserved(
-            WriterMessage::Input(data.to_vec()),
+            if shell_guarded {
+                WriterMessage::ShellInput(data.to_vec())
+            } else {
+                WriterMessage::Input(data.to_vec())
+            },
             &self.queued_bytes,
             &self.queued_messages,
             data.len(),
@@ -368,6 +381,17 @@ impl PtyManager {
             .take_writer()
             .map_err(|e| AppError::Pty(format!("take writer failed: {e}")))?;
 
+        // Keep a dedicated descriptor for the writer thread's last-moment
+        // foreground-group check. A duplicate cannot be closed and reused if
+        // the UI concurrently removes the session while queued input drains.
+        #[cfg(unix)]
+        let writer_foreground_fd = pair.master.as_raw_fd().and_then(|fd| {
+            use std::os::fd::{FromRawFd, OwnedFd};
+
+            let duplicate = unsafe { libc::dup(fd) };
+            (duplicate >= 0).then(|| unsafe { OwnedFd::from_raw_fd(duplicate) })
+        });
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // Writer pump: the PTY master blocks when the child stops reading, so
@@ -392,10 +416,38 @@ impl PtyManager {
             .name(format!("pty-writer-{id}"))
             .spawn(move || {
                 while let Ok(message) = write_rx.recv() {
-                    let (data, bytes, messages) = match message {
-                        WriterMessage::Input(data) => (data, &queued_bytes, &queued_messages),
-                        WriterMessage::Reply(data) => (data, &queued_reply_bytes, &queued_replies),
+                    let (data, bytes, messages, shell_guarded) = match message {
+                        WriterMessage::Input(data) => {
+                            (data, &queued_bytes, &queued_messages, false)
+                        }
+                        WriterMessage::ShellInput(data) => {
+                            (data, &queued_bytes, &queued_messages, true)
+                        }
+                        WriterMessage::Reply(data) => {
+                            (data, &queued_reply_bytes, &queued_replies, false)
+                        }
                     };
+                    #[cfg(unix)]
+                    if shell_guarded
+                        && !pid
+                            .zip(writer_foreground_fd.as_ref())
+                            .is_some_and(|(shell_pid, fd)| {
+                                use std::os::fd::AsRawFd;
+
+                                (unsafe { libc::tcgetpgrp(fd.as_raw_fd()) })
+                                    == shell_pid as libc::pid_t
+                            })
+                    {
+                        bytes.fetch_sub(data.len(), Ordering::AcqRel);
+                        messages.fetch_sub(1, Ordering::AcqRel);
+                        continue;
+                    }
+                    #[cfg(not(unix))]
+                    if shell_guarded {
+                        bytes.fetch_sub(data.len(), Ordering::AcqRel);
+                        messages.fetch_sub(1, Ordering::AcqRel);
+                        continue;
+                    }
                     let result = writer.write_all(&data).and_then(|_| writer.flush());
                     // Release the budget only after the blocking write, so
                     // buffered plus in-flight input stays within the bound.
@@ -494,6 +546,41 @@ impl PtyManager {
         queue.enqueue(data)
     }
 
+    /// Queue a prompt-driven command only while the spawned shell owns the
+    /// PTY foreground process group.
+    ///
+    /// Screen contents are not an execution authority: a child process can
+    /// draw a convincing prompt. The kernel-maintained foreground process
+    /// group cannot be changed by terminal escape sequences, so command
+    /// injection fails closed unless it still belongs to the shell process we
+    /// spawned. Callers should also validate the terminal's prompt and modes;
+    /// this final backend check closes the authority boundary immediately
+    /// before the input is accepted by the writer queue.
+    pub fn write_shell_input(&self, id: u32, data: &[u8]) -> AppResult<()> {
+        let queue = {
+            let sessions = self.lock();
+            let session = sessions
+                .get(&id)
+                .ok_or_else(|| AppError::Pty("no such pty".to_string()))?;
+            if !session.shell_owns_foreground() {
+                return Err(AppError::Pty(
+                    "shell does not own the terminal foreground".to_string(),
+                ));
+            }
+            session.writer_queue.clone()
+        };
+        queue.enqueue_shell(data)
+    }
+
+    /// Whether the original shell process currently owns terminal input.
+    /// Missing sessions, unavailable process identities, and unsupported
+    /// platforms all fail closed.
+    pub fn shell_owns_foreground(&self, id: u32) -> bool {
+        self.lock()
+            .get(&id)
+            .is_some_and(PtySession::shell_owns_foreground)
+    }
+
     /// Queue terminal-generated protocol output (for example a DSR cursor
     /// report) using capacity reserved separately from user input.
     pub fn write_reply(&self, id: u32, data: &[u8]) -> AppResult<()> {
@@ -569,6 +656,25 @@ impl PtyManager {
                     active: true,
                 });
             }
+        }
+    }
+}
+
+impl PtySession {
+    fn shell_owns_foreground(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let Some(shell_pid) = self.pid else {
+                return false;
+            };
+            let Some(foreground_group) = self.master.process_group_leader() else {
+                return false;
+            };
+            foreground_group > 0 && foreground_group as u32 == shell_pid
+        }
+        #[cfg(not(unix))]
+        {
+            false
         }
     }
 }
@@ -1278,6 +1384,66 @@ mod tests {
         assert!(reaped, "child {pid} was not reaped after natural exit");
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn shell_guard_rejects_input_while_a_child_job_owns_the_pty() {
+        let manager = PtyManager::new();
+        let eof = Arc::new(AtomicUsize::new(0));
+        let id = manager
+            .spawn(
+                LaunchOpts {
+                    command: Some("/bin/sh".to_string()),
+                    args: vec!["-i".to_string()],
+                    startup: None,
+                    cwd: None,
+                    rows: 24,
+                    cols: 80,
+                },
+                EofFlag(Arc::clone(&eof)),
+            )
+            .expect("spawn interactive shell");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !manager.shell_owns_foreground(id) {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "shell never acquired the PTY foreground"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        manager.write_shell_input(id, b"sleep 30\r").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager.shell_owns_foreground(id) {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "child job never acquired the PTY foreground"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let error = manager
+            .write_shell_input(id, b"echo injected\r")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "pty error: shell does not own the terminal foreground"
+        );
+
+        // Ordinary user input must remain deliverable to the foreground job;
+        // only synthesized shell commands use the stricter authority path.
+        manager.write(id, b"\x03").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !manager.shell_owns_foreground(id) {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "Ctrl+C did not return the PTY foreground to the shell"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        manager.kill(id).unwrap();
+    }
+
     #[cfg(unix)]
     struct DetachingSink(Arc<AtomicUsize>);
 
@@ -1349,7 +1515,7 @@ mod tests {
 
     fn input(message: WriterMessage) -> Vec<u8> {
         match message {
-            WriterMessage::Input(data) => data,
+            WriterMessage::Input(data) | WriterMessage::ShellInput(data) => data,
             WriterMessage::Reply(_) => panic!("expected user input"),
         }
     }
@@ -1423,7 +1589,9 @@ mod tests {
         assert_eq!(input(rx.try_recv().unwrap()), filler);
         match rx.try_recv().unwrap() {
             WriterMessage::Reply(data) => assert_eq!(data, b"\x1b[1;1R"),
-            WriterMessage::Input(_) => panic!("expected terminal reply"),
+            WriterMessage::Input(_) | WriterMessage::ShellInput(_) => {
+                panic!("expected terminal reply")
+            }
         }
     }
 
@@ -1441,7 +1609,9 @@ mod tests {
         }
         match rx.try_recv().unwrap() {
             WriterMessage::Reply(data) => assert_eq!(data, b"reply"),
-            WriterMessage::Input(_) => panic!("expected terminal reply"),
+            WriterMessage::Input(_) | WriterMessage::ShellInput(_) => {
+                panic!("expected terminal reply")
+            }
         }
     }
 
@@ -1456,7 +1626,9 @@ mod tests {
         assert_eq!(input(rx.try_recv().unwrap()), b"before");
         match rx.try_recv().unwrap() {
             WriterMessage::Reply(data) => assert_eq!(data, b"reply"),
-            WriterMessage::Input(_) => panic!("expected terminal reply"),
+            WriterMessage::Input(_) | WriterMessage::ShellInput(_) => {
+                panic!("expected terminal reply")
+            }
         }
         assert_eq!(input(rx.try_recv().unwrap()), b"after");
     }

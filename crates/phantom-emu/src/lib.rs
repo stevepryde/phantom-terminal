@@ -57,6 +57,9 @@ pub trait VtCore {
     /// which changes how arrow/navigation keys must be encoded.
     fn application_cursor_keys(&self) -> bool;
 
+    /// Whether an application has switched to the alternate screen buffer.
+    fn alternate_screen(&self) -> bool;
+
     /// Scroll the viewport by `delta` lines (positive scrolls back into
     /// history, negative toward the prompt).
     fn scroll(&mut self, delta: i32);

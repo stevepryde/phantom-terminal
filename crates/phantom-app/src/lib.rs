@@ -1629,7 +1629,8 @@ impl App {
             return;
         }
         // Never inject into a foreground program (vim, an SSH password
-        // prompt, ...): the text would be submitted to it, not the shell.
+        // prompt, ...): terminal output is forgeable, so this also requires
+        // the spawned shell to own the kernel's PTY foreground process group.
         if !self.active_tab_at_shell_prompt() {
             self.show_notice("Cannot run the command: the tab is running a program");
             return;
@@ -1638,7 +1639,7 @@ impl App {
         // Clear any partially typed shell line first so the clicked action
         // executes exactly the displayed command instead of concatenating it.
         let input = frequent_command_input(command);
-        if let Err(error) = self.pty.write(pty_id, &input) {
+        if let Err(error) = self.pty.write_shell_input(pty_id, &input) {
             self.show_notice(format!("Could not run command: {error}"));
             return;
         }
@@ -1701,7 +1702,7 @@ impl App {
                 }
                 let pty_id = tab.pty_id;
                 let command = posix_cd_command(canonical_text);
-                if let Err(error) = self.pty.write(pty_id, command.as_bytes()) {
+                if let Err(error) = self.pty.write_shell_input(pty_id, command.as_bytes()) {
                     self.show_notice(format!("Could not change directory: {error}"));
                     return;
                 }
@@ -3018,12 +3019,12 @@ impl App {
         let Some(tab) = self.tabs.get(self.active) else {
             return false;
         };
-        // Runs on every printable keypress/paste, so read just the cursor row
-        // instead of snapshotting the whole grid.
-        let Some(prefix) = tab.core.cursor_row_prefix() else {
+        if !Self::terminal_reports_shell_prompt(&tab.core)
+            || !self.pty.shell_owns_foreground(tab.pty_id)
+        {
             return false;
-        };
-        looks_like_shell_prompt(&prefix)
+        }
+        true
     }
 
     fn write_terminal_input(&mut self, pty_id: u32, bytes: &[u8], failure: &str) -> bool {
@@ -3034,6 +3035,25 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Terminal-state half of the shell-injection gate. Full-screen and
+    /// mouse-reporting applications are rejected even if they paint a prompt
+    /// suffix. Bracketed paste alone remains allowed because interactive
+    /// readline/zle shells commonly enable it while waiting at a real prompt.
+    fn terminal_reports_shell_prompt(core: &AlacrittyCore) -> bool {
+        if core.alternate_screen()
+            || core.application_cursor_keys()
+            || core.mouse_mode().protocol != MouseProtocol::Off
+        {
+            return false;
+        }
+        // Runs on every printable keypress/paste, so read just the cursor row
+        // instead of snapshotting the whole grid.
+        let Some(prefix) = core.cursor_row_prefix() else {
+            return false;
+        };
+        looks_like_shell_prompt(&prefix)
     }
 
     /// Detect a copy/paste shortcut: Cmd+C/V on macOS, Ctrl+Shift+C/V elsewhere
@@ -5381,6 +5401,32 @@ mod tests {
         assert!(looks_like_shell_prompt("PS C:\\project> "));
         assert!(!looks_like_shell_prompt("Password: "));
         assert!(!looks_like_shell_prompt("Confirm token: "));
+    }
+
+    #[test]
+    fn shell_injection_terminal_state_rejects_spoofable_application_modes() {
+        fn core_with(bytes: &[u8]) -> AlacrittyCore {
+            let mut core = AlacrittyCore::new(4, 40, 100, CursorShape::Block);
+            core.advance(bytes);
+            core
+        }
+
+        assert!(App::terminal_reports_shell_prompt(&core_with(b"host$ ")));
+        assert!(App::terminal_reports_shell_prompt(&core_with(
+            b"\x1b[?2004hhost$ "
+        )));
+        assert!(!App::terminal_reports_shell_prompt(&core_with(
+            b"\x1b[?1hhost$ "
+        )));
+        assert!(!App::terminal_reports_shell_prompt(&core_with(
+            b"\x1b[?1049hhost$ "
+        )));
+        assert!(!App::terminal_reports_shell_prompt(&core_with(
+            b"\x1b[?1000hhost$ "
+        )));
+        assert!(!App::terminal_reports_shell_prompt(&core_with(
+            b"Password: "
+        )));
     }
 
     #[test]

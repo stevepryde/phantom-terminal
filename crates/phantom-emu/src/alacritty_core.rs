@@ -220,6 +220,10 @@ impl VtCore for AlacrittyCore {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    fn alternate_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     fn scroll(&mut self, delta: i32) {
         let offset = self.term.grid().display_offset();
         self.term.scroll_display(Scroll::Delta(delta));
@@ -1038,6 +1042,16 @@ mod tests {
         assert!(term.application_cursor_keys());
         term.advance(b"\x1b[?1l"); // DECCKM reset
         assert!(!term.application_cursor_keys());
+    }
+
+    #[test]
+    fn tracks_alternate_screen_mode() {
+        let mut term = core(24, 80, 100);
+        assert!(!term.alternate_screen());
+        term.advance(b"\x1b[?1049h");
+        assert!(term.alternate_screen());
+        term.advance(b"\x1b[?1049l");
+        assert!(!term.alternate_screen());
     }
 
     #[test]
