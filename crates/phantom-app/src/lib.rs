@@ -69,6 +69,8 @@ use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
+#[cfg(target_os = "linux")]
+use winit::window::ResizeDirection;
 use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 use context_actions::{discover_context, ContextRequest, ContextSnapshot};
@@ -577,7 +579,7 @@ pub struct App {
 
     cursor_pos: (f32, f32),
     cursor_seen: bool,
-    cursor_pointer: bool,
+    cursor_icon: CursorIcon,
     last_hits: Option<chrome::TabBarHits>,
     chrome_anim: chrome::ChromeAnimationState,
     tab_drag: Option<TabDrag>,
@@ -693,7 +695,7 @@ impl App {
             next_tab_id: 0,
             cursor_pos: (0.0, 0.0),
             cursor_seen: false,
-            cursor_pointer: false,
+            cursor_icon: CursorIcon::Default,
             last_hits: None,
             chrome_anim: chrome::ChromeAnimationState::default(),
             tab_drag: None,
@@ -2403,6 +2405,13 @@ impl App {
 
     fn on_mouse_down(&mut self) {
         let (px, py) = self.cursor_pos;
+        #[cfg(target_os = "linux")]
+        if let Some(direction) = self.linux_window_resize_direction() {
+            if let Some(gpu) = self.gpu.as_ref() {
+                let _ = gpu.window.drag_resize_window(direction);
+            }
+            return;
+        }
         if self.palette.open {
             return;
         }
@@ -2627,6 +2636,14 @@ impl App {
             return;
         }
         let (px, py) = self.cursor_pos;
+        #[cfg(target_os = "linux")]
+        if let Some(direction) = self.linux_window_resize_direction() {
+            self.set_cursor_icon(direction.into());
+            if self.chrome_anim.set_hover(chrome::ChromeHoverTarget::None) {
+                self.request_redraw();
+            }
+            return;
+        }
         let scrollbar_hover = self.scroll_drag.is_some()
             || self
                 .active_scrollbar_track()
@@ -2665,17 +2682,61 @@ impl App {
     }
 
     fn set_pointer_cursor(&mut self, pointer: bool) {
-        if self.cursor_pointer == pointer {
-            return;
+        self.set_cursor_icon(if pointer {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Default
+        });
+    }
+
+    fn set_cursor_icon(&mut self, icon: CursorIcon) {
+        if self.cursor_icon != icon {
+            self.cursor_icon = icon;
+            if let Some(gpu) = self.gpu.as_ref() {
+                gpu.window.set_cursor(icon);
+            }
         }
-        self.cursor_pointer = pointer;
-        if let Some(gpu) = self.gpu.as_ref() {
-            let icon = if pointer {
-                CursorIcon::Pointer
-            } else {
-                CursorIcon::Default
-            };
-            gpu.window.set_cursor(icon);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_window_resize_direction(&self) -> Option<ResizeDirection> {
+        let gpu = self.gpu.as_ref()?;
+        if self.fullscreen || gpu.window.is_maximized() {
+            return None;
+        }
+        let (width, height) = gpu.size();
+        let (px, py) = self.cursor_pos;
+        let handle = chrome::window_resize_handle_at(
+            width as f32,
+            height as f32,
+            gpu.scale_factor(),
+            self.applied_window_chrome(),
+            self.active_scrollbar_track(),
+            px,
+            py,
+        )?;
+        Some(match handle {
+            chrome::WindowResizeHandle::East => ResizeDirection::East,
+            chrome::WindowResizeHandle::North => ResizeDirection::North,
+            chrome::WindowResizeHandle::NorthEast => ResizeDirection::NorthEast,
+            chrome::WindowResizeHandle::NorthWest => ResizeDirection::NorthWest,
+            chrome::WindowResizeHandle::South => ResizeDirection::South,
+            chrome::WindowResizeHandle::SouthEast => ResizeDirection::SouthEast,
+            chrome::WindowResizeHandle::SouthWest => ResizeDirection::SouthWest,
+            chrome::WindowResizeHandle::West => ResizeDirection::West,
+        })
+    }
+
+    fn input_starts_window_resize(&self, input: &AppInput) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(input, AppInput::MouseDown { .. })
+                && self.linux_window_resize_direction().is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = input;
+            false
         }
     }
 
@@ -3855,6 +3916,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.egui.is_some() && (self.palette.open || self.ui.context_owns_keyboard());
             if app_input_bypasses_egui_overlay(&input)
                 || app_input_is_find_shortcut(&input)
+                || self.input_starts_window_resize(&input)
                 || (!consumed && !egui_overlay_owns_input)
             {
                 self.handle_input(input);
@@ -4946,7 +5008,7 @@ mod tests {
     fn cursor_leave_keeps_scrollbar_drag_active() {
         let mut app = test_app();
         app.cursor_seen = true;
-        app.cursor_pointer = true;
+        app.cursor_icon = CursorIcon::Pointer;
         app.scroll_drag = Some(ScrollDrag {
             start_y: 10.0,
             start_offset: 3,
@@ -4955,7 +5017,7 @@ mod tests {
         app.clear_chrome_hover();
 
         assert!(app.scroll_drag.is_some());
-        assert!(app.cursor_pointer);
+        assert_eq!(app.cursor_icon, CursorIcon::Pointer);
         assert!(!app.cursor_seen);
     }
 
@@ -4963,11 +5025,11 @@ mod tests {
     fn cursor_leave_without_drag_clears_pointer_cursor() {
         let mut app = test_app();
         app.cursor_seen = true;
-        app.cursor_pointer = true;
+        app.cursor_icon = CursorIcon::Pointer;
 
         app.clear_chrome_hover();
 
-        assert!(!app.cursor_pointer);
+        assert_eq!(app.cursor_icon, CursorIcon::Default);
         assert!(!app.cursor_seen);
     }
 
