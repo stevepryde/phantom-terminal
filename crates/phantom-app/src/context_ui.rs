@@ -374,6 +374,14 @@ impl ContextUi {
                             .map_or(u16::MAX, |plugin| plugin.order);
                         left_order.cmp(&right_order).then(left.id.cmp(&right.id))
                     });
+                    if visible_sections.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("No contextual actions available.")
+                                .size(12.0)
+                                .color(muted_text_color()),
+                        );
+                    }
                     for (index, section) in visible_sections.into_iter().enumerate() {
                         if index > 0 {
                             thin_separator(ui);
@@ -1376,6 +1384,16 @@ mod tests {
         (output.shapes.len(), focused)
     }
 
+    fn shape_contains_text(shape: &egui::Shape, expected: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text) => text.galley.job.text == expected,
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_contains_text(shape, expected)),
+            _ => false,
+        }
+    }
+
     #[test]
     fn idle_overlay_draws_without_owning_keyboard() {
         let ctx = Context::default();
@@ -1850,7 +1868,7 @@ mod tests {
         };
         let mut outcome = None;
 
-        let _ = ctx.run_ui(input, |ui| {
+        let output = ctx.run_ui(input, |ui| {
             outcome = Some(state.draw(
                 ui,
                 &mut config,
@@ -1863,6 +1881,10 @@ mod tests {
         let outcome = outcome.unwrap();
         assert!(outcome.rect.is_some());
         assert!(outcome.reserved_width_points > 0.0);
+        assert!(output
+            .shapes
+            .iter()
+            .any(|shape| shape_contains_text(&shape.shape, "No contextual actions available.")));
     }
 
     #[test]

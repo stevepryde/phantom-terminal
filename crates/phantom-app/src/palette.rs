@@ -11,6 +11,13 @@ use crate::{keybindings::BuiltinShortcut, themes};
 
 const MAX_ROWS: usize = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaletteWindow {
+    pub first: usize,
+    pub last: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteAction {
     NewTab,
@@ -127,6 +134,19 @@ impl PaletteState {
                 selected: filtered_index == self.selected,
             })
             .collect()
+    }
+
+    pub(crate) fn visible_window(&self) -> Option<PaletteWindow> {
+        let total = self.filtered.len();
+        if total <= MAX_ROWS {
+            return None;
+        }
+        let first = self.selected.saturating_sub(MAX_ROWS - 1);
+        Some(PaletteWindow {
+            first: first + 1,
+            last: (first + MAX_ROWS).min(total),
+            total,
+        })
     }
 
     pub fn execute_selected(&self) -> Option<PaletteAction> {
@@ -434,5 +454,25 @@ mod tests {
         palette.open(&config);
         palette.set_query("Focus Context Sidebar".to_string());
         assert_eq!(palette.execute_selected(), None);
+    }
+
+    #[test]
+    fn truncated_palette_reports_the_visible_window_as_selection_moves() {
+        let config = AppConfig::default();
+        let mut palette = PaletteState::default();
+        palette.open(&config);
+
+        let initial = palette.visible_window().unwrap();
+        assert_eq!(initial.first, 1);
+        assert_eq!(initial.last, MAX_ROWS);
+        assert!(initial.total > MAX_ROWS);
+
+        for _ in 0..MAX_ROWS {
+            palette.move_selection(1);
+        }
+        let scrolled = palette.visible_window().unwrap();
+        assert_eq!(scrolled.first, 2);
+        assert_eq!(scrolled.last, MAX_ROWS + 1);
+        assert_eq!(scrolled.total, initial.total);
     }
 }
