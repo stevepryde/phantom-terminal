@@ -5,7 +5,11 @@ resolver = "2"
 [profile.release]
 codegen-units = 1
 lto = "thin"
-strip = "symbols"
+# rust-objcopy (invoked by strip = "symbols") aborts on current rustup macOS
+# toolchains: its rpath looks for libLLVM.dylib under rustlib/<triple>/lib,
+# but rustup installs that dylib at the toolchain lib/ root. The install
+# script strips the shipped binary with the OS strip tool instead.
+strip = "none"
 
 [workspace.lints.rust]
 warnings = "deny"
