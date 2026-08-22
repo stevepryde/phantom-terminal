@@ -1151,6 +1151,10 @@ impl EguiLayer {
         self.repaint_delay
     }
 
+    pub fn wants_keyboard_input(&self) -> bool {
+        self.ctx.egui_wants_keyboard_input()
+    }
+
     pub fn set_blur_suppressed(&mut self, suppressed: bool) {
         self.blur_suppressed = suppressed;
     }

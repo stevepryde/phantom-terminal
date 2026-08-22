@@ -766,9 +766,20 @@ impl App {
             AppInput::CloseRequested => {
                 self.request_exit();
             }
-            AppInput::ImeCommit(text) => self.commit_text(&text),
+            AppInput::ImeCommit(text) => {
+                if self.overlay_owns_terminal_ime() {
+                    self.preedit.clear();
+                    self.request_redraw();
+                } else {
+                    self.commit_text(&text);
+                }
+            }
             AppInput::ImePreedit(text) => {
-                self.preedit = text;
+                if self.overlay_owns_terminal_ime() {
+                    self.preedit.clear();
+                } else {
+                    self.preedit = text;
+                }
                 self.request_redraw();
             }
             AppInput::MouseMove { x, y } => {
@@ -2177,6 +2188,18 @@ impl App {
         }
     }
 
+    fn overlay_owns_terminal_ime(&self) -> bool {
+        overlay_owns_terminal_ime(
+            self.palette.open,
+            self.rename.is_some(),
+            self.ui.settings_open(),
+            self.ui.context_owns_keyboard(),
+            self.egui
+                .as_ref()
+                .is_some_and(EguiLayer::wants_keyboard_input),
+        )
+    }
+
     /// Handle a keypress while renaming the active tab.
     fn handle_rename_key(&mut self, key: Key, text: Option<&str>) {
         match key {
@@ -3206,6 +3229,9 @@ impl App {
                 self.egui_repaint_after = Instant::now().checked_add(delay);
             }
         }
+        if self.overlay_owns_terminal_ime() {
+            self.preedit.clear();
+        }
         if ui_outcome.config_changed {
             self.apply_config_change();
             if context_discovery_fingerprint(&self.config.context_actions)
@@ -3475,6 +3501,16 @@ fn terminal_owns_keyboard(
     context_owns_keyboard: bool,
 ) -> bool {
     !palette_open && !renaming && !settings_open && !context_owns_keyboard
+}
+
+fn overlay_owns_terminal_ime(
+    palette_open: bool,
+    renaming: bool,
+    settings_open: bool,
+    context_owns_keyboard: bool,
+    egui_wants_keyboard_input: bool,
+) -> bool {
+    palette_open || renaming || settings_open || context_owns_keyboard || egui_wants_keyboard_input
 }
 
 fn find_shortcut(key: Key, mods: Mods) -> bool {
@@ -3915,8 +3951,15 @@ impl ApplicationHandler<AppEvent> for App {
         let input = translate(&event, self.mods, self.cursor_pos, cell_height_px);
 
         if let Some(input) = input {
-            let egui_overlay_owns_input =
-                self.egui.is_some() && (self.palette.open || self.ui.context_owns_keyboard());
+            let input_is_ime = matches!(input, AppInput::ImeCommit(_) | AppInput::ImePreedit(_));
+            let egui_overlay_owns_input = self.egui.is_some()
+                && (self.palette.open
+                    || self.ui.context_owns_keyboard()
+                    || (input_is_ime && self.overlay_owns_terminal_ime()));
+            if egui_overlay_owns_input && input_is_ime && !self.preedit.is_empty() {
+                self.preedit.clear();
+                self.request_redraw();
+            }
             if app_input_bypasses_egui_overlay(&input)
                 || app_input_is_find_shortcut(&input)
                 || self.input_starts_window_resize(&input)
@@ -4238,6 +4281,42 @@ mod tests {
         assert!(!terminal_owns_keyboard(false, true, false, false));
         assert!(!terminal_owns_keyboard(false, false, true, false));
         assert!(!terminal_owns_keyboard(false, false, false, true));
+    }
+
+    #[test]
+    fn overlays_and_focused_egui_widgets_own_terminal_ime() {
+        assert!(!overlay_owns_terminal_ime(
+            false, false, false, false, false
+        ));
+        assert!(overlay_owns_terminal_ime(true, false, false, false, false));
+        assert!(overlay_owns_terminal_ime(false, true, false, false, false));
+        assert!(overlay_owns_terminal_ime(false, false, true, false, false));
+        assert!(overlay_owns_terminal_ime(false, false, false, true, false));
+        assert!(overlay_owns_terminal_ime(false, false, false, false, true));
+    }
+
+    #[test]
+    fn settings_discard_terminal_ime_commit_and_preedit() {
+        let mut app = test_app();
+        app.tabs.push(Tab::new(
+            0,
+            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
+            u32::MAX,
+            String::new(),
+            None,
+        ));
+        app.preedit = "terminal composition".to_string();
+        app.ui.open_settings(&app.config);
+
+        app.handle_input(AppInput::ImeCommit("settings text".to_string()));
+
+        assert!(app.preedit.is_empty());
+        assert_eq!(app.notice_text(), None, "IME commit attempted a PTY write");
+
+        app.handle_input(AppInput::ImePreedit("new composition".to_string()));
+
+        assert!(app.preedit.is_empty());
+        assert_eq!(app.notice_text(), None);
     }
 
     #[test]
