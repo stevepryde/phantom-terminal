@@ -10,6 +10,7 @@ use crate::ui_components::DIVIDER_RGBA;
 
 const PAD: f32 = 8.0;
 const CLOSE_W: f32 = 16.0;
+const CLOSE_HIT_W: f32 = 28.0;
 const NEW_TAB_W: f32 = 30.0;
 const SETTINGS_W: f32 = 34.0;
 const EPHEMERAL_W: f32 = 24.0;
@@ -636,10 +637,8 @@ impl TabBarHits {
         if self.new_tab.contains(px, py) {
             return ChromeHoverTarget::NewTab;
         }
-        for tab in &self.tabs {
-            if tab.close.contains(px, py) {
-                return ChromeHoverTarget::Close(tab.index);
-            }
+        if let Some(index) = self.close_at(px, py) {
+            return ChromeHoverTarget::Close(index);
         }
         for tab in &self.tabs {
             if tab.rect.contains(px, py) {
@@ -647,6 +646,13 @@ impl TabBarHits {
             }
         }
         ChromeHoverTarget::None
+    }
+
+    pub fn close_at(&self, px: f32, py: f32) -> Option<usize> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.close.contains(px, py))
+            .map(|tab| tab.index)
     }
 
     pub fn window_control_at(&self, px: f32, py: f32) -> Option<WindowControl> {
@@ -804,7 +810,9 @@ pub fn draw_tab_bar(
             tabs.push(TabHit {
                 index: i,
                 rect: visible,
-                close: close.intersect(strip).unwrap_or(Rect::EMPTY),
+                close: tab_close_hit_rect(rect, close, layout.scale_factor)
+                    .intersect(strip)
+                    .unwrap_or(Rect::EMPTY),
             });
         }
         r.clear_clip();
@@ -947,7 +955,9 @@ pub fn draw_tab_bar(
             tabs.push(TabHit {
                 index: i,
                 rect: visible,
-                close: close.intersect(strip).unwrap_or(Rect::EMPTY),
+                close: tab_close_hit_rect(rect, close, layout.scale_factor)
+                    .intersect(strip)
+                    .unwrap_or(Rect::EMPTY),
             });
         }
         let new_tab = Rect {
@@ -1634,6 +1644,18 @@ fn settings_icon_rects(x: f32, y: f32, w: f32, h: f32, scale_factor: f32) -> [[R
             },
         ]
     })
+}
+
+fn tab_close_hit_rect(tab: Rect, visual: Rect, scale_factor: f32) -> Rect {
+    let width = (CLOSE_HIT_W * scale_factor.max(1.0)).min(tab.w);
+    let centered_x = visual.x + (visual.w - width) * 0.5;
+    let max_x = (tab.x + tab.w - width).max(tab.x);
+    Rect {
+        x: centered_x.clamp(tab.x, max_x),
+        y: tab.y,
+        w: width,
+        h: tab.h,
+    }
 }
 
 fn draw_close_button(
@@ -2636,6 +2658,85 @@ mod tests {
         assert_eq!(hits.tab_body_at(10.0, 10.0), Some(0));
         assert_eq!(hits.tab_body_at(90.0, 10.0), None);
         assert_eq!(hits.tab_body_at(310.0, 10.0), None);
+    }
+
+    #[test]
+    fn close_hit_target_is_28_logical_pixels_without_resizing_the_glyph_or_tab() {
+        for scale_factor in [1.0, 2.0] {
+            let tab = Rect {
+                x: 40.0 * scale_factor,
+                y: 12.0 * scale_factor,
+                w: TAB_W * scale_factor,
+                h: 36.0 * scale_factor,
+            };
+            let horizontal_visual = Rect {
+                x: tab.x + tab.w - CLOSE_W * scale_factor - PAD * scale_factor * 0.5,
+                y: tab.y,
+                w: CLOSE_W * scale_factor,
+                h: tab.h,
+            };
+            let vertical_visual = Rect {
+                x: tab.x + tab.w - CLOSE_W * scale_factor - PAD * scale_factor,
+                ..horizontal_visual
+            };
+
+            for visual in [horizontal_visual, vertical_visual] {
+                let hit = tab_close_hit_rect(tab, visual, scale_factor);
+                assert_eq!(hit.w, CLOSE_HIT_W * scale_factor);
+                assert_eq!(hit.y, tab.y);
+                assert_eq!(hit.h, tab.h);
+                assert!(hit.x >= tab.x);
+                assert!(hit.x + hit.w <= tab.x + tab.w);
+                assert!(visual.x >= hit.x);
+                assert!(visual.x + visual.w <= hit.x + hit.w);
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_close_wing_routes_to_close_not_tab_body_at_one_and_two_x() {
+        for scale_factor in [1.0, 2.0] {
+            let tab = Rect {
+                x: 0.0,
+                y: 0.0,
+                w: TAB_W * scale_factor,
+                h: 36.0 * scale_factor,
+            };
+            let visual = Rect {
+                x: tab.w - CLOSE_W * scale_factor - PAD * scale_factor * 0.5,
+                y: tab.y,
+                w: CLOSE_W * scale_factor,
+                h: tab.h,
+            };
+            let close = tab_close_hit_rect(tab, visual, scale_factor);
+            let hits = TabBarHits {
+                tabs: vec![TabHit {
+                    index: 7,
+                    rect: tab,
+                    close,
+                }],
+                new_tab: Rect::EMPTY,
+                settings: Rect::EMPTY,
+                titlebar: None,
+                window_controls: Vec::new(),
+                tab_strip: tab,
+                tab_scroll: 0.0,
+                max_tab_scroll: 0.0,
+            };
+            let y = tab.y + tab.h * 0.5;
+            let expanded_wing_x = close.x + scale_factor;
+            assert!(expanded_wing_x < visual.x);
+            assert_eq!(hits.close_at(expanded_wing_x, y), Some(7));
+            assert_eq!(
+                hits.hover_target(expanded_wing_x, y),
+                ChromeHoverTarget::Close(7)
+            );
+            assert_eq!(hits.tab_body_at(expanded_wing_x, y), None);
+
+            let body_x = close.x - scale_factor;
+            assert_eq!(hits.close_at(body_x, y), None);
+            assert_eq!(hits.tab_body_at(body_x, y), Some(7));
+        }
     }
 
     #[test]
