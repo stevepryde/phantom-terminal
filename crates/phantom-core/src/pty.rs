@@ -324,7 +324,7 @@ impl PtyManager {
                 .command
                 .filter(|command| !command.is_empty())
                 .unwrap_or_else(|| default_shell(account));
-            let shell = resolve_named_program(&shell, &env.path)?;
+            let shell = resolve_program(&shell)?;
             let mut cmd = CommandBuilder::new(shell);
             for arg in &opts.args {
                 cmd.arg(arg);
@@ -338,7 +338,7 @@ impl PtyManager {
                 .command
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| default_shell(account));
-            let command = resolve_named_program(&command, &env.path)?;
+            let command = resolve_program(&command)?;
             let mut cmd = CommandBuilder::new(command);
             for arg in &opts.args {
                 cmd.arg(arg);
@@ -793,6 +793,14 @@ fn default_unix_path() -> &'static str {
     "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:~/bin:~/.cargo/bin:~/.local/bin"
 }
 
+/// Resolve a program through the normalized PATH used by terminal sessions.
+///
+/// Built-in providers use this before constructing their fixed argv so a login
+/// shell cannot redirect the launch by changing PATH after dispatch.
+pub fn resolve_program(program: &str) -> AppResult<String> {
+    resolve_named_program(program, &process_env().path)
+}
+
 #[cfg(unix)]
 fn resolve_named_program(program: &str, path: &str) -> AppResult<String> {
     if Path::new(program).components().count() > 1 {
@@ -801,6 +809,17 @@ fn resolve_named_program(program: &str, path: &str) -> AppResult<String> {
     for directory in std::env::split_paths(path) {
         let candidate = directory.join(program);
         if is_executable_file(&candidate) {
+            let candidate = if candidate.is_absolute() {
+                candidate
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| {
+                        AppError::Pty(format!(
+                            "could not resolve program '{program}' to an absolute path: {error}"
+                        ))
+                    })?
+                    .join(candidate)
+            };
             return candidate.into_os_string().into_string().map_err(|_| {
                 AppError::Pty(format!("program '{program}' path is not valid UTF-8"))
             });
@@ -1026,14 +1045,41 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn named_programs_resolve_from_the_normalized_path() {
-        assert_eq!(
-            resolve_named_program("sh", "/definitely-missing:/bin").unwrap(),
-            "/bin/sh"
-        );
+        let resolved = resolve_named_program("sh", "/definitely-missing:/bin").unwrap();
+        assert_eq!(resolved, "/bin/sh");
+        assert!(Path::new(&resolved).is_absolute());
         assert_eq!(
             resolve_named_program("./serve.sh", "/bin").unwrap(),
             "./serve.sh"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_programs_in_relative_path_entries_resolve_absolutely() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+        let relative_dir = PathBuf::from("target").join(format!(
+            "phantom-program-resolution-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&relative_dir).unwrap();
+        let executable = relative_dir.join("spdeploy");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let resolved = resolve_named_program("spdeploy", relative_dir.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            PathBuf::from(resolved),
+            std::env::current_dir().unwrap().join(executable)
+        );
+        let _ = fs::remove_dir_all(relative_dir);
     }
 
     #[test]
