@@ -253,6 +253,44 @@ printf '%s\n' \
 cargo generate-lockfile --offline --manifest-path "$raw_ffi/Cargo.toml"
 expect_failure "$raw_ffi" 'direct socket API:'
 
+echo "==> raw extern syscall declarations fail and compile"
+extern_syscall="$scratch/extern-syscall"
+new_fixture "$extern_syscall"
+printf '%s\n' \
+  'unsafe extern "C" {' \
+  '    fn syscall(number: i64) -> i64;' \
+  '}' \
+  'pub fn raw() { let _ = syscall; }' \
+  >"$extern_syscall/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$extern_syscall/Cargo.toml"
+cargo check --offline --manifest-path "$extern_syscall/Cargo.toml" >/dev/null 2>&1
+expect_failure "$extern_syscall" 'direct socket API:'
+
+echo "==> ToSocketAddrs imports fail and compile"
+socket_addresses="$scratch/socket-addresses"
+new_fixture "$socket_addresses"
+printf '%s\n' \
+  'use std::net::ToSocketAddrs;' \
+  'pub fn resolve() { let _ = ("localhost", 9).to_socket_addrs(); }' \
+  >"$socket_addresses/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$socket_addresses/Cargo.toml"
+cargo check --offline --manifest-path "$socket_addresses/Cargo.toml" >/dev/null 2>&1
+expect_failure "$socket_addresses" 'direct socket API:'
+
+echo "==> whole std and core authority aliases fail and compile"
+root_alias="$scratch/root-alias"
+new_fixture "$root_alias"
+printf '%s\n' \
+  'use std as system;' \
+  'use core as language_core;' \
+  'pub fn connect() {' \
+  '    let _ = system::net::TcpStream::connect("127.0.0.1:9");' \
+  '    let _ = language_core::mem::size_of::<usize>();' \
+  '}' >"$root_alias/crates/app/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$root_alias/Cargo.toml"
+cargo check --offline --manifest-path "$root_alias/Cargo.toml" >/dev/null 2>&1
+expect_failure "$root_alias" 'direct socket API:'
+
 echo "==> libc module aliases fail"
 libc_module_alias="$scratch/libc-module-alias"
 new_fixture "$libc_module_alias"

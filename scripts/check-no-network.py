@@ -116,7 +116,7 @@ APPROVED_FEATURES = {
 
 TOKEN_RE = re.compile(r"r#[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|::|->|=>|[^\s]")
 IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-SOCKET_TYPES = {"TcpStream", "TcpListener", "UdpSocket"}
+SOCKET_TYPES = {"TcpStream", "TcpListener", "UdpSocket", "ToSocketAddrs"}
 SOCKET_FUNCTIONS = {"socket", "connect", "bind", "syscall", "dlopen", "dlsym"}
 ALLOWED_MACROS = {
     "assert", "assert_eq", "assert_ne", "cfg", "env", "eprintln", "format",
@@ -231,13 +231,15 @@ def source_violation(tokens):
 
     delimiters = {"(": ")", "[": "]", "{": "}"}
     stack = []
+    matching_delimiters = {}
     for index, value in enumerate(values):
         if value in delimiters:
             stack.append((delimiters[value], index))
         elif value in delimiters.values():
             if not stack or stack[-1][0] != value:
                 return index
-            stack.pop()
+            _, opening_index = stack.pop()
+            matching_delimiters[opening_index] = index
     if stack:
         return stack[-1][1]
 
@@ -253,15 +255,8 @@ def source_violation(tokens):
     for index in range(len(values) - 1):
         if values[index : index + 2] != ["#", "["]:
             continue
-        depth = 1
-        end = index + 2
-        while end < len(values) and depth:
-            if values[end] == "[":
-                depth += 1
-            elif values[end] == "]":
-                depth -= 1
-            end += 1
-        attribute = values[index + 2 : end - 1]
+        end = matching_delimiters[index + 1]
+        attribute = values[index + 2 : end]
         authorities = {"path", "link", "link_name", "link_ordinal"}
         if attribute and (
             attribute[0] in authorities
@@ -273,9 +268,11 @@ def source_violation(tokens):
         ("std", "::", "net", "::", "TcpStream"),
         ("std", "::", "net", "::", "TcpListener"),
         ("std", "::", "net", "::", "UdpSocket"),
+        ("std", "::", "net", "::", "ToSocketAddrs"),
         ("net", "::", "TcpStream"),
         ("net", "::", "TcpListener"),
         ("net", "::", "UdpSocket"),
+        ("net", "::", "ToSocketAddrs"),
         ("tokio", "::", "net"),
         ("async_std", "::", "net"),
         ("smol", "::", "net"),
@@ -313,6 +310,20 @@ def source_violation(tokens):
         use_tree = values[index + 1 : end]
         if "include" in use_tree:
             return index
+        for root in {"std", "core"}:
+            root_aliases = [
+                (root, "as"),
+                (root, "::", "*"),
+                (root, "::", "{", "self", "as"),
+            ]
+            if any(find_sequence(use_tree, alias) is not None for alias in root_aliases):
+                return index
+            root_index = use_tree.index(root) if root in use_tree else None
+            if root_index is not None and (
+                root_index + 1 == len(use_tree)
+                or use_tree[root_index + 1] in {",", "}"}
+            ):
+                return index
         if "libc" in use_tree:
             libc_index = use_tree.index("libc")
             aliases_libc = (
@@ -355,7 +366,7 @@ def source_violation(tokens):
             elif values[end] == "}":
                 depth -= 1
             end += 1
-        if any(symbol in values[start + 1 : end - 1] for symbol in SOCKET_FUNCTIONS - {"syscall"}):
+        if any(symbol in values[start + 1 : end - 1] for symbol in SOCKET_FUNCTIONS):
             return index
     return None
 
