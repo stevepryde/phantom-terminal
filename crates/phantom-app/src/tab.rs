@@ -59,14 +59,14 @@ impl Tab {
 
     /// The label shown on the tab: the custom title if set, else the cwd
     /// basename, else a default.
-    pub fn title(&self) -> String {
+    pub fn title(&self) -> &str {
         if !self.custom_title.is_empty() {
-            return self.custom_title.clone();
+            return &self.custom_title;
         }
         let trimmed = self.cwd.trim_end_matches('/');
         match trimmed.rsplit('/').next() {
-            Some(name) if !name.is_empty() => name.to_string(),
-            _ => "shell".to_string(),
+            Some(name) if !name.is_empty() => name,
+            _ => "shell",
         }
     }
 }

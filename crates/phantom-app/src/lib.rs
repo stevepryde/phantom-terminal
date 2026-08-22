@@ -606,6 +606,8 @@ pub struct App {
 
     keymap: Keymap,
     tabs: Vec<Tab>,
+    /// Reused title storage keeps steady-state chrome rendering allocation-free.
+    tab_titles: Vec<String>,
     active: usize,
     next_tab_id: u64,
 
@@ -734,6 +736,7 @@ impl App {
             egui: None,
             keymap,
             tabs: Vec::new(),
+            tab_titles: Vec::new(),
             active: 0,
             next_tab_id: 0,
             cursor_pos: (0.0, 0.0),
@@ -956,7 +959,7 @@ impl App {
     }
 
     pub fn active_title(&self) -> Option<String> {
-        self.tabs.get(self.active).map(|t| t.title())
+        self.tabs.get(self.active).map(|t| t.title().to_owned())
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -1610,7 +1613,7 @@ impl App {
             }
             Action::RenameTab => {
                 if let Some(tab) = self.tabs.get(self.active) {
-                    self.rename = Some(tab.title());
+                    self.rename = Some(tab.title().to_owned());
                     self.request_redraw();
                 }
             }
@@ -1637,7 +1640,7 @@ impl App {
             PaletteAction::CloseTab => self.close_tab(self.active),
             PaletteAction::RenameTab => {
                 if let Some(tab) = self.tabs.get(self.active) {
-                    self.rename = Some(tab.title());
+                    self.rename = Some(tab.title().to_owned());
                 }
             }
             PaletteAction::NewTabWithProfile(id) => self.spawn_tab(Some(id), None),
@@ -3429,22 +3432,15 @@ impl App {
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| {
-                let title = if t.custom_title.is_empty() {
-                    t.title()
-                } else {
-                    t.custom_title.clone()
-                };
-                TabRecord {
-                    id: Some(t.id.to_string()),
-                    title: sanitize_title(&title),
-                    cwd: t.cwd.clone(),
-                    sort_order: i as i64,
-                    is_active: i == active,
-                    shell_profile_id: t.profile_id.clone(),
-                    created_at: None,
-                    updated_at: None,
-                }
+            .map(|(i, t)| TabRecord {
+                id: Some(t.id.to_string()),
+                title: sanitize_title(t.title()),
+                cwd: t.cwd.clone(),
+                sort_order: i as i64,
+                is_active: i == active,
+                shell_profile_id: t.profile_id.clone(),
+                created_at: None,
+                updated_at: None,
             })
             .collect();
         let errors = self.persistence.save_tabs(records);
@@ -3553,6 +3549,12 @@ impl App {
         let drag_indicator = self.tab_drag_indicator();
         let custom_window_chrome = self.custom_window_chrome();
 
+        self.tab_titles.resize_with(self.tabs.len(), String::new);
+        for (slot, tab) in self.tab_titles.iter_mut().zip(&self.tabs) {
+            slot.clear();
+            slot.push_str(tab.title());
+        }
+
         let (Some(gpu), Some(renderer)) = (self.gpu.as_mut(), self.renderer.as_mut()) else {
             return;
         };
@@ -3570,8 +3572,9 @@ impl App {
             renderer,
             themes::ui_theme_accent(&self.config.ui_theme),
         );
-        let titles: Vec<String> = self.tabs.iter().map(|t| t.title()).collect();
-        let chrome_animating = self.chrome_anim.advance(Instant::now(), titles.len());
+        let chrome_animating = self
+            .chrome_anim
+            .advance(Instant::now(), self.tab_titles.len());
 
         renderer.begin();
         chrome::draw_window_backfill(renderer, &base_layout, &colors, w as f32, h as f32);
@@ -3588,7 +3591,7 @@ impl App {
             renderer,
             &gpu.queue,
             &layout,
-            &titles,
+            &self.tab_titles,
             self.active,
             &colors,
             self.rename.as_deref(),
