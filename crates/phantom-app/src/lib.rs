@@ -490,7 +490,6 @@ struct ContextDiscoveryRequest {
     cwd: PathBuf,
     config: phantom_core::ContextActionsConfig,
     trusted_projects: Vec<phantom_core::TrustedProject>,
-    trusted_spdeploy_projects: Vec<phantom_core::TrustedSpdeployProject>,
 }
 
 fn spawn_context_discovery_worker(
@@ -507,12 +506,8 @@ fn spawn_context_discovery_worker(
                 while let Ok(newer) = rx.try_recv() {
                     request = newer;
                 }
-                let snapshot = discover_context(
-                    &request.cwd,
-                    &request.config,
-                    &request.trusted_projects,
-                    &request.trusted_spdeploy_projects,
-                );
+                let snapshot =
+                    discover_context(&request.cwd, &request.config, &request.trusted_projects);
                 if !outbox.send(AppEvent::ContextDiscovered {
                     generation: request.generation,
                     snapshot: Box::new(snapshot),
@@ -1800,7 +1795,6 @@ impl App {
             cwd: cwd.clone(),
             config: self.config.context_actions.clone(),
             trusted_projects: self.config.trusted_projects.clone(),
-            trusted_spdeploy_projects: self.config.trusted_spdeploy_projects.clone(),
         };
         if self.context_discovery_tx.send(request).is_err() {
             self.context_snapshot = ContextSnapshot::empty(cwd);
@@ -1814,9 +1808,7 @@ impl App {
             | ContextRequest::EditManifest { .. }
             | ContextRequest::OpenManifestAll { .. }
             | ContextRequest::OpenManifestTab { .. } => context_actions::MANIFEST_PROVIDER_ID,
-            ContextRequest::RunSpdeploy { .. } | ContextRequest::TrustSpdeploy { .. } => {
-                context_actions::SPDEPLOY_PROVIDER_ID
-            }
+            ContextRequest::RunSpdeploy { .. } => context_actions::SPDEPLOY_PROVIDER_ID,
             ContextRequest::OpenDirectory { .. } => phantom_core::RECENT_DIRECTORIES_PLUGIN_ID,
         };
         if !self.config.context_actions.enabled
@@ -1851,7 +1843,6 @@ impl App {
                 config_path,
                 operation,
             } => self.run_spdeploy_context_action(config_path, operation),
-            ContextRequest::TrustSpdeploy { root, sources } => self.trust_spdeploy(root, sources),
             ContextRequest::OpenDirectory { path } => self.open_context_directory(path),
         }
     }
@@ -2117,56 +2108,6 @@ impl App {
         self.run_spdeploy_context_action_with_resolver(config_path, operation, resolve_program);
     }
 
-    fn trust_spdeploy(&mut self, root: PathBuf, sources: Vec<phantom_core::TrustedSpdeploySource>) {
-        let active_cwd = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| Path::new(&tab.cwd).canonicalize().ok());
-        let canonical_root = root.canonicalize().ok();
-        if active_cwd.is_none() || active_cwd != canonical_root {
-            self.show_notice("The active tab has left this spdeploy project");
-            self.schedule_context_discovery();
-            return;
-        }
-        let graph = match phantom_core::load_spdeploy_graph(&root) {
-            Ok(Some(graph)) if graph.sources == sources => graph,
-            Ok(_) => {
-                self.show_notice("spdeploy configuration changed; review it again");
-                self.schedule_context_discovery();
-                return;
-            }
-            Err(error) => {
-                self.show_notice(format!("Could not trust spdeploy operations: {error}"));
-                self.schedule_context_discovery();
-                return;
-            }
-        };
-        let trusted = match phantom_core::trust_spdeploy_graph(&graph) {
-            Ok(trusted) => trusted,
-            Err(error) => {
-                self.show_notice(format!("Could not trust spdeploy operations: {error}"));
-                return;
-            }
-        };
-        let mut candidate = self.config.clone();
-        if let Some(existing) = candidate
-            .trusted_spdeploy_projects
-            .iter_mut()
-            .find(|project| project.root == trusted.root)
-        {
-            *existing = trusted;
-        } else {
-            candidate.trusted_spdeploy_projects.push(trusted);
-        }
-        if let Err(error) = candidate.validate() {
-            self.show_notice(format!("Could not store spdeploy trust: {error}"));
-            return;
-        }
-        self.config = candidate;
-        self.mark_config_dirty();
-        self.schedule_context_discovery();
-    }
-
     fn run_spdeploy_context_action_with_resolver(
         &mut self,
         config_path: PathBuf,
@@ -2190,10 +2131,9 @@ impl App {
                 .iter()
                 .find_map(|section| match &section.content {
                     context_actions::ContextSectionContent::Spdeploy(spdeploy)
-                        if spdeploy.trust == context_actions::SpdeployTrustState::Trusted
-                            && spdeploy.operations.iter().any(|item| {
-                                item.config_path == config_path && item.name == operation
-                            }) =>
+                        if spdeploy.operations.iter().any(|item| {
+                            item.config_path == config_path && item.name == operation
+                        }) =>
                     {
                         Some(spdeploy)
                     }
@@ -2204,15 +2144,6 @@ impl App {
             self.schedule_context_discovery();
             return;
         };
-        let stored_trust = self.config.trusted_spdeploy_projects.iter().any(|project| {
-            Path::new(&project.root) == listed_section.root
-                && project.sources == listed_section.config_sources
-        });
-        if !stored_trust {
-            self.show_notice("spdeploy operations are not trusted");
-            self.schedule_context_discovery();
-            return;
-        }
         let valid = self.context_snapshot.cwd == active_cwd
             && config_path.starts_with(&active_cwd)
             && !operation.is_empty()
@@ -2234,18 +2165,11 @@ impl App {
             .tabs
             .get(self.active)
             .and_then(|tab| Path::new(&tab.cwd).canonicalize().ok());
-        let still_trusted = self.config.trusted_spdeploy_projects.iter().any(|project| {
-            Path::new(&project.root) == listed_section.root
-                && project.sources == listed_section.config_sources
-        });
         let still_listed = listed_section
             .operations
             .iter()
             .any(|item| item.config_path == config_path && item.name == operation);
-        if current_active_cwd.as_ref() != Some(&listed_section.root)
-            || !still_trusted
-            || !still_listed
-        {
+        if current_active_cwd.as_ref() != Some(&listed_section.root) || !still_listed {
             self.show_notice("The selected spdeploy action is stale or invalid");
             self.schedule_context_discovery();
             return;
@@ -5992,7 +5916,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_spdeploy_resolution_failure_is_noticed_without_opening_a_tab() {
+    fn sidebar_spdeploy_needs_no_stored_trust_before_program_resolution() {
         use std::fs;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6010,11 +5934,7 @@ mod tests {
         )
         .unwrap();
         let root = temp.canonicalize().unwrap();
-        let graph = phantom_core::load_spdeploy_graph(&root).unwrap().unwrap();
-        let trusted = phantom_core::trust_spdeploy_graph(&graph).unwrap();
-        let section =
-            context_actions::discover_spdeploy_with_trust(&root, std::slice::from_ref(&trusted))
-                .unwrap();
+        let section = context_actions::discover_spdeploy(&root).unwrap();
         let context_actions::ContextSectionContent::Spdeploy(spdeploy) = &section.content else {
             panic!("expected spdeploy section");
         };
@@ -6032,8 +5952,6 @@ mod tests {
             cwd: root,
             sections: vec![section],
         };
-        app.config.trusted_spdeploy_projects.push(trusted);
-
         app.run_spdeploy_context_action_with_resolver(config_path, "deploy".to_string(), |_| {
             Err(phantom_core::AppError::Pty(
                 "program 'spdeploy' was not found in the normalized PATH".to_string(),
@@ -6051,81 +5969,7 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_spdeploy_request_is_inert_before_program_resolution() {
-        use std::fs;
-
-        let temp =
-            std::env::temp_dir().join(format!("phantom-spdeploy-untrusted-{}", std::process::id()));
-        fs::create_dir_all(&temp).unwrap();
-        fs::write(
-            temp.join("deploy.yml"),
-            "name: Test\noperation:\n  deploy:\n    stage: []\n",
-        )
-        .unwrap();
-        let root = temp.canonicalize().unwrap();
-        let section = context_actions::discover_spdeploy(&root).unwrap();
-        let context_actions::ContextSectionContent::Spdeploy(spdeploy) = &section.content else {
-            panic!("expected spdeploy section");
-        };
-        let config_path = spdeploy.operations[0].config_path.clone();
-        let mut app = test_app();
-        app.tabs.push(Tab::new(
-            0,
-            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
-            u32::MAX,
-            root.to_string_lossy().into_owned(),
-            None,
-        ));
-        app.context_snapshot = ContextSnapshot {
-            cwd: root,
-            sections: vec![section],
-        };
-        app.run_spdeploy_context_action_with_resolver(config_path, "deploy".to_string(), |_| {
-            panic!("untrusted dispatch must not resolve an executable")
-        });
-        assert_eq!(app.tabs.len(), 1);
-        assert_eq!(
-            app.notice_text(),
-            Some("The selected spdeploy action is stale or invalid")
-        );
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn changed_spdeploy_source_cannot_be_trusted_from_a_stale_review() {
-        use std::fs;
-
-        let temp = std::env::temp_dir().join(format!(
-            "phantom-spdeploy-stale-trust-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&temp).unwrap();
-        let path = temp.join("deploy.yml");
-        fs::write(&path, "name: Test\noperation:\n  deploy:\n    stage: []\n").unwrap();
-        let root = temp.canonicalize().unwrap();
-        let graph = phantom_core::load_spdeploy_graph(&root).unwrap().unwrap();
-        fs::write(&path, "name: Test\noperation:\n  changed:\n    stage: []\n").unwrap();
-        let mut app = test_app();
-        app.tabs.push(Tab::new(
-            0,
-            AlacrittyCore::new(4, 40, 100, CursorShape::Block),
-            u32::MAX,
-            root.to_string_lossy().into_owned(),
-            None,
-        ));
-
-        app.trust_spdeploy(root, graph.sources);
-
-        assert!(app.config.trusted_spdeploy_projects.is_empty());
-        assert_eq!(
-            app.notice_text(),
-            Some("spdeploy configuration changed; review it again")
-        );
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn changed_trusted_spdeploy_source_blocks_dispatch_after_resolution() {
+    fn changed_spdeploy_source_blocks_dispatch_after_resolution() {
         use std::fs;
 
         let temp =
@@ -6134,11 +5978,7 @@ mod tests {
         let path = temp.join("deploy.yml");
         fs::write(&path, "name: Test\noperation:\n  deploy:\n    stage: []\n").unwrap();
         let root = temp.canonicalize().unwrap();
-        let graph = phantom_core::load_spdeploy_graph(&root).unwrap().unwrap();
-        let trusted = phantom_core::trust_spdeploy_graph(&graph).unwrap();
-        let section =
-            context_actions::discover_spdeploy_with_trust(&root, std::slice::from_ref(&trusted))
-                .unwrap();
+        let section = context_actions::discover_spdeploy(&root).unwrap();
         let context_actions::ContextSectionContent::Spdeploy(spdeploy) = &section.content else {
             panic!("expected spdeploy section");
         };
@@ -6156,8 +5996,6 @@ mod tests {
             cwd: root,
             sections: vec![section],
         };
-        app.config.trusted_spdeploy_projects.push(trusted);
-
         let resolved = std::cell::Cell::new(false);
         app.run_spdeploy_context_action_with_resolver(config_path, "deploy".to_string(), |_| {
             resolved.set(true);

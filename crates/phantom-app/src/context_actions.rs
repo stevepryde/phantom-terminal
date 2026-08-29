@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use phantom_core::{
     load_context_manifest_source, load_spdeploy_graph, parse_context_manifest,
     trust_context_manifest, verify_spdeploy_graph, ContextActionsConfig, ContextRun, SpdeployGraph,
-    TrustedProject, TrustedSpdeployProject, TrustedSpdeploySource, BUILT_IN_CONTEXT_PLUGIN_IDS,
-    CONTEXT_MANIFEST_FILE, RECENT_DIRECTORIES_PLUGIN_ID,
+    SpdeploySource, TrustedProject, BUILT_IN_CONTEXT_PLUGIN_IDS, CONTEXT_MANIFEST_FILE,
+    RECENT_DIRECTORIES_PLUGIN_ID,
 };
 
 pub const MANIFEST_PROVIDER_ID: &str = "phantom-manifest";
@@ -116,17 +116,10 @@ pub struct SpdeploySection {
     pub root: PathBuf,
     pub config_path: PathBuf,
     pub project_name: String,
-    pub trust: SpdeployTrustState,
     pub operations: Vec<SpdeployOperation>,
     /// Sorted root-relative config graph reachable from current-directory
-    /// non-submenu operations, used to compare persisted trust.
-    pub config_sources: Vec<TrustedSpdeploySource>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpdeployTrustState {
-    NeedsTrust,
-    Trusted,
+    /// non-submenu operations, used for click-time source verification.
+    pub config_sources: Vec<SpdeploySource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,10 +159,6 @@ pub enum ContextRequest {
         config_path: PathBuf,
         operation: String,
     },
-    TrustSpdeploy {
-        root: PathBuf,
-        sources: Vec<TrustedSpdeploySource>,
-    },
     OpenDirectory {
         path: PathBuf,
     },
@@ -182,7 +171,6 @@ pub fn discover_context(
     cwd: &Path,
     config: &ContextActionsConfig,
     trusted_projects: &[TrustedProject],
-    trusted_spdeploy_projects: &[TrustedSpdeployProject],
 ) -> ContextSnapshot {
     let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut snapshot = ContextSnapshot::empty(canonical_cwd.clone());
@@ -203,9 +191,7 @@ pub fn discover_context(
         }
         let section = match provider {
             MANIFEST_PROVIDER_ID => discover_manifest(&canonical_cwd, trusted_projects),
-            SPDEPLOY_PROVIDER_ID => {
-                discover_spdeploy_with_trust(&canonical_cwd, trusted_spdeploy_projects)
-            }
+            SPDEPLOY_PROVIDER_ID => discover_spdeploy(&canonical_cwd),
             RECENT_DIRECTORIES_PLUGIN_ID => discover_recent_directories(config),
             _ => None,
         };
@@ -320,24 +306,13 @@ fn manifest_error(message: String, source: Option<(PathBuf, String)>) -> Context
     }
 }
 
-#[cfg(test)]
 pub fn discover_spdeploy(cwd: &Path) -> Option<ContextSection> {
-    discover_spdeploy_with_trust(cwd, &[])
-}
-
-pub fn discover_spdeploy_with_trust(
-    cwd: &Path,
-    trusted_projects: &[TrustedSpdeployProject],
-) -> Option<ContextSection> {
     match load_spdeploy_graph(cwd) {
         Ok(None) => None,
         Ok(Some(graph)) => {
             if graph.operations.is_empty() {
                 return None;
             }
-            let trusted = trusted_projects
-                .iter()
-                .any(|project| project.matches_graph(&graph));
             let config_path = graph.root.join(phantom_core::SPDEPLOY_CONFIG_FILE);
             let operations = graph
                 .operations
@@ -357,11 +332,6 @@ pub fn discover_spdeploy_with_trust(
                     root: graph.root,
                     config_path,
                     project_name: graph.project_name,
-                    trust: if trusted {
-                        SpdeployTrustState::Trusted
-                    } else {
-                        SpdeployTrustState::NeedsTrust
-                    },
                     operations,
                     config_sources: graph.sources,
                 }),
@@ -466,7 +436,7 @@ mod tests {
             .record_directory_visit(Path::new("/projects/recent"), 20)
             .unwrap();
 
-        let snapshot = discover_context(temp.path(), &config, &[], &[]);
+        let snapshot = discover_context(temp.path(), &config, &[]);
         let section = snapshot
             .sections
             .iter()
@@ -548,7 +518,7 @@ tabs:
             .record_directory_visit(Path::new("/projects/alpha"), 1)
             .unwrap();
 
-        let snapshot = discover_context(temp.path(), &config, &[], &[]);
+        let snapshot = discover_context(temp.path(), &config, &[]);
         let ids: Vec<_> = snapshot
             .sections
             .iter()
@@ -588,7 +558,7 @@ tabs:
             ..ContextActionsConfig::default()
         };
 
-        let snapshot = discover_context(temp.path(), &config, &[], &[]);
+        let snapshot = discover_context(temp.path(), &config, &[]);
         assert!(snapshot.sections.is_empty());
     }
 
@@ -599,7 +569,7 @@ tabs:
         let mut config = ContextActionsConfig::default();
         config.plugin_mut(SPDEPLOY_PROVIDER_ID).unwrap().enabled = false;
 
-        let snapshot = discover_context(temp.path(), &config, &[], &[]);
+        let snapshot = discover_context(temp.path(), &config, &[]);
         assert!(snapshot.sections.is_empty());
     }
 
@@ -747,36 +717,6 @@ operation:
         fs::write(config_path, "name: changed\noperation: {}\n").unwrap();
         let error = verify_spdeploy_sources(&section).unwrap_err();
         assert!(error.contains("configuration changed"));
-    }
-
-    #[test]
-    fn exact_graph_trust_is_recognized_and_source_change_invalidates_it() {
-        let temp = TestDir::new();
-        let config_path = temp.path().join(DEPLOY_FILE);
-        fs::write(
-            &config_path,
-            "name: Project\noperation:\n  deploy:\n    stage: []\n",
-        )
-        .unwrap();
-        let graph = load_spdeploy_graph(temp.path()).unwrap().unwrap();
-        let trusted = phantom_core::trust_spdeploy_graph(&graph).unwrap();
-        let section =
-            discover_spdeploy_with_trust(temp.path(), std::slice::from_ref(&trusted)).unwrap();
-        let ContextSectionContent::Spdeploy(section) = section.content else {
-            panic!("expected spdeploy section");
-        };
-        assert_eq!(section.trust, SpdeployTrustState::Trusted);
-
-        fs::write(
-            &config_path,
-            "name: Project\noperation:\n  release:\n    stage: []\n",
-        )
-        .unwrap();
-        let changed = discover_spdeploy_with_trust(temp.path(), &[trusted]).unwrap();
-        let ContextSectionContent::Spdeploy(changed) = changed.content else {
-            panic!("expected spdeploy section");
-        };
-        assert_eq!(changed.trust, SpdeployTrustState::NeedsTrust);
     }
 
     #[cfg(unix)]

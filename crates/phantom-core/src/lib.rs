@@ -49,7 +49,6 @@ pub use session::{
 };
 pub use spawn::{default_home_dir, resolve_launch_opts};
 pub use spdeploy::{
-    load_spdeploy_graph, trust_spdeploy_graph, verify_spdeploy_graph, SpdeployGraph,
-    SpdeployOperation, TrustedSpdeployProject, TrustedSpdeploySource, MAX_SPDEPLOY_CONFIGS,
-    MAX_SPDEPLOY_SOURCE_BYTES, SPDEPLOY_CONFIG_FILE,
+    load_spdeploy_graph, verify_spdeploy_graph, SpdeployGraph, SpdeployOperation, SpdeploySource,
+    MAX_SPDEPLOY_CONFIGS, MAX_SPDEPLOY_SOURCE_BYTES, SPDEPLOY_CONFIG_FILE,
 };

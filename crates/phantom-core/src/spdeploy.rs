@@ -1,10 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use noyalib::{Mapping, Value};
-use serde::{Deserialize, Serialize};
-
 use crate::{read_bounded_regular_file, AppError, AppResult};
+use noyalib::{Mapping, Value};
 
 pub const SPDEPLOY_CONFIG_FILE: &str = "deploy.yml";
 pub const MAX_SPDEPLOY_SOURCE_BYTES: usize = 1024 * 1024;
@@ -15,16 +13,10 @@ const MAX_NAME_BYTES: usize = 256;
 const MAX_DESCRIPTION_BYTES: usize = 1024;
 const MAX_PATH_BYTES: usize = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TrustedSpdeploySource {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpdeploySource {
     pub relative_path: String,
     pub source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TrustedSpdeployProject {
-    pub root: String,
-    pub sources: Vec<TrustedSpdeploySource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,22 +32,7 @@ pub struct SpdeployGraph {
     pub root: PathBuf,
     pub project_name: String,
     pub operations: Vec<SpdeployOperation>,
-    pub sources: Vec<TrustedSpdeploySource>,
-}
-
-impl TrustedSpdeployProject {
-    pub fn validate(&self) -> AppResult<()> {
-        validate_root(&self.root)?;
-        let parsed = parse_source_graph(&self.sources)?;
-        if parsed.sources != self.sources {
-            return invalid("trusted spdeploy sources do not match their transitive config graph");
-        }
-        Ok(())
-    }
-
-    pub fn matches_graph(&self, graph: &SpdeployGraph) -> bool {
-        Path::new(&self.root) == graph.root && self.sources == graph.sources
-    }
+    pub sources: Vec<SpdeploySource>,
 }
 
 pub fn load_spdeploy_graph(root: &Path) -> AppResult<Option<SpdeployGraph>> {
@@ -73,7 +50,7 @@ pub fn load_spdeploy_graph(root: &Path) -> AppResult<Option<SpdeployGraph>> {
     collect_fs_sources(&root, SPDEPLOY_CONFIG_FILE, 0, &mut sources)?;
     let sources = sources
         .into_iter()
-        .map(|(relative_path, source)| TrustedSpdeploySource {
+        .map(|(relative_path, source)| SpdeploySource {
             relative_path,
             source,
         })
@@ -87,25 +64,11 @@ pub fn load_spdeploy_graph(root: &Path) -> AppResult<Option<SpdeployGraph>> {
     }))
 }
 
-pub fn trust_spdeploy_graph(graph: &SpdeployGraph) -> AppResult<TrustedSpdeployProject> {
-    let trusted = TrustedSpdeployProject {
-        root: graph
-            .root
-            .to_str()
-            .ok_or_else(|| AppError::InvalidConfig("spdeploy root must be UTF-8".into()))?
-            .to_string(),
-        sources: graph.sources.clone(),
-    };
-    trusted.validate()?;
-    Ok(trusted)
-}
-
 pub fn verify_spdeploy_graph(graph: &SpdeployGraph) -> AppResult<()> {
-    let current = load_spdeploy_graph(&graph.root)?.ok_or_else(|| {
-        AppError::InvalidConfig("deploy.yml no longer exists; review and trust it again".into())
-    })?;
+    let current = load_spdeploy_graph(&graph.root)?
+        .ok_or_else(|| AppError::InvalidConfig("deploy.yml no longer exists".into()))?;
     if current.sources != graph.sources || current.operations != graph.operations {
-        return invalid("spdeploy configuration changed; review and trust it again");
+        return invalid("spdeploy configuration changed since discovery");
     }
     Ok(())
 }
@@ -113,14 +76,14 @@ pub fn verify_spdeploy_graph(graph: &SpdeployGraph) -> AppResult<()> {
 struct ParsedGraph {
     project_name: String,
     operations: Vec<SpdeployOperation>,
-    sources: Vec<TrustedSpdeploySource>,
+    sources: Vec<SpdeploySource>,
 }
 
 // `type: deploy` paths on non-submenu operations are operation-call edges,
 // not includes. Same-file sibling calls (`path: deploy.yml` + `operation:`)
 // and mutual calls across files are valid; revisiting an already-collected
 // source is a no-op. Submenu-only operations are ignored: they are not listed
-// and their targets are not part of this directory's trust graph.
+// and their targets are not part of this directory's reachable config graph.
 fn collect_fs_sources(
     root: &Path,
     relative_path: &str,
@@ -161,7 +124,7 @@ fn collect_fs_sources(
     Ok(())
 }
 
-fn parse_source_graph(sources: &[TrustedSpdeploySource]) -> AppResult<ParsedGraph> {
+fn parse_source_graph(sources: &[SpdeploySource]) -> AppResult<ParsedGraph> {
     validate_sources(sources)?;
     let source_map = sources
         .iter()
@@ -176,7 +139,7 @@ fn parse_source_graph(sources: &[TrustedSpdeploySource]) -> AppResult<ParsedGrap
             .iter()
             .any(|source| !required.contains(source.relative_path.as_str()))
     {
-        return invalid("trusted spdeploy sources contain missing or unrelated configs");
+        return invalid("spdeploy sources contain missing or unrelated configs");
     }
     let mut operations = Vec::new();
     collect_root_operations(&source_map, &mut operations)?;
@@ -200,9 +163,7 @@ fn collect_required(
         return Ok(());
     }
     let source = sources.get(relative_path).ok_or_else(|| {
-        AppError::InvalidConfig(format!(
-            "trusted spdeploy source '{relative_path}' is missing"
-        ))
+        AppError::InvalidConfig(format!("spdeploy source '{relative_path}' is missing"))
     })?;
     let value = parse_yaml(relative_path, source)?;
     required.insert(relative_path.to_string());
@@ -218,7 +179,7 @@ fn collect_root_operations(
 ) -> AppResult<()> {
     let source = sources.get(SPDEPLOY_CONFIG_FILE).ok_or_else(|| {
         AppError::InvalidConfig(format!(
-            "trusted spdeploy source '{SPDEPLOY_CONFIG_FILE}' is missing"
+            "spdeploy source '{SPDEPLOY_CONFIG_FILE}' is missing"
         ))
     })?;
     let value = parse_yaml(SPDEPLOY_CONFIG_FILE, source)?;
@@ -321,7 +282,7 @@ fn is_submenu(stages: &[Value]) -> AppResult<bool> {
 
 fn reject_dynamic_path(path: &str) -> AppResult<()> {
     if path.contains("{{") || path.contains("}}") {
-        return invalid("dynamic spdeploy config paths cannot be trusted");
+        return invalid("dynamic spdeploy config paths cannot be resolved during discovery");
     }
     Ok(())
 }
@@ -357,10 +318,10 @@ fn normalize_relative_path(path: &Path) -> AppResult<String> {
     Ok(text.to_string())
 }
 
-fn validate_sources(sources: &[TrustedSpdeploySource]) -> AppResult<()> {
+fn validate_sources(sources: &[SpdeploySource]) -> AppResult<()> {
     if sources.is_empty() || sources.len() > MAX_SPDEPLOY_CONFIGS {
         return invalid(format!(
-            "trusted spdeploy sources must contain 1 to {MAX_SPDEPLOY_CONFIGS} configs"
+            "spdeploy sources must contain 1 to {MAX_SPDEPLOY_CONFIGS} configs"
         ));
     }
     let total = sources.iter().try_fold(0usize, |total, source| {
@@ -370,17 +331,17 @@ fn validate_sources(sources: &[TrustedSpdeploySource]) -> AppResult<()> {
     })?;
     if total > MAX_SPDEPLOY_SOURCE_BYTES {
         return invalid(format!(
-            "trusted spdeploy sources exceed {MAX_SPDEPLOY_SOURCE_BYTES} bytes"
+            "spdeploy sources exceed {MAX_SPDEPLOY_SOURCE_BYTES} bytes"
         ));
     }
     let mut previous = None;
     for source in sources {
         let normalized = normalize_relative_path(Path::new(&source.relative_path))?;
         if normalized != source.relative_path {
-            return invalid("trusted spdeploy source paths must be normalized");
+            return invalid("spdeploy source paths must be normalized");
         }
         if previous.is_some_and(|path| path >= source.relative_path.as_str()) {
-            return invalid("trusted spdeploy source paths must be strictly sorted and unique");
+            return invalid("spdeploy source paths must be strictly sorted and unique");
         }
         previous = Some(source.relative_path.as_str());
     }
@@ -388,33 +349,7 @@ fn validate_sources(sources: &[TrustedSpdeploySource]) -> AppResult<()> {
         .iter()
         .any(|source| source.relative_path == SPDEPLOY_CONFIG_FILE)
     {
-        return invalid("trusted spdeploy sources must include deploy.yml");
-    }
-    Ok(())
-}
-
-fn validate_root(root: &str) -> AppResult<()> {
-    validate_text(root, "project root", MAX_PATH_BYTES)?;
-    let path = Path::new(root);
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
-        return invalid("trusted spdeploy project root must be a normalized absolute path");
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir | Component::Normal(_) => normalized.push(component.as_os_str()),
-            Component::CurDir | Component::ParentDir => {
-                return invalid("trusted spdeploy project root must be normalized")
-            }
-        }
-    }
-    if normalized.as_os_str() != path.as_os_str() {
-        return invalid("trusted spdeploy project root must be a normalized absolute path");
+        return invalid("spdeploy sources must include deploy.yml");
     }
     Ok(())
 }
@@ -478,17 +413,21 @@ fn invalid<T>(message: impl Into<String>) -> AppResult<T> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "phantom-spdeploy-trust-{}-{}",
+                "phantom-spdeploy-graph-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).unwrap();
             Self(path)
@@ -582,7 +521,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["deploy", "env", "compose"]
         );
-        trust_spdeploy_graph(&graph).unwrap();
+        verify_spdeploy_graph(&graph).unwrap();
     }
 
     #[test]
@@ -607,7 +546,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["child.yml", "deploy.yml"]
         );
-        trust_spdeploy_graph(&graph).unwrap();
+        verify_spdeploy_graph(&graph).unwrap();
     }
 
     #[test]

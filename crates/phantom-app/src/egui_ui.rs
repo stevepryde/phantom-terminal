@@ -470,7 +470,6 @@ impl UiState {
         draft.window_size = config.window_size;
         draft.context_actions.directory_history = config.context_actions.directory_history.clone();
         draft.trusted_projects = config.trusted_projects.clone();
-        draft.trusted_spdeploy_projects = config.trusted_spdeploy_projects.clone();
 
         // Discard is authoritative even if the same input frame also made the
         // draft valid. Never let a confirmation action accidentally autosave.
